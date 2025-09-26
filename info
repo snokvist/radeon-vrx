@@ -1,0 +1,14 @@
+make
+
+
+
+  Commands: l, n, s <i>, stats, q
+stats
+---- Sources ----
+[0]* 192.168.2.202:54746  rx_pkts=13580 rx_bytes=15473736  fwd_pkts=13550 fwd_bytes=15438347  rate=9.40 Mbps  last_seen=0.0s
+[1] 192.168.2.203:43450  rx_pkts=6179 rx_bytes=6728498  fwd_pkts=0 fwd_bytes=0  rate=4.07 Mbps  last_seen=0.0s
+---- Pipeline ----
+queue0: level buffers=0 bytes=0 time=0.0ms
+
+(udp-h265-viewer:37821): GLib-GObject-CRITICAL **: 22:44:18.983: ../../../gobject/gsignal.c:3647: signal name 'get-stats' is invalid for instance '0x5f6dca330700' of type 'GstRtpJitterBuffer'
+rtpjitterbuffer: stats not available
