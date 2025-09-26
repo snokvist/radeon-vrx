@@ -12,8 +12,7 @@ static void qos_stats_free(gpointer data) {
 static void addr_to_str(const struct sockaddr_in *sa, char *out, size_t outlen) {
     char ip[INET_ADDRSTRLEN] = {0};
     inet_ntop(AF_INET, &sa->sin_addr, ip, sizeof(ip));
-    int port = ntohs(sa->sin_port);
-    g_snprintf(out, outlen, "%s:%d", ip, port);
+    g_strlcpy(out, ip, outlen);
 }
 
 void uv_internal_decoder_stats_reset(DecoderStats *stats) {

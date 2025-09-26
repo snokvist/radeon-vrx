@@ -11,15 +11,47 @@
 static void addr_to_str(const struct sockaddr_in *sa, char *out, size_t outlen) {
     char ip[INET_ADDRSTRLEN] = {0};
     inet_ntop(AF_INET, &sa->sin_addr, ip, sizeof(ip));
-    int port = ntohs(sa->sin_port);
-    g_snprintf(out, outlen, "%s:%d", ip, port);
+    g_strlcpy(out, ip, outlen);
+}
+
+static void relay_source_clear_stats(UvRelaySource *src, gboolean reset_totals) {
+    if (!src) return;
+    if (reset_totals) {
+        src->rx_packets = 0;
+        src->rx_bytes = 0;
+        src->forwarded_packets = 0;
+        src->forwarded_bytes = 0;
+    }
+    src->last_seen_us = 0;
+    src->prev_bytes = 0;
+    src->prev_timestamp_us = 0;
+    src->rtp_initialized = FALSE;
+    src->rtp_cycles = 0;
+    src->rtp_last_seq = 0;
+    src->rtp_first_ext_seq = 0;
+    src->rtp_max_ext_seq = 0;
+    src->rtp_unique_packets = 0;
+    src->rtp_duplicate_packets = 0;
+    src->rtp_reordered_packets = 0;
+    for (guint i = 0; i < UV_RTP_WIN_SIZE; ++i) {
+        src->rtp_seq_slot[i] = UV_RTP_SLOT_EMPTY;
+    }
+    src->jitter_initialized = FALSE;
+    src->jitter_prev_transit = 0;
+    src->jitter_value = 0.0;
 }
 
 static bool relay_add_or_find(RelayController *rc, const struct sockaddr_in *from, socklen_t fromlen, int *out_idx) {
     for (guint i = 0; i < rc->sources_count; i++) {
         UvRelaySource *slot = &rc->sources[i];
         if (!slot->in_use) continue;
-        if (slot->addrlen == fromlen && memcmp(&slot->addr, from, fromlen) == 0) {
+        if (slot->addr.sin_family == from->sin_family &&
+            slot->addr.sin_addr.s_addr == from->sin_addr.s_addr) {
+            if (slot->addr.sin_port != from->sin_port) {
+                relay_source_clear_stats(slot, TRUE);
+            }
+            slot->addr = *from;
+            slot->addrlen = fromlen;
             if (out_idx) *out_idx = (int)i;
             return FALSE;
         }
@@ -30,7 +62,7 @@ static bool relay_add_or_find(RelayController *rc, const struct sockaddr_in *fro
     ns->addr = *from;
     ns->addrlen = fromlen;
     ns->in_use = TRUE;
-    for (guint i = 0; i < UV_RTP_WIN_SIZE; ++i) ns->rtp_seq_slot[i] = UV_RTP_SLOT_EMPTY;
+    relay_source_clear_stats(ns, TRUE);
     if (out_idx) *out_idx = (int)rc->sources_count;
     rc->sources_count++;
     return TRUE;

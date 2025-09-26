@@ -102,10 +102,12 @@ typedef struct {
     GstElement *capsfilter;
     GstElement *decoder;
     GstElement *queue_postdec;
+    GstElement *video_convert;
     GstElement *sink;
 
     GThread *loop_thread;
     GMainLoop *loop;
+    GMainContext *loop_context;
     guint bus_watch_id;
     gulong decoder_probe_id;
     gboolean sink_is_fakesink;
@@ -155,6 +157,9 @@ void     pipeline_controller_stop(PipelineController *pc);
 GstAppSrc *pipeline_controller_get_appsrc(PipelineController *pc);
 void     pipeline_controller_snapshot(PipelineController *pc, UvViewerStats *stats);
 gboolean pipeline_controller_update(PipelineController *pc, const UvPipelineOverrides *overrides, GError **error);
+GstElement *pipeline_controller_get_sink(PipelineController *pc);
+
+GstElement *uv_internal_viewer_get_sink(struct _UvViewer *viewer);
 
 void uv_log_info(const char *fmt, ...) G_GNUC_PRINTF(1, 2);
 void uv_log_warn(const char *fmt, ...) G_GNUC_PRINTF(1, 2);

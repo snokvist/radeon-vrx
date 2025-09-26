@@ -156,3 +156,8 @@ bool uv_viewer_get_stats(UvViewer *viewer, UvViewerStats *stats) {
     uv_internal_qos_db_snapshot(&viewer->qos, stats);
     return TRUE;
 }
+
+GstElement *uv_internal_viewer_get_sink(UvViewer *viewer) {
+    if (!viewer) return NULL;
+    return pipeline_controller_get_sink(&viewer->pipeline);
+}

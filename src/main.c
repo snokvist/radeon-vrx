@@ -1,4 +1,4 @@
-#include "cli_shell.h"
+#include "gui_shell.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -55,9 +55,9 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    uv_cli_run(viewer, &cfg);
+    int status = uv_gui_run(viewer, &cfg, argv ? argv[0] : NULL);
 
     uv_viewer_stop(viewer);
     uv_viewer_free(viewer);
-    return 0;
+    return status;
 }

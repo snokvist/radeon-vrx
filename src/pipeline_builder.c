@@ -71,7 +71,8 @@ static void on_enough_data(GstAppSrc *src, gpointer user_data) {
 static gboolean pipeline_swap_to_fakesink(PipelineController *pc) {
     if (!pc || !pc->pipeline || !pc->queue_postdec || !pc->sink) return FALSE;
 
-    gst_element_unlink(pc->queue_postdec, pc->sink);
+    GstElement *upstream = pc->video_convert ? pc->video_convert : pc->queue_postdec;
+    gst_element_unlink(upstream, pc->sink);
     gst_bin_remove(GST_BIN(pc->pipeline), pc->sink);
 
     GstElement *fakesink = gst_element_factory_make("fakesink", "sink");
@@ -79,7 +80,7 @@ static gboolean pipeline_swap_to_fakesink(PipelineController *pc) {
     g_object_set(fakesink, "sync", FALSE, "async", FALSE, NULL);
 
     gst_bin_add(GST_BIN(pc->pipeline), fakesink);
-    if (!gst_element_link(pc->queue_postdec, fakesink)) {
+    if (!gst_element_link(upstream, fakesink)) {
         gst_bin_remove(GST_BIN(pc->pipeline), fakesink);
         return FALSE;
     }
@@ -105,6 +106,7 @@ static gboolean build_pipeline(PipelineController *pc, GError **error) {
         if (pc->decoder) uv_log_warn("Using avdec_h265 software decoder fallback");
     }
     pc->queue_postdec    = gst_element_factory_make("queue", "queue_postdec");
+    pc->video_convert    = gst_element_factory_make("videoconvert", "video_convert");
 
     gboolean headless = (g_getenv("WAYLAND_DISPLAY") == NULL && g_getenv("DISPLAY") == NULL);
     gboolean sink_is_fakesink = FALSE;
@@ -115,7 +117,8 @@ static gboolean build_pipeline(PipelineController *pc, GError **error) {
             sink_is_fakesink = TRUE;
         }
     } else {
-        pc->sink = gst_element_factory_make("waylandsink", "sink");
+        pc->sink = gst_element_factory_make("gtk4paintablesink", "sink");
+        if (!pc->sink) pc->sink = gst_element_factory_make("waylandsink", "sink");
         if (!pc->sink) pc->sink = gst_element_factory_make("glimagesink", "sink");
         if (!pc->sink) pc->sink = gst_element_factory_make("xvimagesink", "sink");
         if (!pc->sink) pc->sink = gst_element_factory_make("autovideosink", "sink");
@@ -130,7 +133,7 @@ static gboolean build_pipeline(PipelineController *pc, GError **error) {
 
     if (!pc->appsrc_element || !capsf_rtp || !pc->queue0 || !pc->jitterbuffer ||
         !pc->depay || !pc->parser || !pc->capsfilter || !pc->decoder ||
-        !pc->queue_postdec || !pc->sink) {
+        !pc->queue_postdec || !pc->video_convert || !pc->sink) {
         g_set_error(error, g_quark_from_static_string("uv-viewer"), 10,
                     "Failed to create required GStreamer elements");
         return FALSE;
@@ -200,11 +203,11 @@ static gboolean build_pipeline(PipelineController *pc, GError **error) {
     gst_bin_add_many(GST_BIN(pc->pipeline),
                      pc->appsrc_element, capsf_rtp, pc->queue0, pc->jitterbuffer,
                      pc->depay, pc->parser, pc->capsfilter,
-                     pc->decoder, pc->queue_postdec, pc->sink, NULL);
+                     pc->decoder, pc->queue_postdec, pc->video_convert, pc->sink, NULL);
 
     if (!gst_element_link_many(pc->appsrc_element, capsf_rtp, pc->queue0, pc->jitterbuffer,
                                pc->depay, pc->parser, pc->capsfilter,
-                               pc->decoder, pc->queue_postdec, pc->sink, NULL)) {
+                               pc->decoder, pc->queue_postdec, pc->video_convert, pc->sink, NULL)) {
         g_set_error(error, g_quark_from_static_string("uv-viewer"), 14,
                     "Failed to link pipeline");
         return FALSE;
@@ -238,8 +241,14 @@ static void set_appsrc_callbacks(PipelineController *pc) {
 
 static gpointer pipeline_loop_thread(gpointer data) {
     PipelineController *pc = (PipelineController *)data;
+    if (pc->loop_context) {
+        g_main_context_push_thread_default(pc->loop_context);
+    }
     if (pc->loop) {
         g_main_loop_run(pc->loop);
+    }
+    if (pc->loop_context) {
+        g_main_context_pop_thread_default(pc->loop_context);
     }
     return NULL;
 }
@@ -266,9 +275,14 @@ void pipeline_controller_deinit(PipelineController *pc) {
         gst_object_unref(pc->pipeline);
         pc->pipeline = NULL;
     }
+    pc->video_convert = NULL;
     if (pc->loop) {
         g_main_loop_unref(pc->loop);
         pc->loop = NULL;
+    }
+    if (pc->loop_context) {
+        g_main_context_unref(pc->loop_context);
+        pc->loop_context = NULL;
     }
 }
 
@@ -276,13 +290,26 @@ gboolean pipeline_controller_start(PipelineController *pc, GError **error) {
     g_return_val_if_fail(pc != NULL, FALSE);
     ensure_gstreamer_initialized();
 
+    if (!pc->loop_context) {
+        pc->loop_context = g_main_context_new();
+    }
+
     if (!pc->pipeline) {
-        if (!build_pipeline(pc, error)) {
+        if (pc->loop_context) {
+            g_main_context_push_thread_default(pc->loop_context);
+        }
+        gboolean built = build_pipeline(pc, error);
+        if (pc->loop_context) {
+            g_main_context_pop_thread_default(pc->loop_context);
+        }
+        if (!built) {
             return FALSE;
         }
     }
 
-    if (!pc->loop) pc->loop = g_main_loop_new(NULL, FALSE);
+    if (!pc->loop) {
+        pc->loop = g_main_loop_new(pc->loop_context, FALSE);
+    }
 
     GstStateChangeReturn ret = gst_element_set_state(pc->pipeline, GST_STATE_PLAYING);
     if (ret == GST_STATE_CHANGE_FAILURE) {
@@ -398,4 +425,8 @@ gboolean pipeline_controller_update(PipelineController *pc, const UvPipelineOver
     g_set_error(error, g_quark_from_static_string("uv-viewer"), 30,
                 "Pipeline overrides not implemented yet");
     return FALSE;
+}
+
+GstElement *pipeline_controller_get_sink(PipelineController *pc) {
+    return pc ? pc->sink : NULL;
 }
