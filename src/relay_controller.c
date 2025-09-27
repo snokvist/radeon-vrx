@@ -85,9 +85,16 @@ static inline uint32_t rtp_now_ts(int clock_rate) {
     return (uint32_t)((uint64_t)ts);
 }
 
-static inline void rtp_update_stats(UvRelaySource *s, const unsigned char *p, size_t len, int clock_rate) {
+static inline void rtp_update_stats(UvRelaySource *s, const unsigned char *p, size_t len, int clock_rate, int primary_payload_type) {
     if (len < 12) return;
     if ((p[0] & 0xC0) != 0x80) return;
+
+    if (primary_payload_type >= 0) {
+        int payload_type = p[1] & 0x7F;
+        if (payload_type != primary_payload_type) {
+            return; // ignore non-primary RTP payload types for stats tracking
+        }
+    }
 
     uint16_t seq = (uint16_t)((p[2] << 8) | p[3]);
     uint32_t ts  = (uint32_t)((p[4] << 24) | (p[5] << 16) | (p[6] << 8) | p[7]);
@@ -122,7 +129,7 @@ static inline void rtp_update_stats(UvRelaySource *s, const unsigned char *p, si
     }
 }
 
-static GstFlowReturn relay_push_buffer(RelayController *rc, UvRelaySource *src, const unsigned char *buf, size_t len) {
+static GstFlowReturn relay_push_buffer(RelayController *rc, const unsigned char *buf, size_t len) {
     if (!rc->appsrc) return GST_FLOW_ERROR;
     GstBuffer *gbuf = gst_buffer_new_allocate(NULL, (gsize)len, NULL);
     if (!gbuf) return GST_FLOW_ERROR;
@@ -132,12 +139,7 @@ static GstFlowReturn relay_push_buffer(RelayController *rc, UvRelaySource *src, 
         gst_buffer_unmap(gbuf, &map);
     }
     GST_BUFFER_FLAG_SET(gbuf, GST_BUFFER_FLAG_LIVE);
-    GstFlowReturn ret = gst_app_src_push_buffer(rc->appsrc, gbuf);
-    if (ret == GST_FLOW_OK && src) {
-        src->forwarded_packets++;
-        src->forwarded_bytes += (uint64_t)len;
-    }
-    return ret;
+    return gst_app_src_push_buffer(rc->appsrc, gbuf);
 }
 
 static gpointer relay_thread_run(gpointer data) {
@@ -155,6 +157,9 @@ static gpointer relay_thread_run(gpointer data) {
 
     int reuse = 1;
     setsockopt(in_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+
+    int rcvbuf = 4 * 1024 * 1024; // allow bursty sources before poll loop catches up
+    setsockopt(in_fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
 
     struct sockaddr_in bind_addr = {
         .sin_family = AF_INET,
@@ -211,7 +216,7 @@ static gpointer relay_thread_run(gpointer data) {
             src->rx_packets++;
             src->rx_bytes += (uint64_t)r;
             src->last_seen_us = g_get_monotonic_time();
-            rtp_update_stats(src, buf, (size_t)r, viewer->config.clock_rate);
+            rtp_update_stats(src, buf, (size_t)r, viewer->config.clock_rate, viewer->config.payload_type);
         }
         if (is_new && src) {
             char addr[64];
@@ -227,13 +232,7 @@ static gpointer relay_thread_run(gpointer data) {
         }
 
         gboolean push_now = rc->push_enabled && rc->selected_index >= 0 && idx == rc->selected_index;
-        GstFlowReturn push_ret = GST_FLOW_OK;
-        if (push_now && src) {
-            push_ret = relay_push_buffer(rc, src, buf, (size_t)r);
-            if (push_ret != GST_FLOW_OK) {
-                uv_log_warn("Relay: appsrc push returned %s", gst_flow_get_name(push_ret));
-            }
-        }
+        int push_index = push_now ? idx : -1;
         g_mutex_unlock(&rc->lock);
 
         if (emit_added) {
@@ -243,7 +242,22 @@ static gpointer relay_thread_run(gpointer data) {
             uv_internal_emit_event(viewer, UV_VIEWER_EVENT_SOURCE_SELECTED, rc->selected_index, &snapshot, NULL);
         }
 
-        (void)push_ret;
+        if (push_index >= 0) {
+            GstFlowReturn push_ret = relay_push_buffer(rc, buf, (size_t)r);
+            if (push_ret != GST_FLOW_OK) {
+                uv_log_warn("Relay: appsrc push returned %s", gst_flow_get_name(push_ret));
+            } else {
+                g_mutex_lock(&rc->lock);
+                if (push_index >= 0 && (guint)push_index < rc->sources_count) {
+                    UvRelaySource *forward_src = &rc->sources[push_index];
+                    if (forward_src->in_use) {
+                        forward_src->forwarded_packets++;
+                        forward_src->forwarded_bytes += (uint64_t)r;
+                    }
+                }
+                g_mutex_unlock(&rc->lock);
+            }
+        }
     }
 
     close(in_fd);
