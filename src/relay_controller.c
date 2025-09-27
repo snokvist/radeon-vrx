@@ -3,10 +3,155 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <math.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
+
+#define UV_FRAME_BLOCK_DEFAULT_WIDTH  100u
+#define UV_FRAME_BLOCK_DEFAULT_HEIGHT 100u
+#define UV_FRAME_BLOCK_COLOR_BUCKETS  4u
+
+typedef struct UvFrameBlockState {
+    guint width;
+    guint height;
+    guint capacity;
+    guint cursor;
+    guint filled;
+    gboolean have_baseline;
+    gboolean snapshot_complete;
+    gboolean wrap_pending;
+    gboolean summary_valid;
+    double thresholds_ms[3];
+    double *values_ms; // array length == capacity
+    double sum_lateness_ms;
+    double min_lateness_ms;
+    double max_lateness_ms;
+    guint color_counts[UV_FRAME_BLOCK_COLOR_BUCKETS];
+    uint32_t last_frame_ts;
+    gint64 last_frame_arrival_us;
+} UvFrameBlockState;
+
+static void frame_block_state_reset(UvFrameBlockState *state);
+
+static UvFrameBlockState *frame_block_state_new(guint width, guint height) {
+    UvFrameBlockState *state = g_new0(UvFrameBlockState, 1);
+    state->width = MAX(width, 1u);
+    state->height = MAX(height, 1u);
+    state->capacity = state->width * state->height;
+    state->values_ms = g_new(double, state->capacity);
+    frame_block_state_reset(state);
+    return state;
+}
+
+static void frame_block_state_free(UvFrameBlockState *state) {
+    if (!state) return;
+    g_free(state->values_ms);
+    state->values_ms = NULL;
+    g_free(state);
+}
+
+static void frame_block_state_reset(UvFrameBlockState *state) {
+    if (!state) return;
+    state->cursor = 0;
+    state->filled = 0;
+    state->have_baseline = FALSE;
+    state->snapshot_complete = FALSE;
+    state->wrap_pending = FALSE;
+    state->summary_valid = FALSE;
+    state->sum_lateness_ms = 0.0;
+    state->min_lateness_ms = 0.0;
+    state->max_lateness_ms = 0.0;
+    memset(state->color_counts, 0, sizeof(state->color_counts));
+    state->last_frame_ts = 0;
+    state->last_frame_arrival_us = 0;
+    for (guint i = 0; i < state->capacity; i++) {
+        state->values_ms[i] = NAN;
+    }
+}
+
+static guint frame_block_classify_lateness(const UvFrameBlockState *state, double lateness_ms) {
+    if (lateness_ms <= state->thresholds_ms[0]) return 0;
+    if (lateness_ms <= state->thresholds_ms[1]) return 1;
+    if (lateness_ms <= state->thresholds_ms[2]) return 2;
+    return 3;
+}
+
+static void frame_block_state_reclassify(UvFrameBlockState *state) {
+    if (!state) return;
+    memset(state->color_counts, 0, sizeof(state->color_counts));
+    if (state->filled == 0) return;
+    for (guint i = 0; i < state->filled; i++) {
+        double v = state->values_ms[i];
+        if (isnan(v)) continue;
+        guint bucket = frame_block_classify_lateness(state, v);
+        if (bucket < UV_FRAME_BLOCK_COLOR_BUCKETS) {
+            state->color_counts[bucket]++;
+        }
+    }
+}
+
+static void frame_block_state_apply_thresholds(UvFrameBlockState *state, const double thresholds_ms[3]) {
+    if (!state || !thresholds_ms) return;
+    for (guint i = 0; i < 3; i++) {
+        state->thresholds_ms[i] = thresholds_ms[i];
+    }
+    frame_block_state_reclassify(state);
+}
+
+static void frame_block_state_record(UvFrameBlockState *state, double lateness_ms, gboolean snapshot_mode) {
+    if (!state) return;
+
+    if (state->wrap_pending) {
+        frame_block_state_reset(state);
+    }
+
+    if (state->filled >= state->capacity) {
+        if (snapshot_mode) {
+            state->snapshot_complete = TRUE;
+            return;
+        }
+        frame_block_state_reset(state);
+    }
+
+    guint idx = state->cursor;
+    if (idx >= state->capacity) idx = state->capacity - 1;
+
+    state->values_ms[idx] = lateness_ms;
+
+    if (state->filled == 0) {
+        state->min_lateness_ms = lateness_ms;
+        state->max_lateness_ms = lateness_ms;
+        state->sum_lateness_ms = lateness_ms;
+        state->summary_valid = TRUE;
+    } else {
+        state->sum_lateness_ms += lateness_ms;
+        if (lateness_ms < state->min_lateness_ms) state->min_lateness_ms = lateness_ms;
+        if (lateness_ms > state->max_lateness_ms) state->max_lateness_ms = lateness_ms;
+    }
+
+    guint bucket = frame_block_classify_lateness(state, lateness_ms);
+    if (bucket < UV_FRAME_BLOCK_COLOR_BUCKETS) {
+        state->color_counts[bucket]++;
+    }
+
+    if (state->filled < state->capacity) {
+        state->filled++;
+    }
+
+    if (state->cursor < state->capacity) {
+        state->cursor++;
+    }
+
+    if (state->filled >= state->capacity) {
+        if (snapshot_mode) {
+            state->snapshot_complete = TRUE;
+        } else {
+            state->wrap_pending = TRUE;
+        }
+    }
+}
 
 static void addr_to_str(const struct sockaddr_in *sa, char *out, size_t outlen) {
     char ip[INET_ADDRSTRLEN] = {0};
@@ -39,6 +184,9 @@ static void relay_source_clear_stats(UvRelaySource *src, gboolean reset_totals) 
     src->jitter_initialized = FALSE;
     src->jitter_prev_transit = 0;
     src->jitter_value = 0.0;
+    if (src->frame_block) {
+        frame_block_state_reset(src->frame_block);
+    }
 }
 
 static bool relay_add_or_find(RelayController *rc, const struct sockaddr_in *from, socklen_t fromlen, int *out_idx) {
@@ -78,14 +226,86 @@ static inline uint32_t rtp_ext_seq(UvRelaySource *s, uint16_t seq16) {
     return s->rtp_cycles + seq16;
 }
 
-static inline uint32_t rtp_now_ts(int clock_rate) {
-    gint64 us = g_get_monotonic_time();
+static inline uint32_t rtp_now_ts_from_us(int clock_rate, gint64 us) {
     long double ts = ((long double)us * (long double)clock_rate) / 1000000.0L;
     if (ts < 0) ts = 0;
     return (uint32_t)((uint64_t)ts);
 }
 
-static inline void rtp_update_stats(UvRelaySource *s, const unsigned char *p, size_t len, int clock_rate, int primary_payload_type) {
+static inline uint32_t rtp_now_ts(int clock_rate) {
+    return rtp_now_ts_from_us(clock_rate, g_get_monotonic_time());
+}
+
+static void frame_block_process_packet(RelayController *rc,
+                                       UvRelaySource *src,
+                                       uint32_t ts,
+                                       gboolean marker,
+                                       gint64 arrival_us,
+                                       int clock_rate,
+                                       gboolean is_selected) {
+    if (!rc || !src) return;
+    if (!marker) return;
+
+    if (!rc->frame_block.enabled || !is_selected) {
+        if (src->frame_block) {
+            src->frame_block->have_baseline = FALSE;
+        }
+        return;
+    }
+
+    UvFrameBlockState *state = src->frame_block;
+    if (!state) {
+        state = frame_block_state_new(rc->frame_block.width, rc->frame_block.height);
+        frame_block_state_apply_thresholds(state, rc->frame_block.thresholds_ms);
+        src->frame_block = state;
+    }
+
+    if (rc->frame_block.reset_requested) {
+        frame_block_state_reset(state);
+        rc->frame_block.reset_requested = FALSE;
+    }
+    if (rc->frame_block.thresholds_dirty) {
+        frame_block_state_apply_thresholds(state, rc->frame_block.thresholds_ms);
+        rc->frame_block.thresholds_dirty = FALSE;
+    }
+
+    if (!state->have_baseline) {
+        state->last_frame_ts = ts;
+        state->last_frame_arrival_us = arrival_us;
+        state->have_baseline = TRUE;
+        return;
+    }
+
+    guint32 ts_delta = ts - state->last_frame_ts;
+    double expected_ms = 0.0;
+    if (clock_rate > 0) {
+        expected_ms = ((double)ts_delta * 1000.0) / (double)clock_rate;
+    }
+
+    double arrival_delta_ms = 0.0;
+    if (arrival_us > state->last_frame_arrival_us) {
+        arrival_delta_ms = (double)(arrival_us - state->last_frame_arrival_us) / 1000.0;
+    }
+
+    double lateness_ms = arrival_delta_ms - expected_ms;
+    if (lateness_ms < 0.0) lateness_ms = 0.0;
+
+    state->last_frame_ts = ts;
+    state->last_frame_arrival_us = arrival_us;
+    state->have_baseline = TRUE;
+
+    if (rc->frame_block.paused) return;
+
+    frame_block_state_record(state, lateness_ms, rc->frame_block.snapshot_mode);
+}
+
+static inline void rtp_update_stats(RelayController *rc,
+                                    UvRelaySource *s,
+                                    const unsigned char *p,
+                                    size_t len,
+                                    int clock_rate,
+                                    int primary_payload_type,
+                                    gboolean is_selected) {
     if (len < 12) return;
     if ((p[0] & 0xC0) != 0x80) return;
 
@@ -95,6 +315,8 @@ static inline void rtp_update_stats(UvRelaySource *s, const unsigned char *p, si
             return; // ignore non-primary RTP payload types for stats tracking
         }
     }
+
+    gboolean marker = (p[1] & 0x80) != 0;
 
     uint16_t seq = (uint16_t)((p[2] << 8) | p[3]);
     uint32_t ts  = (uint32_t)((p[4] << 24) | (p[5] << 16) | (p[6] << 8) | p[7]);
@@ -116,7 +338,8 @@ static inline void rtp_update_stats(UvRelaySource *s, const unsigned char *p, si
         if (ext > s->rtp_max_ext_seq) s->rtp_max_ext_seq = ext;
     }
 
-    uint32_t arrival_ts = rtp_now_ts(clock_rate);
+    gint64 arrival_us = g_get_monotonic_time();
+    uint32_t arrival_ts = rtp_now_ts_from_us(clock_rate, arrival_us);
     uint32_t transit = arrival_ts - ts;
     if (!s->jitter_initialized) {
         s->jitter_initialized = TRUE;
@@ -127,6 +350,8 @@ static inline void rtp_update_stats(UvRelaySource *s, const unsigned char *p, si
         s->jitter_value += ((double)d - s->jitter_value) / 16.0;
         s->jitter_prev_transit = transit;
     }
+
+    frame_block_process_packet(rc, s, ts, marker, arrival_us, clock_rate, is_selected);
 }
 
 static GstFlowReturn relay_push_buffer(RelayController *rc, const unsigned char *buf, size_t len) {
@@ -216,7 +441,14 @@ static gpointer relay_thread_run(gpointer data) {
             src->rx_packets++;
             src->rx_bytes += (uint64_t)r;
             src->last_seen_us = g_get_monotonic_time();
-            rtp_update_stats(src, buf, (size_t)r, viewer->config.clock_rate, viewer->config.payload_type);
+            gboolean is_selected = (idx == rc->selected_index);
+            rtp_update_stats(rc,
+                             src,
+                             buf,
+                             (size_t)r,
+                             viewer->config.clock_rate,
+                             viewer->config.payload_type,
+                             is_selected);
         }
         if (is_new && src) {
             char addr[64];
@@ -275,6 +507,16 @@ gboolean relay_controller_init(RelayController *rc, struct _UvViewer *viewer) {
     rc->listen_port = viewer->config.listen_port;
     rc->selected_index = -1;
     rc->viewer = viewer;
+    rc->frame_block.enabled = FALSE;
+    rc->frame_block.paused = FALSE;
+    rc->frame_block.snapshot_mode = FALSE;
+    rc->frame_block.width = UV_FRAME_BLOCK_DEFAULT_WIDTH;
+    rc->frame_block.height = UV_FRAME_BLOCK_DEFAULT_HEIGHT;
+    rc->frame_block.thresholds_ms[0] = 5.0;
+    rc->frame_block.thresholds_ms[1] = 15.0;
+    rc->frame_block.thresholds_ms[2] = 30.0;
+    rc->frame_block.reset_requested = TRUE;
+    rc->frame_block.thresholds_dirty = TRUE;
     return TRUE;
 }
 
@@ -283,6 +525,10 @@ void relay_controller_deinit(RelayController *rc) {
     relay_controller_stop(rc);
     g_mutex_lock(&rc->lock);
     rc->appsrc = NULL;
+    for (guint i = 0; i < rc->sources_count; i++) {
+        frame_block_state_free(rc->sources[i].frame_block);
+        rc->sources[i].frame_block = NULL;
+    }
     rc->sources_count = 0;
     rc->selected_index = -1;
     g_mutex_unlock(&rc->lock);
@@ -317,7 +563,15 @@ gboolean relay_controller_select(RelayController *rc, int index, GError **error)
     g_mutex_lock(&rc->lock);
     if (index >= 0 && (guint)index < rc->sources_count && rc->sources[index].in_use) {
         rc->selected_index = index;
-        snapshot = rc->sources[index];
+        UvRelaySource *selected_src = &rc->sources[index];
+        snapshot = *selected_src;
+        if (rc->frame_block.enabled) {
+            if (!selected_src->frame_block) {
+                selected_src->frame_block = frame_block_state_new(rc->frame_block.width, rc->frame_block.height);
+                frame_block_state_apply_thresholds(selected_src->frame_block, rc->frame_block.thresholds_ms);
+            }
+            frame_block_state_reset(selected_src->frame_block);
+        }
         valid = TRUE;
     }
     g_mutex_unlock(&rc->lock);
@@ -342,7 +596,15 @@ gboolean relay_controller_select_next(RelayController *rc, GError **error) {
             rc->selected_index = (rc->selected_index + 1) % (int)rc->sources_count;
         }
         next_index = rc->selected_index;
-        snapshot = rc->sources[next_index];
+        UvRelaySource *selected_src = &rc->sources[next_index];
+        snapshot = *selected_src;
+        if (rc->frame_block.enabled) {
+            if (!selected_src->frame_block) {
+                selected_src->frame_block = frame_block_state_new(rc->frame_block.width, rc->frame_block.height);
+                frame_block_state_apply_thresholds(selected_src->frame_block, rc->frame_block.thresholds_ms);
+            }
+            frame_block_state_reset(selected_src->frame_block);
+        }
         success = TRUE;
     }
     g_mutex_unlock(&rc->lock);
@@ -361,7 +623,14 @@ int relay_controller_selected(const RelayController *rc) {
 
 void relay_controller_snapshot(RelayController *rc, UvViewerStats *stats, int clock_rate) {
     if (!rc || !stats) return;
+    (void)clock_rate;
     gint64 now_us = g_get_monotonic_time();
+
+    GArray *fb_values = stats->frame_block.lateness_ms;
+    memset(&stats->frame_block, 0, sizeof(stats->frame_block));
+    stats->frame_block.lateness_ms = fb_values;
+    if (fb_values) g_array_set_size(fb_values, 0);
+    stats->frame_block_valid = FALSE;
 
     g_mutex_lock(&rc->lock);
     for (guint i = 0; i < rc->sources_count; i++) {
@@ -401,6 +670,61 @@ void relay_controller_snapshot(RelayController *rc, UvViewerStats *stats, int cl
         src->prev_timestamp_us = now_us;
 
         g_array_append_val(stats->sources, s);
+
+        if (s.selected) {
+            stats->frame_block_valid = TRUE;
+            UvFrameBlockStats *fb = &stats->frame_block;
+            UvFrameBlockState *state = src->frame_block;
+
+            fb->active = rc->frame_block.enabled;
+            fb->paused = rc->frame_block.paused;
+            fb->snapshot_mode = rc->frame_block.snapshot_mode;
+            fb->snapshot_complete = state ? state->snapshot_complete : FALSE;
+
+            fb->width = state ? state->width : rc->frame_block.width;
+            fb->height = state ? state->height : rc->frame_block.height;
+            if (fb->width == 0) fb->width = UV_FRAME_BLOCK_DEFAULT_WIDTH;
+            if (fb->height == 0) fb->height = UV_FRAME_BLOCK_DEFAULT_HEIGHT;
+            guint capacity = fb->width * fb->height;
+
+            if (!fb->lateness_ms) {
+                fb->lateness_ms = g_array_new(FALSE, TRUE, sizeof(double));
+            }
+            g_array_set_size(fb->lateness_ms, capacity);
+
+            if (state && state->values_ms) {
+                for (guint k = 0; k < capacity && k < state->capacity; k++) {
+                    g_array_index(fb->lateness_ms, double, k) = state->values_ms[k];
+                }
+                for (guint k = state->capacity; k < capacity; k++) {
+                    g_array_index(fb->lateness_ms, double, k) = NAN;
+                }
+            } else {
+                for (guint k = 0; k < capacity; k++) {
+                    g_array_index(fb->lateness_ms, double, k) = NAN;
+                }
+            }
+
+            memcpy(fb->thresholds_ms, rc->frame_block.thresholds_ms, sizeof(fb->thresholds_ms));
+
+            if (state && state->filled > 0 && state->summary_valid) {
+                fb->filled = state->filled;
+                fb->next_index = MIN(state->cursor, state->capacity);
+                fb->min_lateness_ms = state->min_lateness_ms;
+                fb->max_lateness_ms = state->max_lateness_ms;
+                fb->avg_lateness_ms = state->sum_lateness_ms / (double)state->filled;
+                for (guint c = 0; c < UV_FRAME_BLOCK_COLOR_BUCKETS; c++) {
+                    fb->color_counts[c] = state->color_counts[c];
+                }
+            } else {
+                fb->filled = 0;
+                fb->next_index = 0;
+                fb->min_lateness_ms = 0.0;
+                fb->max_lateness_ms = 0.0;
+                fb->avg_lateness_ms = 0.0;
+                memset(fb->color_counts, 0, sizeof(fb->color_counts));
+            }
+        }
     }
     g_mutex_unlock(&rc->lock);
 }
@@ -416,5 +740,85 @@ void relay_controller_set_push_enabled(RelayController *rc, gboolean enabled) {
     if (!rc) return;
     g_mutex_lock(&rc->lock);
     rc->push_enabled = enabled;
+    g_mutex_unlock(&rc->lock);
+}
+
+void relay_controller_frame_block_configure(RelayController *rc, gboolean enabled, gboolean snapshot_mode) {
+    if (!rc) return;
+    g_mutex_lock(&rc->lock);
+    rc->frame_block.enabled = enabled;
+    rc->frame_block.snapshot_mode = snapshot_mode;
+    if (!enabled) {
+        rc->frame_block.paused = FALSE;
+    }
+    rc->frame_block.reset_requested = TRUE;
+    for (guint i = 0; i < rc->sources_count; i++) {
+        UvRelaySource *src = &rc->sources[i];
+        if (src->frame_block) {
+            frame_block_state_reset(src->frame_block);
+        }
+    }
+    rc->frame_block.reset_requested = FALSE;
+    g_mutex_unlock(&rc->lock);
+}
+
+void relay_controller_frame_block_pause(RelayController *rc, gboolean paused) {
+    if (!rc) return;
+    g_mutex_lock(&rc->lock);
+    rc->frame_block.paused = paused;
+    g_mutex_unlock(&rc->lock);
+}
+
+void relay_controller_frame_block_reset(RelayController *rc) {
+    if (!rc) return;
+    g_mutex_lock(&rc->lock);
+    rc->frame_block.reset_requested = TRUE;
+    for (guint i = 0; i < rc->sources_count; i++) {
+        UvRelaySource *src = &rc->sources[i];
+        if (src->frame_block) {
+            frame_block_state_reset(src->frame_block);
+        }
+    }
+    rc->frame_block.reset_requested = FALSE;
+    g_mutex_unlock(&rc->lock);
+}
+
+void relay_controller_frame_block_set_thresholds(RelayController *rc,
+                                                 double green_ms,
+                                                 double yellow_ms,
+                                                 double orange_ms) {
+    if (!rc) return;
+    if (green_ms < 0.0) green_ms = 0.0;
+    if (yellow_ms < 0.0) yellow_ms = 0.0;
+    if (orange_ms < 0.0) orange_ms = 0.0;
+
+    if (green_ms > yellow_ms) {
+        double tmp = green_ms;
+        green_ms = yellow_ms;
+        yellow_ms = tmp;
+    }
+    if (yellow_ms > orange_ms) {
+        double tmp = yellow_ms;
+        yellow_ms = orange_ms;
+        orange_ms = tmp;
+    }
+    if (green_ms > yellow_ms) {
+        double tmp = green_ms;
+        green_ms = yellow_ms;
+        yellow_ms = tmp;
+    }
+
+    g_mutex_lock(&rc->lock);
+    rc->frame_block.thresholds_ms[0] = green_ms;
+    rc->frame_block.thresholds_ms[1] = yellow_ms;
+    rc->frame_block.thresholds_ms[2] = orange_ms;
+    rc->frame_block.thresholds_dirty = TRUE;
+    for (guint i = 0; i < rc->sources_count; i++) {
+        UvRelaySource *src = &rc->sources[i];
+        if (src->frame_block) {
+            frame_block_state_apply_thresholds(src->frame_block, rc->frame_block.thresholds_ms);
+        }
+    }
+    rc->frame_block.thresholds_dirty = FALSE;
     g_mutex_unlock(&rc->lock);
 }

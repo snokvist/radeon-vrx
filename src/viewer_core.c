@@ -127,6 +127,29 @@ bool uv_viewer_update_pipeline(UvViewer *viewer, const UvPipelineOverrides *over
     return pipeline_controller_update(&viewer->pipeline, overrides, error);
 }
 
+void uv_viewer_frame_block_configure(UvViewer *viewer, gboolean enabled, gboolean snapshot_mode) {
+    if (!viewer) return;
+    relay_controller_frame_block_configure(&viewer->relay, enabled, snapshot_mode);
+}
+
+void uv_viewer_frame_block_pause(UvViewer *viewer, gboolean paused) {
+    if (!viewer) return;
+    relay_controller_frame_block_pause(&viewer->relay, paused);
+}
+
+void uv_viewer_frame_block_reset(UvViewer *viewer) {
+    if (!viewer) return;
+    relay_controller_frame_block_reset(&viewer->relay);
+}
+
+void uv_viewer_frame_block_set_thresholds(UvViewer *viewer,
+                                          double green_ms,
+                                          double yellow_ms,
+                                          double orange_ms) {
+    if (!viewer) return;
+    relay_controller_frame_block_set_thresholds(&viewer->relay, green_ms, yellow_ms, orange_ms);
+}
+
 void uv_viewer_stats_init(UvViewerStats *stats) {
     if (!stats) return;
     stats->sources = g_array_new(FALSE, TRUE, sizeof(UvSourceStats));
@@ -134,6 +157,9 @@ void uv_viewer_stats_init(UvViewerStats *stats) {
     memset(&stats->decoder, 0, sizeof(stats->decoder));
     stats->queue0_valid = FALSE;
     memset(&stats->queue0, 0, sizeof(stats->queue0));
+    stats->frame_block_valid = FALSE;
+    memset(&stats->frame_block, 0, sizeof(stats->frame_block));
+    stats->frame_block.lateness_ms = g_array_new(FALSE, TRUE, sizeof(double));
 }
 
 void uv_viewer_stats_clear(UvViewerStats *stats) {
@@ -149,6 +175,12 @@ void uv_viewer_stats_clear(UvViewerStats *stats) {
     stats->queue0_valid = FALSE;
     memset(&stats->queue0, 0, sizeof(stats->queue0));
     memset(&stats->decoder, 0, sizeof(stats->decoder));
+    if (stats->frame_block.lateness_ms) {
+        g_array_unref(stats->frame_block.lateness_ms);
+        stats->frame_block.lateness_ms = NULL;
+    }
+    stats->frame_block_valid = FALSE;
+    memset(&stats->frame_block, 0, sizeof(stats->frame_block));
 }
 
 bool uv_viewer_get_stats(UvViewer *viewer, UvViewerStats *stats) {

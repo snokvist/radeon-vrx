@@ -74,11 +74,30 @@ typedef struct {
 } UvQueueStats;
 
 typedef struct {
+    gboolean active;
+    gboolean paused;
+    gboolean snapshot_mode;
+    gboolean snapshot_complete;
+    guint width;
+    guint height;
+    guint filled;
+    guint next_index;
+    double thresholds_ms[3];
+    double min_lateness_ms;
+    double max_lateness_ms;
+    double avg_lateness_ms;
+    guint color_counts[4];
+    GArray *lateness_ms; // double values for current snapshot (size width*height)
+} UvFrameBlockStats;
+
+typedef struct {
     GArray *sources;      // UvSourceStats elements
     GArray *qos_entries;  // UvNamedQoSStats elements
     UvDecoderStats decoder;
     gboolean queue0_valid;
     UvQueueStats queue0;
+    gboolean frame_block_valid;
+    UvFrameBlockStats frame_block;
 } UvViewerStats;
 
 typedef struct {
@@ -118,6 +137,14 @@ bool uv_viewer_select_next_source(UvViewer *viewer, GError **error);
 int  uv_viewer_get_selected_source(const UvViewer *viewer);
 
 bool uv_viewer_update_pipeline(UvViewer *viewer, const UvPipelineOverrides *overrides, GError **error);
+
+void uv_viewer_frame_block_configure(UvViewer *viewer, gboolean enabled, gboolean snapshot_mode);
+void uv_viewer_frame_block_pause(UvViewer *viewer, gboolean paused);
+void uv_viewer_frame_block_reset(UvViewer *viewer);
+void uv_viewer_frame_block_set_thresholds(UvViewer *viewer,
+                                          double green_ms,
+                                          double yellow_ms,
+                                          double orange_ms);
 
 void uv_viewer_stats_init(UvViewerStats *stats);
 void uv_viewer_stats_clear(UvViewerStats *stats);

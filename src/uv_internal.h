@@ -15,6 +15,8 @@ G_BEGIN_DECLS
 #define UV_RTP_WIN_SIZE 4096
 #define UV_RTP_SLOT_EMPTY 0xffffffffu
 
+struct UvFrameBlockState;
+
 typedef struct {
     struct sockaddr_in addr;
     socklen_t addrlen;
@@ -40,8 +42,10 @@ typedef struct {
     uint32_t rtp_seq_slot[UV_RTP_WIN_SIZE];
 
     bool     jitter_initialized;
-    uint32_t jitter_prev_transit;
+   uint32_t jitter_prev_transit;
     double   jitter_value;
+
+    struct UvFrameBlockState *frame_block;
 } UvRelaySource;
 
 typedef struct {
@@ -55,6 +59,17 @@ typedef struct {
     int selected_index;
 
     GstAppSrc *appsrc;
+
+    struct {
+        gboolean enabled;
+        gboolean paused;
+        gboolean snapshot_mode;
+        guint width;
+        guint height;
+        double thresholds_ms[3];
+        gboolean reset_requested;
+        gboolean thresholds_dirty;
+    } frame_block;
 
     GMutex lock;
     struct _UvViewer *viewer;
@@ -149,6 +164,13 @@ int      relay_controller_selected(const RelayController *rc);
 void     relay_controller_snapshot(RelayController *rc, UvViewerStats *stats, int clock_rate);
 void     relay_controller_set_appsrc(RelayController *rc, GstAppSrc *appsrc);
 void     relay_controller_set_push_enabled(RelayController *rc, gboolean enabled);
+void     relay_controller_frame_block_configure(RelayController *rc, gboolean enabled, gboolean snapshot_mode);
+void     relay_controller_frame_block_pause(RelayController *rc, gboolean paused);
+void     relay_controller_frame_block_reset(RelayController *rc);
+void     relay_controller_frame_block_set_thresholds(RelayController *rc,
+                                                     double green_ms,
+                                                     double yellow_ms,
+                                                     double orange_ms);
 
 gboolean pipeline_controller_init(PipelineController *pc, struct _UvViewer *viewer, GError **error);
 void     pipeline_controller_deinit(PipelineController *pc);
