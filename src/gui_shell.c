@@ -12,6 +12,9 @@
 #define FRAME_BLOCK_DEFAULT_GREEN_MS   5.0
 #define FRAME_BLOCK_DEFAULT_YELLOW_MS 15.0
 #define FRAME_BLOCK_DEFAULT_ORANGE_MS 30.0
+#define FRAME_BLOCK_DEFAULT_SIZE_GREEN_KB   64.0
+#define FRAME_BLOCK_DEFAULT_SIZE_YELLOW_KB  256.0
+#define FRAME_BLOCK_DEFAULT_SIZE_ORANGE_KB  512.0
 
 typedef struct {
     UvViewer *viewer;
@@ -46,7 +49,9 @@ typedef struct {
     GtkToggleButton *frame_block_enable_toggle;
     GtkToggleButton *frame_block_pause_toggle;
     GtkDropDown *frame_block_mode_dropdown;
+    GtkDropDown *frame_block_metric_dropdown;
     GtkSpinButton *frame_block_threshold_spins[3];
+    GtkLabel *frame_block_threshold_labels[3];
     GtkCheckButton *frame_block_color_toggles[4];
     GtkLabel *frame_block_summary_label;
     GtkButton *frame_block_reset_button;
@@ -59,12 +64,19 @@ typedef struct {
     guint frame_block_height;
     guint frame_block_filled;
     guint frame_block_next_index;
-    double frame_block_thresholds[3];
+    double frame_block_thresholds_ms[3];
+    double frame_block_thresholds_kb[3];
     double frame_block_min_ms;
     double frame_block_max_ms;
     double frame_block_avg_ms;
-    guint frame_block_color_counts[4];
-    GArray *frame_block_values; // doubles, length width*height
+    double frame_block_min_kb;
+    double frame_block_max_kb;
+    double frame_block_avg_kb;
+    guint frame_block_color_counts_ms[4];
+    guint frame_block_color_counts_kb[4];
+    GArray *frame_block_values_lateness; // doubles
+    GArray *frame_block_values_size;     // doubles
+    guint frame_block_view; // 0 = lateness, 1 = size
 } GuiContext;
 
 typedef struct {
@@ -95,6 +107,9 @@ typedef struct {
     double fps_avg;
 } StatsSample;
 
+#define FRAME_BLOCK_VIEW_LATENESS 0u
+#define FRAME_BLOCK_VIEW_SIZE     1u
+
 static GtkWidget *build_monitor_page(GuiContext *ctx);
 static GtkWidget *build_settings_page(GuiContext *ctx);
 static GtkWidget *build_stats_page(GuiContext *ctx);
@@ -109,6 +124,7 @@ static void frame_block_draw(GtkDrawingArea *area, cairo_t *cr, int width, int h
 static void on_frame_block_enable_toggled(GtkToggleButton *button, gpointer user_data);
 static void on_frame_block_pause_toggled(GtkToggleButton *button, gpointer user_data);
 static void on_frame_block_mode_changed(GObject *dropdown, GParamSpec *pspec, gpointer user_data);
+static void on_frame_block_metric_changed(GObject *dropdown, GParamSpec *pspec, gpointer user_data);
 static void on_frame_block_reset_clicked(GtkButton *button, gpointer user_data);
 static void on_frame_block_threshold_changed(GtkSpinButton *spin, gpointer user_data);
 static void on_frame_block_color_toggled(GtkCheckButton *check, gpointer user_data);
@@ -153,12 +169,20 @@ static void frame_block_apply_thresholds(GuiContext *ctx) {
     double yellow = gtk_spin_button_get_value(GTK_SPIN_BUTTON(ctx->frame_block_threshold_spins[1]));
     double orange = gtk_spin_button_get_value(GTK_SPIN_BUTTON(ctx->frame_block_threshold_spins[2]));
 
-    ctx->frame_block_thresholds[0] = green;
-    ctx->frame_block_thresholds[1] = yellow;
-    ctx->frame_block_thresholds[2] = orange;
-
-    if (ctx->viewer) {
-        uv_viewer_frame_block_set_thresholds(ctx->viewer, green, yellow, orange);
+    if (ctx->frame_block_view == FRAME_BLOCK_VIEW_SIZE) {
+        ctx->frame_block_thresholds_kb[0] = green;
+        ctx->frame_block_thresholds_kb[1] = yellow;
+        ctx->frame_block_thresholds_kb[2] = orange;
+        if (ctx->viewer) {
+            uv_viewer_frame_block_set_size_thresholds(ctx->viewer, green, yellow, orange);
+        }
+    } else {
+        ctx->frame_block_thresholds_ms[0] = green;
+        ctx->frame_block_thresholds_ms[1] = yellow;
+        ctx->frame_block_thresholds_ms[2] = orange;
+        if (ctx->viewer) {
+            uv_viewer_frame_block_set_thresholds(ctx->viewer, green, yellow, orange);
+        }
     }
 }
 
@@ -202,20 +226,33 @@ static void frame_block_update_summary(GuiContext *ctx) {
                                    ctx->frame_block_avg_ms,
                                    ctx->frame_block_max_ms);
 
-            gboolean first_bucket = TRUE;
+            g_string_append(summary, " | Size min/avg/max: ");
+            g_string_append_printf(summary, "%.2f / %.2f / %.2f KB",
+                                   ctx->frame_block_min_kb,
+                                   ctx->frame_block_avg_kb,
+                                   ctx->frame_block_max_kb);
+
+            const guint *counts = (ctx->frame_block_view == FRAME_BLOCK_VIEW_SIZE)
+                ? ctx->frame_block_color_counts_kb
+                : ctx->frame_block_color_counts_ms;
             const char *labels[FRAME_BLOCK_COLOR_COUNT] = {"Green", "Yellow", "Orange", "Red"};
+            gboolean first_bucket = TRUE;
+            const char *bucket_title = (ctx->frame_block_view == FRAME_BLOCK_VIEW_SIZE)
+                ? "Size buckets"
+                : "Lateness buckets";
             for (guint i = 0; i < FRAME_BLOCK_COLOR_COUNT; i++) {
                 if (!ctx->frame_block_colors_visible[i]) continue;
                 if (first_bucket) {
-                    g_string_append(summary, " | Buckets: ");
+                    g_string_append_printf(summary, " | %s: ", bucket_title);
                     first_bucket = FALSE;
                 } else {
                     g_string_append(summary, ", ");
                 }
-                g_string_append_printf(summary, "%s %u", labels[i], ctx->frame_block_color_counts[i]);
+                g_string_append_printf(summary, "%s %u", labels[i], counts[i]);
             }
         } else {
             g_string_append(summary, " | Lateness min/avg/max: -- / -- / -- ms");
+            g_string_append(summary, " | Size min/avg/max: -- / -- / -- KB");
         }
     }
 
@@ -225,9 +262,9 @@ static void frame_block_update_summary(GuiContext *ctx) {
 
 static void frame_block_sync_controls(GuiContext *ctx, const UvFrameBlockStats *fb) {
     if (!ctx) return;
-    gboolean active = fb ? fb->active : FALSE;
-    gboolean paused = fb ? fb->paused : FALSE;
-    gboolean snapshot_mode = fb ? fb->snapshot_mode : FALSE;
+    gboolean active = fb ? fb->active : ctx->frame_block_active;
+    gboolean paused = fb ? fb->paused : ctx->frame_block_paused;
+    gboolean snapshot_mode = fb ? fb->snapshot_mode : ctx->frame_block_snapshot_mode;
 
     if (ctx->frame_block_enable_toggle) {
         gboolean toggled = gtk_toggle_button_get_active(ctx->frame_block_enable_toggle);
@@ -262,19 +299,43 @@ static void frame_block_sync_controls(GuiContext *ctx, const UvFrameBlockStats *
         gtk_widget_set_sensitive(GTK_WIDGET(ctx->frame_block_mode_dropdown), TRUE);
     }
 
+    if (ctx->frame_block_metric_dropdown) {
+        guint desired_view = ctx->frame_block_view;
+        guint current_view = gtk_drop_down_get_selected(ctx->frame_block_metric_dropdown);
+        if (current_view != desired_view) {
+            g_signal_handlers_block_by_func(ctx->frame_block_metric_dropdown, G_CALLBACK(on_frame_block_metric_changed), ctx);
+            gtk_drop_down_set_selected(ctx->frame_block_metric_dropdown, desired_view);
+            g_signal_handlers_unblock_by_func(ctx->frame_block_metric_dropdown, G_CALLBACK(on_frame_block_metric_changed), ctx);
+        }
+        gtk_widget_set_sensitive(GTK_WIDGET(ctx->frame_block_metric_dropdown), TRUE);
+    }
+
     if (ctx->frame_block_reset_button) {
         gtk_widget_set_sensitive(GTK_WIDGET(ctx->frame_block_reset_button), active);
     }
 
+    const double *thresholds = (ctx->frame_block_view == FRAME_BLOCK_VIEW_SIZE)
+        ? ctx->frame_block_thresholds_kb
+        : ctx->frame_block_thresholds_ms;
+    double step = (ctx->frame_block_view == FRAME_BLOCK_VIEW_SIZE) ? 10.0 : 0.5;
+    guint digits = (ctx->frame_block_view == FRAME_BLOCK_VIEW_SIZE) ? 1u : 1u;
+    const char *unit = (ctx->frame_block_view == FRAME_BLOCK_VIEW_SIZE) ? "KB" : "ms";
+
     for (guint i = 0; i < 3; i++) {
         GtkSpinButton *spin = ctx->frame_block_threshold_spins[i];
-        if (!spin || !fb) continue;
-        double current = gtk_spin_button_get_value(spin);
-        double desired = fb->thresholds_ms[i];
-        if (fabs(current - desired) > 0.1) {
-            g_signal_handlers_block_by_func(spin, G_CALLBACK(on_frame_block_threshold_changed), ctx);
-            gtk_spin_button_set_value(spin, desired);
-            g_signal_handlers_unblock_by_func(spin, G_CALLBACK(on_frame_block_threshold_changed), ctx);
+        if (!spin) continue;
+        g_signal_handlers_block_by_func(spin, G_CALLBACK(on_frame_block_threshold_changed), ctx);
+        gtk_spin_button_set_digits(spin, digits);
+        gtk_spin_button_set_increments(spin, step, step * 5.0);
+        gtk_spin_button_set_value(spin, thresholds[i]);
+        g_signal_handlers_unblock_by_func(spin, G_CALLBACK(on_frame_block_threshold_changed), ctx);
+
+        GtkLabel *label = ctx->frame_block_threshold_labels[i];
+        if (label) {
+            const char *base = (i == 0) ? "Green" : (i == 1) ? "Yellow" : "Orange";
+            char text[64];
+            g_snprintf(text, sizeof(text), "%s threshold (%s)", base, unit);
+            gtk_label_set_text(label, text);
         }
     }
 }
@@ -288,13 +349,18 @@ static void frame_block_draw(GtkDrawingArea *area, cairo_t *cr, int width, int h
     cairo_fill(cr);
     cairo_restore(cr);
 
-    if (!ctx || !ctx->frame_block_values) return;
+    if (!ctx) return;
+
+    GArray *values = (ctx->frame_block_view == FRAME_BLOCK_VIEW_SIZE)
+        ? ctx->frame_block_values_size
+        : ctx->frame_block_values_lateness;
+    if (!values) return;
 
     guint w = ctx->frame_block_width ? ctx->frame_block_width : FRAME_BLOCK_DEFAULT_WIDTH;
     guint h = ctx->frame_block_height ? ctx->frame_block_height : FRAME_BLOCK_DEFAULT_HEIGHT;
     guint capacity = w * h;
 
-    if (capacity == 0 || ctx->frame_block_values->len < capacity) return;
+    if (capacity == 0 || values->len < capacity) return;
 
     double cell_w = (w > 0) ? (double)width / (double)w : 0.0;
     double cell_h = (h > 0) ? (double)height / (double)h : 0.0;
@@ -310,15 +376,18 @@ static void frame_block_draw(GtkDrawingArea *area, cairo_t *cr, int width, int h
     for (guint row = 0; row < h; row++) {
         for (guint col = 0; col < w; col++) {
             guint idx = row * w + col;
-            double value = g_array_index(ctx->frame_block_values, double, idx);
+            double value = g_array_index(values, double, idx);
             gboolean has_value = !isnan(value);
 
             double r = 0.22, g = 0.22, b = 0.22;
             if (has_value) {
+                const double *thresholds = (ctx->frame_block_view == FRAME_BLOCK_VIEW_SIZE)
+                    ? ctx->frame_block_thresholds_kb
+                    : ctx->frame_block_thresholds_ms;
                 guint bucket = 0;
-                if (value <= ctx->frame_block_thresholds[0]) bucket = 0;
-                else if (value <= ctx->frame_block_thresholds[1]) bucket = 1;
-                else if (value <= ctx->frame_block_thresholds[2]) bucket = 2;
+                if (value <= thresholds[0]) bucket = 0;
+                else if (value <= thresholds[1]) bucket = 1;
+                else if (value <= thresholds[2]) bucket = 2;
                 else bucket = 3;
 
                 if (bucket < FRAME_BLOCK_COLOR_COUNT) {
@@ -663,15 +732,16 @@ static void refresh_stats(GuiContext *ctx) {
         ctx->frame_block_height = fb->height;
         ctx->frame_block_filled = fb->filled;
         ctx->frame_block_next_index = fb->next_index;
-        ctx->frame_block_thresholds[0] = fb->thresholds_ms[0];
-        ctx->frame_block_thresholds[1] = fb->thresholds_ms[1];
-        ctx->frame_block_thresholds[2] = fb->thresholds_ms[2];
+        memcpy(ctx->frame_block_thresholds_ms, fb->thresholds_lateness_ms, sizeof(ctx->frame_block_thresholds_ms));
+        memcpy(ctx->frame_block_thresholds_kb, fb->thresholds_size_kb, sizeof(ctx->frame_block_thresholds_kb));
         ctx->frame_block_min_ms = fb->min_lateness_ms;
         ctx->frame_block_max_ms = fb->max_lateness_ms;
         ctx->frame_block_avg_ms = fb->avg_lateness_ms;
-        for (guint i = 0; i < FRAME_BLOCK_COLOR_COUNT; i++) {
-            ctx->frame_block_color_counts[i] = fb->color_counts[i];
-        }
+        ctx->frame_block_min_kb = fb->min_size_kb;
+        ctx->frame_block_max_kb = fb->max_size_kb;
+        ctx->frame_block_avg_kb = fb->avg_size_kb;
+        memcpy(ctx->frame_block_color_counts_ms, fb->color_counts_lateness, sizeof(ctx->frame_block_color_counts_ms));
+        memcpy(ctx->frame_block_color_counts_kb, fb->color_counts_size, sizeof(ctx->frame_block_color_counts_kb));
 
         guint capacity = 0;
         if (fb->lateness_ms) capacity = fb->lateness_ms->len;
@@ -680,15 +750,26 @@ static void refresh_stats(GuiContext *ctx) {
             guint h = ctx->frame_block_height ? ctx->frame_block_height : FRAME_BLOCK_DEFAULT_HEIGHT;
             capacity = w * h;
         }
-        if (!ctx->frame_block_values) {
-            ctx->frame_block_values = g_array_new(FALSE, TRUE, sizeof(double));
+        if (!ctx->frame_block_values_lateness) {
+            ctx->frame_block_values_lateness = g_array_new(FALSE, TRUE, sizeof(double));
         }
-        g_array_set_size(ctx->frame_block_values, capacity);
+        if (!ctx->frame_block_values_size) {
+            ctx->frame_block_values_size = g_array_new(FALSE, TRUE, sizeof(double));
+        }
+        g_array_set_size(ctx->frame_block_values_lateness, capacity);
+        g_array_set_size(ctx->frame_block_values_size, capacity);
         if (fb->lateness_ms && fb->lateness_ms->len == capacity && capacity > 0) {
-            memcpy(ctx->frame_block_values->data, fb->lateness_ms->data, sizeof(double) * capacity);
+            memcpy(ctx->frame_block_values_lateness->data, fb->lateness_ms->data, sizeof(double) * capacity);
         } else {
-            for (guint i = 0; i < ctx->frame_block_values->len; i++) {
-                g_array_index(ctx->frame_block_values, double, i) = NAN;
+            for (guint i = 0; i < ctx->frame_block_values_lateness->len; i++) {
+                g_array_index(ctx->frame_block_values_lateness, double, i) = NAN;
+            }
+        }
+        if (fb->frame_size_kb && fb->frame_size_kb->len == capacity && capacity > 0) {
+            memcpy(ctx->frame_block_values_size->data, fb->frame_size_kb->data, sizeof(double) * capacity);
+        } else {
+            for (guint i = 0; i < ctx->frame_block_values_size->len; i++) {
+                g_array_index(ctx->frame_block_values_size, double, i) = NAN;
             }
         }
 
@@ -702,9 +783,16 @@ static void refresh_stats(GuiContext *ctx) {
         ctx->frame_block_min_ms = 0.0;
         ctx->frame_block_max_ms = 0.0;
         ctx->frame_block_avg_ms = 0.0;
-        memset(ctx->frame_block_color_counts, 0, sizeof(ctx->frame_block_color_counts));
-        if (ctx->frame_block_values) {
-            g_array_set_size(ctx->frame_block_values, 0);
+        ctx->frame_block_min_kb = 0.0;
+        ctx->frame_block_max_kb = 0.0;
+        ctx->frame_block_avg_kb = 0.0;
+        memset(ctx->frame_block_color_counts_ms, 0, sizeof(ctx->frame_block_color_counts_ms));
+        memset(ctx->frame_block_color_counts_kb, 0, sizeof(ctx->frame_block_color_counts_kb));
+        if (ctx->frame_block_values_lateness) {
+            g_array_set_size(ctx->frame_block_values_lateness, 0);
+        }
+        if (ctx->frame_block_values_size) {
+            g_array_set_size(ctx->frame_block_values_size, 0);
         }
         frame_block_sync_controls(ctx, NULL);
     }
@@ -781,6 +869,14 @@ static void on_frame_block_enable_toggled(GtkToggleButton *button, gpointer user
     ctx->frame_block_snapshot_complete = FALSE;
     ctx->frame_block_filled = 0;
     ctx->frame_block_next_index = 0;
+    ctx->frame_block_min_ms = 0.0;
+    ctx->frame_block_max_ms = 0.0;
+    ctx->frame_block_avg_ms = 0.0;
+    ctx->frame_block_min_kb = 0.0;
+    ctx->frame_block_max_kb = 0.0;
+    ctx->frame_block_avg_kb = 0.0;
+    memset(ctx->frame_block_color_counts_ms, 0, sizeof(ctx->frame_block_color_counts_ms));
+    memset(ctx->frame_block_color_counts_kb, 0, sizeof(ctx->frame_block_color_counts_kb));
     if (!enabled) {
         ctx->frame_block_paused = FALSE;
     }
@@ -792,6 +888,7 @@ static void on_frame_block_enable_toggled(GtkToggleButton *button, gpointer user
         }
     }
 
+    frame_block_sync_controls(ctx, NULL);
     frame_block_update_summary(ctx);
     if (ctx->frame_block_area) gtk_widget_queue_draw(GTK_WIDGET(ctx->frame_block_area));
 }
@@ -819,6 +916,19 @@ static void on_frame_block_mode_changed(GObject *dropdown, GParamSpec *pspec, gp
     frame_block_update_summary(ctx);
 }
 
+static void on_frame_block_metric_changed(GObject *dropdown, GParamSpec *pspec, gpointer user_data) {
+    (void)pspec;
+    GuiContext *ctx = user_data;
+    if (!ctx || !GTK_IS_DROP_DOWN(dropdown)) return;
+    guint selected = gtk_drop_down_get_selected(GTK_DROP_DOWN(dropdown));
+    if (selected > FRAME_BLOCK_VIEW_SIZE) selected = FRAME_BLOCK_VIEW_LATENESS;
+    if (ctx->frame_block_view == selected) return;
+    ctx->frame_block_view = selected;
+    frame_block_sync_controls(ctx, NULL);
+    frame_block_update_summary(ctx);
+    if (ctx->frame_block_area) gtk_widget_queue_draw(GTK_WIDGET(ctx->frame_block_area));
+}
+
 static void on_frame_block_reset_clicked(GtkButton *button, gpointer user_data) {
     (void)button;
     GuiContext *ctx = user_data;
@@ -828,7 +938,17 @@ static void on_frame_block_reset_clicked(GtkButton *button, gpointer user_data) 
     }
     ctx->frame_block_filled = 0;
     ctx->frame_block_snapshot_complete = FALSE;
-    if (ctx->frame_block_values) g_array_set_size(ctx->frame_block_values, 0);
+    ctx->frame_block_min_ms = 0.0;
+    ctx->frame_block_max_ms = 0.0;
+    ctx->frame_block_avg_ms = 0.0;
+    ctx->frame_block_min_kb = 0.0;
+    ctx->frame_block_max_kb = 0.0;
+    ctx->frame_block_avg_kb = 0.0;
+    memset(ctx->frame_block_color_counts_ms, 0, sizeof(ctx->frame_block_color_counts_ms));
+    memset(ctx->frame_block_color_counts_kb, 0, sizeof(ctx->frame_block_color_counts_kb));
+    if (ctx->frame_block_values_lateness) g_array_set_size(ctx->frame_block_values_lateness, 0);
+    if (ctx->frame_block_values_size) g_array_set_size(ctx->frame_block_values_size, 0);
+    frame_block_sync_controls(ctx, NULL);
     frame_block_update_summary(ctx);
     if (ctx->frame_block_area) gtk_widget_queue_draw(GTK_WIDGET(ctx->frame_block_area));
 }
@@ -1276,6 +1396,12 @@ static GtkWidget *build_frame_block_page(GuiContext *ctx) {
     g_signal_connect(ctx->frame_block_mode_dropdown, "notify::selected", G_CALLBACK(on_frame_block_mode_changed), ctx);
     gtk_box_append(GTK_BOX(controls), GTK_WIDGET(ctx->frame_block_mode_dropdown));
 
+    const char *metric_labels[] = {"Lateness (ms)", "Frame Size (KB)", NULL};
+    ctx->frame_block_metric_dropdown = GTK_DROP_DOWN(gtk_drop_down_new_from_strings(metric_labels));
+    gtk_drop_down_set_selected(ctx->frame_block_metric_dropdown, ctx->frame_block_view);
+    g_signal_connect(ctx->frame_block_metric_dropdown, "notify::selected", G_CALLBACK(on_frame_block_metric_changed), ctx);
+    gtk_box_append(GTK_BOX(controls), GTK_WIDGET(ctx->frame_block_metric_dropdown));
+
     ctx->frame_block_pause_toggle = GTK_TOGGLE_BUTTON(gtk_toggle_button_new_with_label("Pause"));
     gtk_widget_set_sensitive(GTK_WIDGET(ctx->frame_block_pause_toggle), FALSE);
     g_signal_connect(ctx->frame_block_pause_toggle, "toggled", G_CALLBACK(on_frame_block_pause_toggled), ctx);
@@ -1296,18 +1422,20 @@ static GtkWidget *build_frame_block_page(GuiContext *ctx) {
         "Orange threshold (ms)"
     };
     double defaults[] = {
-        ctx->frame_block_thresholds[0],
-        ctx->frame_block_thresholds[1],
-        ctx->frame_block_thresholds[2]
+        ctx->frame_block_thresholds_ms[0],
+        ctx->frame_block_thresholds_ms[1],
+        ctx->frame_block_thresholds_ms[2]
     };
 
     for (guint i = 0; i < 3; i++) {
         GtkWidget *lbl = gtk_label_new(labels[i]);
         gtk_label_set_xalign(GTK_LABEL(lbl), 0.0);
         gtk_grid_attach(GTK_GRID(threshold_grid), lbl, 0, (int)i, 1, 1);
+        ctx->frame_block_threshold_labels[i] = GTK_LABEL(lbl);
 
-        GtkSpinButton *spin = GTK_SPIN_BUTTON(gtk_spin_button_new_with_range(0.0, 1000.0, 0.5));
+        GtkSpinButton *spin = GTK_SPIN_BUTTON(gtk_spin_button_new_with_range(0.0, 10000.0, 0.5));
         gtk_spin_button_set_digits(spin, 1);
+        gtk_spin_button_set_increments(spin, 0.5, 2.5);
         gtk_spin_button_set_value(spin, defaults[i]);
         g_signal_connect(spin, "value-changed", G_CALLBACK(on_frame_block_threshold_changed), ctx);
         gtk_grid_attach(GTK_GRID(threshold_grid), GTK_WIDGET(spin), 1, (int)i, 1, 1);
@@ -1328,11 +1456,10 @@ static GtkWidget *build_frame_block_page(GuiContext *ctx) {
     GtkWidget *color_help = gtk_label_new("?");
     gtk_widget_add_css_class(color_help, "dim-label");
     gtk_widget_set_tooltip_text(color_help,
-        "Frame lateness measures how much later a frame arrives compared to the spacing "
-        "suggested by RTP timestamps. We take the wall-clock delta between consecutive "
-        "marker packets, subtract the expected frame period from the RTP timestamp delta, "
-        "and clamp negative values to zero. Values near zero mean frames are arriving on "
-        "schedule; higher values indicate late delivery relative to the nominal pacing.");
+        "Lateness view colors frames by how much later they arrive than the RTP pacing "
+        "(wall-clock delta minus expected timestamp interval, clamped at zero). Size view "
+        "uses the same color buckets but maps to total frame size in kilobytes, letting you "
+        "compare timing spikes with bandwidth spikes inside the same capture window.");
     gtk_box_append(GTK_BOX(color_box), color_help);
     gtk_box_append(GTK_BOX(page), color_box);
 
@@ -1359,6 +1486,7 @@ static GtkWidget *build_frame_block_page(GuiContext *ctx) {
     gtk_box_append(GTK_BOX(summary_row), GTK_WIDGET(ctx->frame_block_summary_label));
 
     frame_block_apply_thresholds(ctx);
+    frame_block_sync_controls(ctx, NULL);
     frame_block_update_summary(ctx);
 
     return page;
@@ -1596,17 +1724,25 @@ static void on_app_shutdown(GApplication *app, gpointer user_data) {
     for (int i = 0; i < STATS_METRIC_COUNT; i++) {
         ctx->stats_charts[i] = NULL;
     }
-    if (ctx->frame_block_values) {
-        g_array_free(ctx->frame_block_values, TRUE);
-        ctx->frame_block_values = NULL;
+    if (ctx->frame_block_values_lateness) {
+        g_array_free(ctx->frame_block_values_lateness, TRUE);
+        ctx->frame_block_values_lateness = NULL;
+    }
+    if (ctx->frame_block_values_size) {
+        g_array_free(ctx->frame_block_values_size, TRUE);
+        ctx->frame_block_values_size = NULL;
     }
     ctx->frame_block_area = NULL;
     ctx->frame_block_enable_toggle = NULL;
     ctx->frame_block_pause_toggle = NULL;
     ctx->frame_block_mode_dropdown = NULL;
+    ctx->frame_block_metric_dropdown = NULL;
     ctx->frame_block_summary_label = NULL;
     ctx->frame_block_reset_button = NULL;
-    for (int i = 0; i < 3; i++) ctx->frame_block_threshold_spins[i] = NULL;
+    for (int i = 0; i < 3; i++) {
+        ctx->frame_block_threshold_spins[i] = NULL;
+        ctx->frame_block_threshold_labels[i] = NULL;
+    }
     for (guint i = 0; i < FRAME_BLOCK_COLOR_COUNT; i++) ctx->frame_block_color_toggles[i] = NULL;
     ctx->notebook = NULL;
     ctx->paintable_bound = FALSE;
@@ -1622,12 +1758,17 @@ int uv_gui_run(UvViewer *viewer, const UvViewerConfig *cfg, const char *program_
     ctx->viewer = viewer;
     ctx->current_cfg = *cfg;
     ctx->stats_range_seconds = 300.0;
-    ctx->frame_block_thresholds[0] = FRAME_BLOCK_DEFAULT_GREEN_MS;
-    ctx->frame_block_thresholds[1] = FRAME_BLOCK_DEFAULT_YELLOW_MS;
-    ctx->frame_block_thresholds[2] = FRAME_BLOCK_DEFAULT_ORANGE_MS;
+    ctx->frame_block_thresholds_ms[0] = FRAME_BLOCK_DEFAULT_GREEN_MS;
+    ctx->frame_block_thresholds_ms[1] = FRAME_BLOCK_DEFAULT_YELLOW_MS;
+    ctx->frame_block_thresholds_ms[2] = FRAME_BLOCK_DEFAULT_ORANGE_MS;
+    ctx->frame_block_thresholds_kb[0] = FRAME_BLOCK_DEFAULT_SIZE_GREEN_KB;
+    ctx->frame_block_thresholds_kb[1] = FRAME_BLOCK_DEFAULT_SIZE_YELLOW_KB;
+    ctx->frame_block_thresholds_kb[2] = FRAME_BLOCK_DEFAULT_SIZE_ORANGE_KB;
     ctx->frame_block_width = FRAME_BLOCK_DEFAULT_WIDTH;
     ctx->frame_block_height = FRAME_BLOCK_DEFAULT_HEIGHT;
-    ctx->frame_block_values = g_array_new(FALSE, TRUE, sizeof(double));
+    ctx->frame_block_values_lateness = g_array_new(FALSE, TRUE, sizeof(double));
+    ctx->frame_block_values_size = g_array_new(FALSE, TRUE, sizeof(double));
+    ctx->frame_block_view = FRAME_BLOCK_VIEW_LATENESS;
     for (guint i = 0; i < FRAME_BLOCK_COLOR_COUNT; i++) {
         ctx->frame_block_colors_visible[i] = TRUE;
     }

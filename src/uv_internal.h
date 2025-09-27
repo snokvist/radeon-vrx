@@ -46,6 +46,7 @@ typedef struct {
     double   jitter_value;
 
     struct UvFrameBlockState *frame_block;
+    uint64_t frame_block_accum_bytes;
 } UvRelaySource;
 
 typedef struct {
@@ -67,8 +68,10 @@ typedef struct {
         guint width;
         guint height;
         double thresholds_ms[3];
+        double thresholds_kb[3];
         gboolean reset_requested;
-        gboolean thresholds_dirty;
+        gboolean thresholds_dirty_ms;
+        gboolean thresholds_dirty_kb;
     } frame_block;
 
     GMutex lock;
@@ -171,6 +174,10 @@ void     relay_controller_frame_block_set_thresholds(RelayController *rc,
                                                      double green_ms,
                                                      double yellow_ms,
                                                      double orange_ms);
+void     relay_controller_frame_block_set_size_thresholds(RelayController *rc,
+                                                          double green_kb,
+                                                          double yellow_kb,
+                                                          double orange_kb);
 
 gboolean pipeline_controller_init(PipelineController *pc, struct _UvViewer *viewer, GError **error);
 void     pipeline_controller_deinit(PipelineController *pc);

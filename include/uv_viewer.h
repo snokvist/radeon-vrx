@@ -82,12 +82,18 @@ typedef struct {
     guint height;
     guint filled;
     guint next_index;
-    double thresholds_ms[3];
+    double thresholds_lateness_ms[3];
+    double thresholds_size_kb[3];
     double min_lateness_ms;
     double max_lateness_ms;
     double avg_lateness_ms;
-    guint color_counts[4];
-    GArray *lateness_ms; // double values for current snapshot (size width*height)
+    double min_size_kb;
+    double max_size_kb;
+    double avg_size_kb;
+    guint color_counts_lateness[4];
+    guint color_counts_size[4];
+    GArray *lateness_ms;   // double values for current snapshot (size width*height)
+    GArray *frame_size_kb; // double values for current snapshot (size width*height)
 } UvFrameBlockStats;
 
 typedef struct {
@@ -145,6 +151,10 @@ void uv_viewer_frame_block_set_thresholds(UvViewer *viewer,
                                           double green_ms,
                                           double yellow_ms,
                                           double orange_ms);
+void uv_viewer_frame_block_set_size_thresholds(UvViewer *viewer,
+                                               double green_kb,
+                                               double yellow_kb,
+                                               double orange_kb);
 
 void uv_viewer_stats_init(UvViewerStats *stats);
 void uv_viewer_stats_clear(UvViewerStats *stats);
