@@ -169,6 +169,8 @@ void uv_viewer_stats_init(UvViewerStats *stats) {
     memset(&stats->frame_block, 0, sizeof(stats->frame_block));
     stats->frame_block.lateness_ms = g_array_new(FALSE, TRUE, sizeof(double));
     stats->frame_block.frame_size_kb = g_array_new(FALSE, TRUE, sizeof(double));
+    stats->frame_block.real_frames = 0;
+    stats->frame_block.missing_frames = 0;
 }
 
 void uv_viewer_stats_clear(UvViewerStats *stats) {

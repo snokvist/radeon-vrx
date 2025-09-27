@@ -90,6 +90,8 @@ typedef struct {
     double min_size_kb;
     double max_size_kb;
     double avg_size_kb;
+    guint real_frames;
+    guint missing_frames;
     guint color_counts_lateness[4];
     guint color_counts_size[4];
     GArray *lateness_ms;   // double values for current snapshot (size width*height)

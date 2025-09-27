@@ -15,6 +15,7 @@
 #define FRAME_BLOCK_DEFAULT_SIZE_GREEN_KB   64.0
 #define FRAME_BLOCK_DEFAULT_SIZE_YELLOW_KB  256.0
 #define FRAME_BLOCK_DEFAULT_SIZE_ORANGE_KB  512.0
+#define FRAME_BLOCK_MISSING_SENTINEL (-1.0)
 
 typedef struct {
     UvViewer *viewer;
@@ -77,6 +78,8 @@ typedef struct {
     GArray *frame_block_values_lateness; // doubles
     GArray *frame_block_values_size;     // doubles
     guint frame_block_view; // 0 = lateness, 1 = size
+    guint frame_block_missing;
+    guint frame_block_real_samples;
 } GuiContext;
 
 typedef struct {
@@ -219,7 +222,7 @@ static void frame_block_update_summary(GuiContext *ctx) {
                                capacity,
                                fill_pct);
 
-        if (ctx->frame_block_filled > 0) {
+        if (ctx->frame_block_real_samples > 0) {
             g_string_append(summary, " | Lateness min/avg/max: ");
             g_string_append_printf(summary, "%.2f / %.2f / %.2f ms",
                                    ctx->frame_block_min_ms,
@@ -242,6 +245,7 @@ static void frame_block_update_summary(GuiContext *ctx) {
                 : "Lateness buckets";
             for (guint i = 0; i < FRAME_BLOCK_COLOR_COUNT; i++) {
                 if (!ctx->frame_block_colors_visible[i]) continue;
+                if (counts[i] == 0) continue;
                 if (first_bucket) {
                     g_string_append_printf(summary, " | %s: ", bucket_title);
                     first_bucket = FALSE;
@@ -255,6 +259,9 @@ static void frame_block_update_summary(GuiContext *ctx) {
             g_string_append(summary, " | Size min/avg/max: -- / -- / -- KB");
         }
     }
+
+    g_string_append_printf(summary, " | missing=%u", ctx->frame_block_missing);
+    g_string_append_printf(summary, " | real=%u", ctx->frame_block_real_samples);
 
     gtk_label_set_text(ctx->frame_block_summary_label, summary->str);
     g_string_free(summary, TRUE);
@@ -327,6 +334,7 @@ static void frame_block_sync_controls(GuiContext *ctx, const UvFrameBlockStats *
         g_signal_handlers_block_by_func(spin, G_CALLBACK(on_frame_block_threshold_changed), ctx);
         gtk_spin_button_set_digits(spin, digits);
         gtk_spin_button_set_increments(spin, step, step * 5.0);
+        gtk_spin_button_set_range(spin, 0.0, ctx->frame_block_view == FRAME_BLOCK_VIEW_SIZE ? 100000.0 : 1000.0);
         gtk_spin_button_set_value(spin, thresholds[i]);
         g_signal_handlers_unblock_by_func(spin, G_CALLBACK(on_frame_block_threshold_changed), ctx);
 
@@ -378,9 +386,12 @@ static void frame_block_draw(GtkDrawingArea *area, cairo_t *cr, int width, int h
             guint idx = row * w + col;
             double value = g_array_index(values, double, idx);
             gboolean has_value = !isnan(value);
+            gboolean is_missing = has_value && value < 0.0;
 
             double r = 0.22, g = 0.22, b = 0.22;
-            if (has_value) {
+            if (is_missing) {
+                r = g = b = 0.0;
+            } else if (has_value) {
                 const double *thresholds = (ctx->frame_block_view == FRAME_BLOCK_VIEW_SIZE)
                     ? ctx->frame_block_thresholds_kb
                     : ctx->frame_block_thresholds_ms;
@@ -740,6 +751,8 @@ static void refresh_stats(GuiContext *ctx) {
         ctx->frame_block_min_kb = fb->min_size_kb;
         ctx->frame_block_max_kb = fb->max_size_kb;
         ctx->frame_block_avg_kb = fb->avg_size_kb;
+        ctx->frame_block_real_samples = fb->real_frames;
+        ctx->frame_block_missing = fb->missing_frames;
         memcpy(ctx->frame_block_color_counts_ms, fb->color_counts_lateness, sizeof(ctx->frame_block_color_counts_ms));
         memcpy(ctx->frame_block_color_counts_kb, fb->color_counts_size, sizeof(ctx->frame_block_color_counts_kb));
 
@@ -786,6 +799,8 @@ static void refresh_stats(GuiContext *ctx) {
         ctx->frame_block_min_kb = 0.0;
         ctx->frame_block_max_kb = 0.0;
         ctx->frame_block_avg_kb = 0.0;
+        ctx->frame_block_real_samples = 0;
+        ctx->frame_block_missing = 0;
         memset(ctx->frame_block_color_counts_ms, 0, sizeof(ctx->frame_block_color_counts_ms));
         memset(ctx->frame_block_color_counts_kb, 0, sizeof(ctx->frame_block_color_counts_kb));
         if (ctx->frame_block_values_lateness) {
@@ -875,6 +890,8 @@ static void on_frame_block_enable_toggled(GtkToggleButton *button, gpointer user
     ctx->frame_block_min_kb = 0.0;
     ctx->frame_block_max_kb = 0.0;
     ctx->frame_block_avg_kb = 0.0;
+    ctx->frame_block_missing = 0;
+    ctx->frame_block_real_samples = 0;
     memset(ctx->frame_block_color_counts_ms, 0, sizeof(ctx->frame_block_color_counts_ms));
     memset(ctx->frame_block_color_counts_kb, 0, sizeof(ctx->frame_block_color_counts_kb));
     if (!enabled) {
@@ -946,6 +963,8 @@ static void on_frame_block_reset_clicked(GtkButton *button, gpointer user_data) 
     ctx->frame_block_avg_kb = 0.0;
     memset(ctx->frame_block_color_counts_ms, 0, sizeof(ctx->frame_block_color_counts_ms));
     memset(ctx->frame_block_color_counts_kb, 0, sizeof(ctx->frame_block_color_counts_kb));
+    ctx->frame_block_missing = 0;
+    ctx->frame_block_real_samples = 0;
     if (ctx->frame_block_values_lateness) g_array_set_size(ctx->frame_block_values_lateness, 0);
     if (ctx->frame_block_values_size) g_array_set_size(ctx->frame_block_values_size, 0);
     frame_block_sync_controls(ctx, NULL);
@@ -1486,6 +1505,12 @@ static GtkWidget *build_frame_block_page(GuiContext *ctx) {
     gtk_box_append(GTK_BOX(summary_row), GTK_WIDGET(ctx->frame_block_summary_label));
 
     frame_block_apply_thresholds(ctx);
+    if (ctx->viewer) {
+        uv_viewer_frame_block_set_size_thresholds(ctx->viewer,
+                                                 ctx->frame_block_thresholds_kb[0],
+                                                 ctx->frame_block_thresholds_kb[1],
+                                                 ctx->frame_block_thresholds_kb[2]);
+    }
     frame_block_sync_controls(ctx, NULL);
     frame_block_update_summary(ctx);
 
@@ -1769,6 +1794,8 @@ int uv_gui_run(UvViewer *viewer, const UvViewerConfig *cfg, const char *program_
     ctx->frame_block_values_lateness = g_array_new(FALSE, TRUE, sizeof(double));
     ctx->frame_block_values_size = g_array_new(FALSE, TRUE, sizeof(double));
     ctx->frame_block_view = FRAME_BLOCK_VIEW_LATENESS;
+    ctx->frame_block_missing = 0;
+    ctx->frame_block_real_samples = 0;
     for (guint i = 0; i < FRAME_BLOCK_COLOR_COUNT; i++) {
         ctx->frame_block_colors_visible[i] = TRUE;
     }

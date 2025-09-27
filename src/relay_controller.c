@@ -15,6 +15,7 @@
 #define UV_FRAME_BLOCK_DEFAULT_SIZE_GREEN_KB  64.0
 #define UV_FRAME_BLOCK_DEFAULT_SIZE_YELLOW_KB 256.0
 #define UV_FRAME_BLOCK_DEFAULT_SIZE_ORANGE_KB 512.0
+#define UV_FRAME_BLOCK_MISSING_SENTINEL (-1.0)
 
 typedef struct UvFrameBlockState {
     guint width;
@@ -35,6 +36,10 @@ typedef struct UvFrameBlockState {
     double sum_size_kb;
     double min_size_kb;
     double max_size_kb;
+    double expected_frame_ms;
+    gboolean have_expected_period;
+    guint real_samples;
+    guint missing_frames;
     guint color_counts_lateness[UV_FRAME_BLOCK_COLOR_BUCKETS];
     guint color_counts_size[UV_FRAME_BLOCK_COLOR_BUCKETS];
     uint32_t last_frame_ts;
@@ -76,6 +81,10 @@ static void frame_block_state_reset(UvFrameBlockState *state) {
     state->sum_size_kb = 0.0;
     state->min_size_kb = 0.0;
     state->max_size_kb = 0.0;
+    state->expected_frame_ms = 0.0;
+    state->have_expected_period = FALSE;
+    state->real_samples = 0;
+    state->missing_frames = 0;
     memset(state->color_counts_lateness, 0, sizeof(state->color_counts_lateness));
     memset(state->color_counts_size, 0, sizeof(state->color_counts_size));
     state->last_frame_ts = 0;
@@ -100,14 +109,14 @@ static void frame_block_state_reclassify(UvFrameBlockState *state) {
     if (state->filled == 0) return;
     for (guint i = 0; i < state->filled; i++) {
         double lateness = state->lateness_ms[i];
-        if (!isnan(lateness)) {
+        if (!isnan(lateness) && lateness >= 0.0) {
             guint bucket_l = frame_block_classify_value(state->thresholds_lateness_ms, lateness);
             if (bucket_l < UV_FRAME_BLOCK_COLOR_BUCKETS) {
                 state->color_counts_lateness[bucket_l]++;
             }
         }
         double size = state->size_kb[i];
-        if (!isnan(size)) {
+        if (!isnan(size) && size >= 0.0) {
             guint bucket_s = frame_block_classify_value(state->thresholds_size_kb, size);
             if (bucket_s < UV_FRAME_BLOCK_COLOR_BUCKETS) {
                 state->color_counts_size[bucket_s]++;
@@ -135,7 +144,8 @@ static void frame_block_state_apply_size_thresholds(UvFrameBlockState *state, co
 static void frame_block_state_record(UvFrameBlockState *state,
                                      double lateness_ms,
                                      double size_kb,
-                                     gboolean snapshot_mode) {
+                                     gboolean snapshot_mode,
+                                     gboolean is_missing) {
     if (!state) return;
 
     if (state->wrap_pending) {
@@ -153,34 +163,42 @@ static void frame_block_state_record(UvFrameBlockState *state,
     guint idx = state->cursor;
     if (idx >= state->capacity) idx = state->capacity - 1;
 
-    state->lateness_ms[idx] = lateness_ms;
-    state->size_kb[idx] = size_kb;
-
-    if (state->filled == 0) {
-        state->min_lateness_ms = lateness_ms;
-        state->max_lateness_ms = lateness_ms;
-        state->sum_lateness_ms = lateness_ms;
-        state->min_size_kb = size_kb;
-        state->max_size_kb = size_kb;
-        state->sum_size_kb = size_kb;
+    if (is_missing) {
+        state->lateness_ms[idx] = UV_FRAME_BLOCK_MISSING_SENTINEL;
+        state->size_kb[idx] = UV_FRAME_BLOCK_MISSING_SENTINEL;
+        state->missing_frames++;
     } else {
-        state->sum_lateness_ms += lateness_ms;
-        if (lateness_ms < state->min_lateness_ms) state->min_lateness_ms = lateness_ms;
-        if (lateness_ms > state->max_lateness_ms) state->max_lateness_ms = lateness_ms;
+        state->lateness_ms[idx] = lateness_ms;
+        state->size_kb[idx] = size_kb;
 
-        state->sum_size_kb += size_kb;
-        if (size_kb < state->min_size_kb) state->min_size_kb = size_kb;
-        if (size_kb > state->max_size_kb) state->max_size_kb = size_kb;
-    }
+        if (state->real_samples == 0) {
+            state->min_lateness_ms = lateness_ms;
+            state->max_lateness_ms = lateness_ms;
+            state->sum_lateness_ms = lateness_ms;
+            state->min_size_kb = size_kb;
+            state->max_size_kb = size_kb;
+            state->sum_size_kb = size_kb;
+        } else {
+            state->sum_lateness_ms += lateness_ms;
+            if (lateness_ms < state->min_lateness_ms) state->min_lateness_ms = lateness_ms;
+            if (lateness_ms > state->max_lateness_ms) state->max_lateness_ms = lateness_ms;
 
-    guint bucket_l = frame_block_classify_value(state->thresholds_lateness_ms, lateness_ms);
-    if (bucket_l < UV_FRAME_BLOCK_COLOR_BUCKETS) {
-        state->color_counts_lateness[bucket_l]++;
-    }
+            state->sum_size_kb += size_kb;
+            if (size_kb < state->min_size_kb) state->min_size_kb = size_kb;
+            if (size_kb > state->max_size_kb) state->max_size_kb = size_kb;
+        }
 
-    guint bucket_s = frame_block_classify_value(state->thresholds_size_kb, size_kb);
-    if (bucket_s < UV_FRAME_BLOCK_COLOR_BUCKETS) {
-        state->color_counts_size[bucket_s]++;
+        state->real_samples++;
+
+        guint bucket_l = frame_block_classify_value(state->thresholds_lateness_ms, lateness_ms);
+        if (bucket_l < UV_FRAME_BLOCK_COLOR_BUCKETS) {
+            state->color_counts_lateness[bucket_l]++;
+        }
+
+        guint bucket_s = frame_block_classify_value(state->thresholds_size_kb, size_kb);
+        if (bucket_s < UV_FRAME_BLOCK_COLOR_BUCKETS) {
+            state->color_counts_size[bucket_s]++;
+        }
     }
 
     if (state->filled < state->capacity) {
@@ -335,6 +353,23 @@ static void frame_block_process_packet(RelayController *rc,
         expected_ms = ((double)ts_delta * 1000.0) / (double)clock_rate;
     }
 
+    guint missing = 0;
+    double normalized_expected_ms = expected_ms;
+    if (state->have_expected_period && state->expected_frame_ms > 0.0 && expected_ms > 0.0) {
+        double ratio = expected_ms / state->expected_frame_ms;
+        if (ratio > 1.5) {
+            double raw_missing = ratio - 1.0;
+            if (raw_missing > 0.0) {
+                guint estimate = (guint)(ratio + 0.2);
+                if (estimate > 0) missing = estimate - 1;
+                if (missing > 64) missing = 64;
+                if (missing > 0) {
+                    normalized_expected_ms = expected_ms / (double)(missing + 1);
+                }
+            }
+        }
+    }
+
     double arrival_delta_ms = 0.0;
     if (arrival_us > state->last_frame_arrival_us) {
         arrival_delta_ms = (double)(arrival_us - state->last_frame_arrival_us) / 1000.0;
@@ -351,7 +386,23 @@ static void frame_block_process_packet(RelayController *rc,
 
     if (rc->frame_block.paused) return;
 
-    frame_block_state_record(state, lateness_ms, size_kb, rc->frame_block.snapshot_mode);
+    if (missing > 0) {
+        for (guint m = 0; m < missing; m++) {
+            frame_block_state_record(state, 0.0, 0.0, rc->frame_block.snapshot_mode, TRUE);
+        }
+    }
+
+    frame_block_state_record(state, lateness_ms, size_kb, rc->frame_block.snapshot_mode, FALSE);
+
+    if (normalized_expected_ms > 0.0) {
+        if (!state->have_expected_period) {
+            state->expected_frame_ms = normalized_expected_ms;
+            state->have_expected_period = TRUE;
+        } else {
+            const double alpha = 0.125;
+            state->expected_frame_ms = (1.0 - alpha) * state->expected_frame_ms + alpha * normalized_expected_ms;
+        }
+    }
 }
 
 static inline void rtp_update_stats(RelayController *rc,
@@ -789,22 +840,31 @@ void relay_controller_snapshot(RelayController *rc, UvViewerStats *stats, int cl
             memcpy(fb->thresholds_lateness_ms, rc->frame_block.thresholds_ms, sizeof(fb->thresholds_lateness_ms));
             memcpy(fb->thresholds_size_kb, rc->frame_block.thresholds_kb, sizeof(fb->thresholds_size_kb));
 
-            if (state && state->filled > 0) {
+            fb->real_frames = state ? state->real_samples : 0;
+            fb->missing_frames = state ? state->missing_frames : 0;
+
+            if (state) {
                 fb->filled = state->filled;
                 fb->next_index = MIN(state->cursor, state->capacity);
-                fb->min_lateness_ms = state->min_lateness_ms;
-                fb->max_lateness_ms = state->max_lateness_ms;
-                fb->avg_lateness_ms = state->sum_lateness_ms / (double)state->filled;
-                fb->min_size_kb = state->min_size_kb;
-                fb->max_size_kb = state->max_size_kb;
-                fb->avg_size_kb = state->sum_size_kb / (double)state->filled;
+                if (state->real_samples > 0) {
+                    fb->min_lateness_ms = state->min_lateness_ms;
+                    fb->max_lateness_ms = state->max_lateness_ms;
+                    fb->avg_lateness_ms = state->sum_lateness_ms / (double)state->real_samples;
+                    fb->min_size_kb = state->min_size_kb;
+                    fb->max_size_kb = state->max_size_kb;
+                    fb->avg_size_kb = state->sum_size_kb / (double)state->real_samples;
+                }
+            } else {
+                fb->filled = 0;
+                fb->next_index = 0;
+            }
+
+            if (state && state->real_samples > 0) {
                 for (guint c = 0; c < UV_FRAME_BLOCK_COLOR_BUCKETS; c++) {
                     fb->color_counts_lateness[c] = state->color_counts_lateness[c];
                     fb->color_counts_size[c] = state->color_counts_size[c];
                 }
             } else {
-                fb->filled = 0;
-                fb->next_index = 0;
                 fb->min_lateness_ms = 0.0;
                 fb->max_lateness_ms = 0.0;
                 fb->avg_lateness_ms = 0.0;
