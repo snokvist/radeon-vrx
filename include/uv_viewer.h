@@ -18,6 +18,11 @@ typedef struct {
     int clock_rate;    // RTP clock rate (default: 90000)
     bool sync_to_clock; // TRUE to let sink sync to clock
     guint appsrc_queue_size; // future use; set 0 for default
+    guint jitter_latency_ms; // jitter buffer latency window (default: 4)
+    guint queue_max_buffers; // upstream queue max buffers (default: 96)
+    gboolean jitter_drop_on_latency; // drop-late packets
+    gboolean jitter_do_lost;         // emit lost events
+    gboolean jitter_post_drop_messages; // post drop messages on bus
 } UvViewerConfig;
 
 typedef struct {

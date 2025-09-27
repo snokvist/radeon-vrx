@@ -20,6 +20,11 @@ void uv_viewer_config_init(UvViewerConfig *cfg) {
     cfg->clock_rate = 90000;
     cfg->sync_to_clock = FALSE;
     cfg->appsrc_queue_size = 0;
+    cfg->jitter_latency_ms = 4;
+    cfg->queue_max_buffers = 96;
+    cfg->jitter_drop_on_latency = TRUE;
+    cfg->jitter_do_lost = TRUE;
+    cfg->jitter_post_drop_messages = TRUE;
 }
 
 UvViewer *uv_viewer_new(const UvViewerConfig *cfg) {

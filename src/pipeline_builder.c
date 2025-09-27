@@ -178,16 +178,16 @@ static gboolean build_pipeline(PipelineController *pc, GError **error) {
 
     g_object_set(pc->queue0,
                  "leaky", 2,
-                 "max-size-buffers", 96,
+                 "max-size-buffers", viewer->config.queue_max_buffers,
                  "max-size-bytes", 0,
                  "max-size-time", (guint64)0,
                  NULL);
 
     g_object_set(pc->jitterbuffer,
-                 "latency", 4,
-                 "drop-on-latency", TRUE,
-                 "do-lost", TRUE,
-                 "post-drop-messages", TRUE,
+                 "latency", (guint)MAX(viewer->config.jitter_latency_ms, 0u),
+                 "drop-on-latency", viewer->config.jitter_drop_on_latency,
+                 "do-lost", viewer->config.jitter_do_lost,
+                 "post-drop-messages", viewer->config.jitter_post_drop_messages,
                  NULL);
 
     g_object_set(pc->parser, "config-interval", -1, NULL);

@@ -7,10 +7,11 @@
 
 typedef struct {
     UvViewer *viewer;
-    const UvViewerConfig *cfg;
+    UvViewerConfig current_cfg;
     GtkApplication *app;
     GtkWindow *window;
     GtkLabel *status_label;
+    GtkLabel *info_label;
     GtkListBox *source_list;
     GtkTextBuffer *stats_buffer;
     GtkPicture *video_picture;
@@ -20,7 +21,17 @@ typedef struct {
     GtkWidget *stats_frame;
     GtkToggleButton *sources_toggle;
     GtkToggleButton *stats_toggle;
+    GtkSpinButton *listen_port_spin;
+    GtkSpinButton *jitter_latency_spin;
+    GtkCheckButton *sync_toggle_settings;
+    GtkSpinButton *queue_max_buffers_spin;
+    GtkCheckButton *jitter_drop_toggle;
+    GtkCheckButton *jitter_do_lost_toggle;
+    GtkCheckButton *jitter_post_drop_toggle;
+    GtkNotebook *notebook;
     guint stats_timeout_id;
+    GstElement *bound_sink;
+    gulong sink_paintable_handler;
     gboolean paintable_bound;
 } GuiContext;
 
@@ -31,6 +42,13 @@ typedef struct {
     char *address;
     char *error_message;
 } UiEvent;
+
+static GtkWidget *build_monitor_page(GuiContext *ctx);
+static GtkWidget *build_settings_page(GuiContext *ctx);
+static void viewer_event_callback(const UvViewerEvent *event, gpointer user_data);
+static void on_notebook_switch_page(GtkNotebook *notebook, GtkWidget *page, guint page_num, gpointer user_data);
+static void detach_bound_sink(GuiContext *ctx);
+static gboolean ensure_video_paintable(GuiContext *ctx);
 
 static void format_bitrate(double bps, char *out, size_t outlen) {
     if (bps < 1000.0) {
@@ -44,9 +62,55 @@ static void format_bitrate(double bps, char *out, size_t outlen) {
     }
 }
 
+static gboolean check_get(GtkCheckButton *button) {
+    return button ? gtk_check_button_get_active(button) : FALSE;
+}
+
+static void check_set(GtkCheckButton *button, gboolean state) {
+    if (!button) return;
+    gtk_check_button_set_active(button, state);
+}
+
 static void update_status(GuiContext *ctx, const char *message) {
     if (!ctx || !ctx->status_label) return;
     gtk_label_set_text(ctx->status_label, message ? message : "");
+}
+
+static void update_info_label(GuiContext *ctx) {
+    if (!ctx || !ctx->info_label) return;
+    char info[160];
+    UvViewerConfig *cfg = &ctx->current_cfg;
+    g_snprintf(info, sizeof(info),
+               "Listening on %d | PT %d | Clock %d | %s | Jitter %ums | Queue buffers %u"
+               " | drop=%s | lost=%s | bus-msg=%s",
+               cfg->listen_port,
+               cfg->payload_type,
+               cfg->clock_rate,
+               cfg->sync_to_clock ? "sync" : "no-sync",
+               cfg->jitter_latency_ms,
+               cfg->queue_max_buffers,
+               cfg->jitter_drop_on_latency ? "on" : "off",
+               cfg->jitter_do_lost ? "on" : "off",
+               cfg->jitter_post_drop_messages ? "on" : "off");
+    gtk_label_set_text(ctx->info_label, info);
+}
+
+static void sync_settings_controls(GuiContext *ctx) {
+    if (!ctx) return;
+    if (ctx->listen_port_spin) {
+        gtk_spin_button_set_value(ctx->listen_port_spin, ctx->current_cfg.listen_port);
+    }
+    if (ctx->jitter_latency_spin) {
+        gtk_spin_button_set_value(ctx->jitter_latency_spin, ctx->current_cfg.jitter_latency_ms);
+    }
+    if (ctx->queue_max_buffers_spin) {
+        gtk_spin_button_set_value(ctx->queue_max_buffers_spin, ctx->current_cfg.queue_max_buffers);
+    }
+    check_set(ctx->sync_toggle_settings, ctx->current_cfg.sync_to_clock ? TRUE : FALSE);
+    check_set(ctx->jitter_drop_toggle, ctx->current_cfg.jitter_drop_on_latency ? TRUE : FALSE);
+    check_set(ctx->jitter_do_lost_toggle, ctx->current_cfg.jitter_do_lost ? TRUE : FALSE);
+    check_set(ctx->jitter_post_drop_toggle, ctx->current_cfg.jitter_post_drop_messages ? TRUE : FALSE);
+    update_info_label(ctx);
 }
 
 static void clear_source_list(GuiContext *ctx) {
@@ -141,18 +205,72 @@ static void update_qos_section(GString *buf, const UvViewerStats *stats) {
     }
 }
 
-static void ensure_video_paintable(GuiContext *ctx) {
-    if (!ctx || !ctx->video_picture || ctx->paintable_bound) return;
-    GstElement *sink = uv_internal_viewer_get_sink(ctx->viewer);
-    if (!sink) return;
+static gboolean bind_sink_paintable(GuiContext *ctx, GstElement *sink) {
+    if (!ctx || !ctx->video_picture || !sink) return FALSE;
+
     GParamSpec *prop = g_object_class_find_property(G_OBJECT_GET_CLASS(sink), "paintable");
-    if (!prop) return;
+    if (!prop) return FALSE;
+
     GdkPaintable *paintable = NULL;
     g_object_get(sink, "paintable", &paintable, NULL);
-    if (!paintable) return;
+    if (!paintable) return FALSE;
+
     gtk_picture_set_paintable(ctx->video_picture, paintable);
+    gtk_widget_queue_draw(GTK_WIDGET(ctx->video_picture));
     g_object_unref(paintable);
     ctx->paintable_bound = TRUE;
+    return TRUE;
+}
+
+static void on_sink_paintable_notify(GObject *object, GParamSpec *pspec, gpointer user_data) {
+    (void)pspec;
+    GuiContext *ctx = user_data;
+    if (!ctx || !ctx->viewer) return;
+    bind_sink_paintable(ctx, GST_ELEMENT(object));
+}
+
+static void detach_bound_sink(GuiContext *ctx) {
+    if (!ctx) return;
+    if (ctx->bound_sink && ctx->sink_paintable_handler) {
+        g_signal_handler_disconnect(ctx->bound_sink, ctx->sink_paintable_handler);
+        ctx->sink_paintable_handler = 0;
+    }
+    if (ctx->bound_sink) {
+        gst_object_unref(ctx->bound_sink);
+        ctx->bound_sink = NULL;
+    }
+    ctx->paintable_bound = FALSE;
+    if (ctx->video_picture) {
+        gtk_picture_set_paintable(ctx->video_picture, NULL);
+    }
+}
+
+static gboolean ensure_video_paintable(GuiContext *ctx) {
+    if (!ctx || !ctx->video_picture || !ctx->viewer) return FALSE;
+
+    GstElement *sink = uv_internal_viewer_get_sink(ctx->viewer);
+    if (!sink) return FALSE;
+
+    GParamSpec *prop = g_object_class_find_property(G_OBJECT_GET_CLASS(sink), "paintable");
+    if (!prop) {
+        detach_bound_sink(ctx);
+        return FALSE;
+    }
+
+    if (ctx->bound_sink != sink) {
+        detach_bound_sink(ctx);
+        ctx->bound_sink = GST_ELEMENT(gst_object_ref(sink));
+        ctx->sink_paintable_handler = g_signal_connect(ctx->bound_sink,
+                                                       "notify::paintable",
+                                                       G_CALLBACK(on_sink_paintable_notify),
+                                                       ctx);
+    }
+
+    if (ctx->paintable_bound) {
+        return TRUE;
+    }
+
+    return bind_sink_paintable(ctx, sink);
 }
 
 static void refresh_stats(GuiContext *ctx) {
@@ -228,7 +346,7 @@ static void refresh_stats(GuiContext *ctx) {
                                    src->rtp_reordered_packets,
                                    src->rfc3550_jitter_ms);
         }
-        update_status(ctx, "Sources updated");
+        update_status(ctx, "");
     }
 
     g_string_append(text, "---- Pipeline ----\n");
@@ -271,12 +389,12 @@ static gboolean stats_timeout_cb(gpointer user_data) {
 }
 
 static void update_sources_toggle_label(GuiContext *ctx, gboolean hidden) {
-    if (!ctx || !ctx->sources_toggle) return;
+    if (!ctx || !ctx->sources_toggle || !GTK_IS_TOGGLE_BUTTON(ctx->sources_toggle)) return;
     gtk_button_set_label(GTK_BUTTON(ctx->sources_toggle), hidden ? "Show Sources" : "Hide Sources");
 }
 
 static void update_stats_toggle_label(GuiContext *ctx, gboolean hidden) {
-    if (!ctx || !ctx->stats_toggle) return;
+    if (!ctx || !ctx->stats_toggle || !GTK_IS_TOGGLE_BUTTON(ctx->stats_toggle)) return;
     gtk_button_set_label(GTK_BUTTON(ctx->stats_toggle), hidden ? "Show Stats" : "Hide Stats");
 }
 
@@ -325,6 +443,93 @@ static void on_stats_toggle_toggled(GtkToggleButton *button, gpointer user_data)
     update_stats_toggle_label(ctx, hidden);
 }
 
+static gboolean gui_restart_with_config(GuiContext *ctx, const UvViewerConfig *cfg) {
+    if (!ctx || !ctx->viewer || !cfg) return FALSE;
+
+    if (cfg->listen_port == ctx->current_cfg.listen_port &&
+        cfg->sync_to_clock == ctx->current_cfg.sync_to_clock &&
+        cfg->jitter_latency_ms == ctx->current_cfg.jitter_latency_ms &&
+        cfg->queue_max_buffers == ctx->current_cfg.queue_max_buffers &&
+        cfg->jitter_drop_on_latency == ctx->current_cfg.jitter_drop_on_latency &&
+        cfg->jitter_do_lost == ctx->current_cfg.jitter_do_lost &&
+        cfg->jitter_post_drop_messages == ctx->current_cfg.jitter_post_drop_messages) {
+        update_status(ctx, "Settings unchanged");
+        return TRUE;
+    }
+
+    UvViewer *old_viewer = ctx->viewer;
+    uv_viewer_set_event_callback(old_viewer, NULL, NULL);
+    uv_viewer_stop(old_viewer);
+
+    UvViewer *new_viewer = uv_viewer_new(cfg);
+    if (!new_viewer) {
+        update_status(ctx, "Failed to create viewer for new settings");
+        GError *restart_error = NULL;
+        if (!uv_viewer_start(old_viewer, &restart_error)) {
+            update_status(ctx, restart_error ? restart_error->message : "Failed to restart viewer");
+            if (restart_error) g_error_free(restart_error);
+            return FALSE;
+        }
+        uv_viewer_set_event_callback(old_viewer, viewer_event_callback, ctx);
+        return FALSE;
+    }
+
+    uv_viewer_set_event_callback(new_viewer, viewer_event_callback, ctx);
+    GError *error = NULL;
+    if (!uv_viewer_start(new_viewer, &error)) {
+        update_status(ctx, error ? error->message : "Failed to start viewer");
+        if (error) g_error_free(error);
+        uv_viewer_set_event_callback(new_viewer, NULL, NULL);
+        uv_viewer_free(new_viewer);
+
+        GError *restart_error = NULL;
+        if (!uv_viewer_start(old_viewer, &restart_error)) {
+            update_status(ctx, restart_error ? restart_error->message : "Failed to restart viewer");
+            if (restart_error) g_error_free(restart_error);
+        } else {
+            uv_viewer_set_event_callback(old_viewer, viewer_event_callback, ctx);
+        }
+        return FALSE;
+    }
+
+    uv_viewer_free(old_viewer);
+    detach_bound_sink(ctx);
+    ctx->viewer = new_viewer;
+    ctx->current_cfg = *cfg;
+    update_info_label(ctx);
+    sync_settings_controls(ctx);
+    refresh_stats(ctx);
+    update_status(ctx, "Settings applied");
+    return TRUE;
+}
+
+static void on_settings_apply_clicked(GtkButton *button, gpointer user_data) {
+    (void)button;
+    GuiContext *ctx = user_data;
+    if (!ctx) return;
+
+    UvViewerConfig new_cfg = ctx->current_cfg;
+    if (ctx->listen_port_spin) {
+        new_cfg.listen_port = gtk_spin_button_get_value_as_int(ctx->listen_port_spin);
+        if (new_cfg.listen_port < 1) new_cfg.listen_port = 1;
+    }
+    if (ctx->jitter_latency_spin) {
+        new_cfg.jitter_latency_ms = gtk_spin_button_get_value_as_int(ctx->jitter_latency_spin);
+        if (new_cfg.jitter_latency_ms == 0) new_cfg.jitter_latency_ms = 1;
+    }
+    if (ctx->queue_max_buffers_spin) {
+        new_cfg.queue_max_buffers = gtk_spin_button_get_value_as_int(ctx->queue_max_buffers_spin);
+    }
+    new_cfg.sync_to_clock = check_get(ctx->sync_toggle_settings);
+    new_cfg.jitter_drop_on_latency = check_get(ctx->jitter_drop_toggle);
+    new_cfg.jitter_do_lost = check_get(ctx->jitter_do_lost_toggle);
+    new_cfg.jitter_post_drop_messages = check_get(ctx->jitter_post_drop_toggle);
+
+    if (!gui_restart_with_config(ctx, &new_cfg)) {
+        sync_settings_controls(ctx);
+    }
+}
+
 static void on_source_row_activated(GtkListBox *box, GtkListBoxRow *row, gpointer user_data) {
     (void)box;
     GuiContext *ctx = user_data;
@@ -350,9 +555,13 @@ static gboolean on_window_close_request(GtkWindow *window, gpointer user_data) {
     if (!ctx || !ctx->viewer) return FALSE;
     uv_viewer_set_event_callback(ctx->viewer, NULL, NULL);
     if (ctx->stats_timeout_id) {
-        g_source_remove(ctx->stats_timeout_id);
+        GSource *source = g_main_context_find_source_by_id(NULL, ctx->stats_timeout_id);
+        if (source) {
+            g_source_destroy(source);
+        }
         ctx->stats_timeout_id = 0;
     }
+    detach_bound_sink(ctx);
     return FALSE;
 }
 
@@ -430,33 +639,16 @@ static void viewer_event_callback(const UvViewerEvent *event, gpointer user_data
     g_idle_add(dispatch_ui_event, copy);
 }
 
-static void build_ui(GuiContext *ctx) {
-    GtkWidget *window = gtk_application_window_new(ctx->app);
-    ctx->window = GTK_WINDOW(window);
-    gtk_window_set_title(ctx->window, "UDP H.265 Viewer");
-    gtk_window_set_default_size(ctx->window, 800, 600);
-    g_signal_connect(window, "close-request", G_CALLBACK(on_window_close_request), ctx);
-
-    GtkWidget *root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
-    gtk_widget_set_margin_top(root, 12);
-    gtk_widget_set_margin_bottom(root, 12);
-    gtk_widget_set_margin_start(root, 12);
-    gtk_widget_set_margin_end(root, 12);
-    gtk_window_set_child(ctx->window, root);
-
-    char info[128];
-    g_snprintf(info, sizeof(info), "Listening on %d | PT %d | Clock %d | %s",
-               ctx->cfg->listen_port,
-               ctx->cfg->payload_type,
-               ctx->cfg->clock_rate,
-               ctx->cfg->sync_to_clock ? "sync" : "no-sync");
-    GtkWidget *info_label = gtk_label_new(info);
-    gtk_label_set_xalign(GTK_LABEL(info_label), 0.0);
-    gtk_box_append(GTK_BOX(root), info_label);
+static GtkWidget *build_monitor_page(GuiContext *ctx) {
+    GtkWidget *page = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    gtk_widget_set_margin_top(page, 12);
+    gtk_widget_set_margin_bottom(page, 12);
+    gtk_widget_set_margin_start(page, 12);
+    gtk_widget_set_margin_end(page, 12);
 
     ctx->status_label = GTK_LABEL(gtk_label_new("Waiting for sources..."));
     gtk_label_set_xalign(ctx->status_label, 0.0);
-    gtk_box_append(GTK_BOX(root), GTK_WIDGET(ctx->status_label));
+    gtk_box_append(GTK_BOX(page), GTK_WIDGET(ctx->status_label));
 
     GtkWidget *video_frame = gtk_frame_new("Video Preview");
     gtk_widget_set_hexpand(video_frame, TRUE);
@@ -468,16 +660,16 @@ static void build_ui(GuiContext *ctx) {
     gtk_widget_set_hexpand(video_widget, TRUE);
     gtk_widget_set_vexpand(video_widget, TRUE);
     gtk_frame_set_child(GTK_FRAME(video_frame), video_widget);
-    gtk_box_append(GTK_BOX(root), video_frame);
+    gtk_box_append(GTK_BOX(page), video_frame);
 
     ctx->sources_frame = gtk_frame_new("Sources");
-    gtk_box_append(GTK_BOX(root), ctx->sources_frame);
+    gtk_box_append(GTK_BOX(page), ctx->sources_frame);
 
     ctx->source_scroller = GTK_SCROLLED_WINDOW(gtk_scrolled_window_new());
     gtk_widget_set_hexpand(GTK_WIDGET(ctx->source_scroller), TRUE);
     gtk_widget_set_vexpand(GTK_WIDGET(ctx->source_scroller), TRUE);
     gtk_scrolled_window_set_policy(ctx->source_scroller, GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
-    gtk_widget_set_size_request(GTK_WIDGET(ctx->source_scroller), -1, 240);
+    gtk_widget_set_size_request(GTK_WIDGET(ctx->source_scroller), -1, 140);
 
     ctx->source_list = GTK_LIST_BOX(gtk_list_box_new());
     gtk_list_box_set_selection_mode(ctx->source_list, GTK_SELECTION_SINGLE);
@@ -488,7 +680,7 @@ static void build_ui(GuiContext *ctx) {
     gtk_frame_set_child(GTK_FRAME(ctx->sources_frame), GTK_WIDGET(ctx->source_scroller));
 
     GtkWidget *button_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
-    gtk_box_append(GTK_BOX(root), button_box);
+    gtk_box_append(GTK_BOX(page), button_box);
 
     GtkWidget *refresh_button = gtk_button_new_with_label("Refresh");
     g_signal_connect(refresh_button, "clicked", G_CALLBACK(on_refresh_button_clicked), ctx);
@@ -501,25 +693,23 @@ static void build_ui(GuiContext *ctx) {
     ctx->sources_toggle = GTK_TOGGLE_BUTTON(gtk_toggle_button_new_with_label("Hide Sources"));
     g_signal_connect(ctx->sources_toggle, "toggled", G_CALLBACK(on_sources_toggle_toggled), ctx);
     gtk_box_append(GTK_BOX(button_box), GTK_WIDGET(ctx->sources_toggle));
-    update_sources_toggle_label(ctx, FALSE);
 
     ctx->stats_toggle = GTK_TOGGLE_BUTTON(gtk_toggle_button_new_with_label("Hide Stats"));
     g_signal_connect(ctx->stats_toggle, "toggled", G_CALLBACK(on_stats_toggle_toggled), ctx);
     gtk_box_append(GTK_BOX(button_box), GTK_WIDGET(ctx->stats_toggle));
-    update_stats_toggle_label(ctx, FALSE);
 
     GtkWidget *quit_button = gtk_button_new_with_label("Quit");
     g_signal_connect(quit_button, "clicked", G_CALLBACK(on_quit_button_clicked), ctx);
     gtk_box_append(GTK_BOX(button_box), quit_button);
 
     ctx->stats_frame = gtk_frame_new("Stats");
-    gtk_box_append(GTK_BOX(root), ctx->stats_frame);
+    gtk_box_append(GTK_BOX(page), ctx->stats_frame);
 
     ctx->stats_scroller = GTK_SCROLLED_WINDOW(gtk_scrolled_window_new());
     gtk_widget_set_hexpand(GTK_WIDGET(ctx->stats_scroller), TRUE);
     gtk_widget_set_vexpand(GTK_WIDGET(ctx->stats_scroller), TRUE);
     gtk_scrolled_window_set_policy(ctx->stats_scroller, GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
-    gtk_widget_set_size_request(GTK_WIDGET(ctx->stats_scroller), -1, 240);
+    gtk_widget_set_size_request(GTK_WIDGET(ctx->stats_scroller), -1, 140);
 
     GtkWidget *stats_view = gtk_text_view_new();
     gtk_text_view_set_editable(GTK_TEXT_VIEW(stats_view), FALSE);
@@ -531,13 +721,113 @@ static void build_ui(GuiContext *ctx) {
     gtk_scrolled_window_set_child(ctx->stats_scroller, stats_view);
     gtk_frame_set_child(GTK_FRAME(ctx->stats_frame), GTK_WIDGET(ctx->stats_scroller));
 
+    gtk_toggle_button_set_active(ctx->sources_toggle, TRUE);
+    gtk_toggle_button_set_active(ctx->stats_toggle, TRUE);
+
+    return page;
+}
+
+static GtkWidget *build_settings_page(GuiContext *ctx) {
+    GtkWidget *page = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
+    gtk_widget_set_margin_top(page, 12);
+    gtk_widget_set_margin_bottom(page, 12);
+    gtk_widget_set_margin_start(page, 12);
+    gtk_widget_set_margin_end(page, 12);
+
+    ctx->info_label = GTK_LABEL(gtk_label_new(""));
+    gtk_label_set_xalign(ctx->info_label, 0.0);
+    gtk_box_append(GTK_BOX(page), GTK_WIDGET(ctx->info_label));
+    update_info_label(ctx);
+
+    GtkWidget *grid = gtk_grid_new();
+    gtk_grid_set_row_spacing(GTK_GRID(grid), 8);
+    gtk_grid_set_column_spacing(GTK_GRID(grid), 12);
+    gtk_box_append(GTK_BOX(page), grid);
+
+    GtkWidget *listen_label = gtk_label_new("Listen Port:");
+    gtk_label_set_xalign(GTK_LABEL(listen_label), 0.0);
+    gtk_grid_attach(GTK_GRID(grid), listen_label, 0, 0, 1, 1);
+
+    ctx->listen_port_spin = GTK_SPIN_BUTTON(gtk_spin_button_new_with_range(1, 65535, 1));
+    gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(ctx->listen_port_spin), 1, 0, 1, 1);
+
+    GtkWidget *sync_label = gtk_label_new("Sync to clock:");
+    gtk_label_set_xalign(GTK_LABEL(sync_label), 0.0);
+    gtk_grid_attach(GTK_GRID(grid), sync_label, 0, 1, 1, 1);
+
+    ctx->sync_toggle_settings = GTK_CHECK_BUTTON(gtk_check_button_new());
+    gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(ctx->sync_toggle_settings), 1, 1, 1, 1);
+
+    GtkWidget *jitter_label = gtk_label_new("Jitter Latency (ms):");
+    gtk_label_set_xalign(GTK_LABEL(jitter_label), 0.0);
+    gtk_grid_attach(GTK_GRID(grid), jitter_label, 0, 2, 1, 1);
+
+    ctx->jitter_latency_spin = GTK_SPIN_BUTTON(gtk_spin_button_new_with_range(1, 500, 1));
+    gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(ctx->jitter_latency_spin), 1, 2, 1, 1);
+
+    GtkWidget *queue_label = gtk_label_new("Max Queue Buffers:");
+    gtk_label_set_xalign(GTK_LABEL(queue_label), 0.0);
+    gtk_grid_attach(GTK_GRID(grid), queue_label, 0, 3, 1, 1);
+
+    ctx->queue_max_buffers_spin = GTK_SPIN_BUTTON(gtk_spin_button_new_with_range(0, 2000, 1));
+    gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(ctx->queue_max_buffers_spin), 1, 3, 1, 1);
+
+    ctx->jitter_drop_toggle = GTK_CHECK_BUTTON(gtk_check_button_new_with_label("Drop packets exceeding latency"));
+    gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(ctx->jitter_drop_toggle), 0, 4, 2, 1);
+
+    ctx->jitter_do_lost_toggle = GTK_CHECK_BUTTON(gtk_check_button_new_with_label("Emit lost packet notifications"));
+    gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(ctx->jitter_do_lost_toggle), 0, 5, 2, 1);
+
+    ctx->jitter_post_drop_toggle = GTK_CHECK_BUTTON(gtk_check_button_new_with_label("Post drop messages on bus"));
+    gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(ctx->jitter_post_drop_toggle), 0, 6, 2, 1);
+
+    GtkWidget *apply_button = gtk_button_new_with_label("Apply Settings");
+    g_signal_connect(apply_button, "clicked", G_CALLBACK(on_settings_apply_clicked), ctx);
+    gtk_box_append(GTK_BOX(page), apply_button);
+
+    sync_settings_controls(ctx);
+
+    GtkWidget *hint = gtk_label_new("Applying changes restarts the viewer to bind the new settings.");
+    gtk_label_set_xalign(GTK_LABEL(hint), 0.0);
+    gtk_box_append(GTK_BOX(page), hint);
+
+    return page;
+}
+
+static void build_ui(GuiContext *ctx) {
+    GtkWidget *window = gtk_application_window_new(ctx->app);
+    ctx->window = GTK_WINDOW(window);
+    gtk_window_set_title(ctx->window, "UDP H.265 Viewer");
+    gtk_window_set_default_size(ctx->window, 960, 720);
+    g_signal_connect(window, "close-request", G_CALLBACK(on_window_close_request), ctx);
+
+    ctx->notebook = GTK_NOTEBOOK(gtk_notebook_new());
+    gtk_window_set_child(ctx->window, GTK_WIDGET(ctx->notebook));
+
+    GtkWidget *monitor_page = build_monitor_page(ctx);
+    gtk_notebook_append_page(ctx->notebook, monitor_page, gtk_label_new("Monitor"));
+
+    GtkWidget *settings_page = build_settings_page(ctx);
+    gtk_notebook_append_page(ctx->notebook, settings_page, gtk_label_new("Settings"));
+
+    g_signal_connect(ctx->notebook, "switch-page", G_CALLBACK(on_notebook_switch_page), ctx);
+
     gtk_window_present(ctx->window);
+}
+
+static void on_notebook_switch_page(GtkNotebook *notebook, GtkWidget *page, guint page_num, gpointer user_data) {
+    (void)notebook;
+    (void)page;
+    (void)page_num;
+    GuiContext *ctx = user_data;
+    sync_settings_controls(ctx);
 }
 
 static void on_app_activate(GtkApplication *app, gpointer user_data) {
     GuiContext *ctx = user_data;
     ctx->app = app;
     build_ui(ctx);
+    sync_settings_controls(ctx);
     uv_viewer_set_event_callback(ctx->viewer, viewer_event_callback, ctx);
     refresh_stats(ctx);
     if (!ctx->stats_timeout_id) {
@@ -550,13 +840,18 @@ static void on_app_shutdown(GApplication *app, gpointer user_data) {
     GuiContext *ctx = user_data;
     if (!ctx) return;
     if (ctx->stats_timeout_id) {
-        g_source_remove(ctx->stats_timeout_id);
+        GSource *source = g_main_context_find_source_by_id(NULL, ctx->stats_timeout_id);
+        if (source) {
+            g_source_destroy(source);
+        }
         ctx->stats_timeout_id = 0;
     }
     if (ctx->viewer) {
         uv_viewer_set_event_callback(ctx->viewer, NULL, NULL);
     }
+    detach_bound_sink(ctx);
     ctx->status_label = NULL;
+    ctx->info_label = NULL;
     ctx->source_list = NULL;
     ctx->stats_buffer = NULL;
     ctx->video_picture = NULL;
@@ -566,6 +861,14 @@ static void on_app_shutdown(GApplication *app, gpointer user_data) {
     ctx->stats_frame = NULL;
     ctx->sources_toggle = NULL;
     ctx->stats_toggle = NULL;
+    ctx->listen_port_spin = NULL;
+    ctx->jitter_latency_spin = NULL;
+    ctx->sync_toggle_settings = NULL;
+    ctx->queue_max_buffers_spin = NULL;
+    ctx->jitter_drop_toggle = NULL;
+    ctx->jitter_do_lost_toggle = NULL;
+    ctx->jitter_post_drop_toggle = NULL;
+    ctx->notebook = NULL;
     ctx->paintable_bound = FALSE;
     ctx->window = NULL;
 }
@@ -577,7 +880,7 @@ int uv_gui_run(UvViewer *viewer, const UvViewerConfig *cfg, const char *program_
 
     GuiContext *ctx = g_new0(GuiContext, 1);
     ctx->viewer = viewer;
-    ctx->cfg = cfg;
+    ctx->current_cfg = *cfg;
 
     g_signal_connect(app, "activate", G_CALLBACK(on_app_activate), ctx);
     g_signal_connect(app, "shutdown", G_CALLBACK(on_app_shutdown), ctx);

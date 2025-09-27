@@ -11,6 +11,7 @@
 - `make clean && make`: force a full rebuild when headers or build flags change.
 - `GST_DEBUG=2 ./udp-h265-viewer --listen-port 5600`: run locally with verbose logging and auto `fakesink` fallback.
 - `gst-launch-1.0 videotestsrc ... ! udpsink host=127.0.0.1 port=5600`: generate a test RTP/H.265 stream.
+- Use the GUI’s Monitor tab for source selection/stats and the Settings tab to tweak listen port, sink sync, jitter latency, jitter drop policy, and queue depth at runtime.
 
 ## Coding Style & Naming Conventions
 - Target C11 with GCC; keep `-Wall -Wextra` warnings at zero.
