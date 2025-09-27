@@ -47,6 +47,7 @@ typedef struct {
     gboolean paintable_bound;
 
     GtkDrawingArea *frame_block_area;
+    GtkDrawingArea *frame_overlay_area;
     GtkToggleButton *frame_block_enable_toggle;
     GtkToggleButton *frame_block_pause_toggle;
     GtkDropDown *frame_block_mode_dropdown;
@@ -108,6 +109,10 @@ typedef struct {
     double reorder_packets;
     double jitter_ms;
     double fps_avg;
+    double frame_lateness_ms;
+    double frame_size_kb;
+    gboolean frame_valid;
+    gboolean frame_missing;
 } StatsSample;
 
 #define FRAME_BLOCK_VIEW_LATENESS 0u
@@ -124,6 +129,7 @@ static gboolean ensure_video_paintable(GuiContext *ctx);
 static void stats_range_changed(GObject *dropdown, GParamSpec *pspec, gpointer user_data);
 static void stats_chart_draw(GtkDrawingArea *area, cairo_t *cr, int width, int height, gpointer user_data);
 static void frame_block_draw(GtkDrawingArea *area, cairo_t *cr, int width, int height, gpointer user_data);
+static void frame_overlay_draw(GtkDrawingArea *area, cairo_t *cr, int width, int height, gpointer user_data);
 static void on_frame_block_enable_toggled(GtkToggleButton *button, gpointer user_data);
 static void on_frame_block_pause_toggled(GtkToggleButton *button, gpointer user_data);
 static void on_frame_block_mode_changed(GObject *dropdown, GParamSpec *pspec, gpointer user_data);
@@ -454,6 +460,158 @@ static void frame_block_draw(GtkDrawingArea *area, cairo_t *cr, int width, int h
     }
 }
 
+static void frame_overlay_draw(GtkDrawingArea *area, cairo_t *cr, int width, int height, gpointer user_data) {
+    (void)area;
+    GuiContext *ctx = user_data;
+    cairo_save(cr);
+    cairo_rectangle(cr, 0, 0, width, height);
+    cairo_set_source_rgb(cr, 0.10, 0.10, 0.10);
+    cairo_fill(cr);
+    cairo_restore(cr);
+
+    if (!ctx || !ctx->stats_history || ctx->stats_history->len < 2) {
+        cairo_save(cr);
+        cairo_set_source_rgb(cr, 0.7, 0.7, 0.7);
+        cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
+        cairo_set_font_size(cr, 12.0);
+        cairo_move_to(cr, 10, height / 2.0);
+        cairo_show_text(cr, "No frame data yet");
+        cairo_restore(cr);
+        return;
+    }
+
+    GArray *hist = ctx->stats_history;
+    guint len = hist->len;
+    double latest_ts = g_array_index(hist, StatsSample, len - 1).timestamp;
+    double range = ctx->stats_range_seconds > 0.1 ? ctx->stats_range_seconds : 60.0;
+    double padding = 8.0;
+    double usable_w = MAX(width - 2.0 * padding, 1.0);
+    double usable_h = MAX(height - 2.0 * padding, 1.0);
+
+    double max_lateness = 0.0;
+    double max_size = 0.0;
+    gboolean has_lateness = FALSE;
+    gboolean has_size = FALSE;
+    gboolean has_missing = FALSE;
+
+    for (guint i = 0; i < len; i++) {
+        StatsSample *sample = &g_array_index(hist, StatsSample, i);
+        double age = latest_ts - sample->timestamp;
+        if (age > range) continue;
+        if (sample->frame_missing) {
+            has_missing = TRUE;
+            has_size = TRUE;
+        }
+        if (sample->frame_valid) {
+            if (!isnan(sample->frame_lateness_ms)) {
+                if (sample->frame_lateness_ms > max_lateness) max_lateness = sample->frame_lateness_ms;
+                has_lateness = TRUE;
+            }
+            if (!isnan(sample->frame_size_kb)) {
+                if (sample->frame_size_kb > max_size) max_size = sample->frame_size_kb;
+                has_size = TRUE;
+            }
+        }
+    }
+
+    if (!has_lateness) max_lateness = 1.0;
+    if (!has_size) max_size = 1.0;
+
+    cairo_save(cr);
+    cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 0.15);
+    cairo_move_to(cr, padding, height - padding);
+    cairo_line_to(cr, width - padding, height - padding);
+    cairo_move_to(cr, padding, padding);
+    cairo_line_to(cr, padding, height - padding);
+    cairo_stroke(cr);
+    cairo_restore(cr);
+
+    double bar_width = MAX(1.0, usable_w / 200.0);
+
+    // Draw size bars and missing markers first
+    for (guint i = 0; i < len; i++) {
+        StatsSample *sample = &g_array_index(hist, StatsSample, i);
+        double age = latest_ts - sample->timestamp;
+        if (age > range) continue;
+        double t_norm = 1.0 - (age / range);
+        if (t_norm < 0.0) t_norm = 0.0;
+        if (t_norm > 1.0) t_norm = 1.0;
+        double x = padding + t_norm * usable_w;
+
+        if (sample->frame_missing) {
+            cairo_save(cr);
+            cairo_set_source_rgb(cr, 0.0, 0.0, 0.0);
+            cairo_rectangle(cr, x - bar_width * 0.5, padding, bar_width, usable_h);
+            cairo_fill(cr);
+            cairo_restore(cr);
+            continue;
+        }
+
+        if (sample->frame_valid && !isnan(sample->frame_size_kb) && sample->frame_size_kb >= 0.0) {
+            double ratio = sample->frame_size_kb / max_size;
+            if (ratio > 1.0) ratio = 1.0;
+            double bar_height = ratio * usable_h;
+            cairo_save(cr);
+            cairo_set_source_rgba(cr, 0.98, 0.55, 0.18, 0.55);
+            cairo_rectangle(cr, x - bar_width * 0.5, height - padding - bar_height, bar_width, bar_height);
+            cairo_fill(cr);
+            cairo_restore(cr);
+        }
+    }
+
+    // Draw lateness line
+    cairo_save(cr);
+    cairo_set_source_rgba(cr, 0.2, 0.7, 1.0, 0.9);
+    cairo_set_line_width(cr, 1.5);
+    gboolean started = FALSE;
+    for (guint i = 0; i < len; i++) {
+        StatsSample *sample = &g_array_index(hist, StatsSample, i);
+        double age = latest_ts - sample->timestamp;
+        if (age > range) continue;
+        double t_norm = 1.0 - (age / range);
+        if (t_norm < 0.0) t_norm = 0.0;
+        if (t_norm > 1.0) t_norm = 1.0;
+        double x = padding + t_norm * usable_w;
+
+        if (!sample->frame_valid || isnan(sample->frame_lateness_ms)) {
+            started = FALSE;
+            continue;
+        }
+
+        double ratio = sample->frame_lateness_ms / max_lateness;
+        if (ratio > 1.0) ratio = 1.0;
+        double y = height - padding - ratio * usable_h;
+
+        if (!started) {
+            cairo_move_to(cr, x, y);
+            started = TRUE;
+        } else {
+            cairo_line_to(cr, x, y);
+        }
+    }
+    cairo_stroke(cr);
+    cairo_restore(cr);
+
+    // Annotate maxima
+    cairo_save(cr);
+    cairo_set_source_rgba(cr, 0.7, 0.7, 0.7, 0.8);
+    cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
+    cairo_set_font_size(cr, 11.0);
+    char label[64];
+    g_snprintf(label, sizeof(label), "max lateness %.1f ms", has_lateness ? max_lateness : 0.0);
+    cairo_move_to(cr, padding, padding + 12);
+    cairo_show_text(cr, label);
+    g_snprintf(label, sizeof(label), "max size %.1f KB", has_size ? max_size : 0.0);
+    cairo_move_to(cr, width - padding - 150, padding + 12);
+    cairo_show_text(cr, label);
+    if (has_missing)
+    {
+        cairo_move_to(cr, padding, padding + 26);
+        cairo_show_text(cr, "black bars = missing frames");
+    }
+    cairo_restore(cr);
+}
+
 static void update_status(GuiContext *ctx, const char *message) {
     if (!ctx || !ctx->status_label) return;
     gtk_label_set_text(ctx->status_label, message ? message : "");
@@ -709,6 +867,33 @@ static void refresh_stats(GuiContext *ctx) {
         update_status(ctx, "");
     }
 
+    double latest_frame_lateness = NAN;
+    double latest_frame_size = NAN;
+    gboolean latest_valid = FALSE;
+    gboolean latest_missing = FALSE;
+    if (stats.frame_block_valid && stats.frame_block.lateness_ms && stats.frame_block.frame_size_kb) {
+        UvFrameBlockStats *fb = &stats.frame_block;
+        guint capacity = fb->lateness_ms->len;
+        guint limit = MIN(fb->filled, capacity);
+        if (capacity > 0 && limit > 0) {
+            guint current = fb->next_index % capacity;
+            for (guint cnt = 0; cnt < limit; cnt++) {
+                guint idx = (current + capacity - 1 - cnt) % capacity;
+                double v = g_array_index(fb->lateness_ms, double, idx);
+                double s = g_array_index(fb->frame_size_kb, double, idx);
+                if (isnan(v)) continue;
+                if (v < 0.0 || s < 0.0) {
+                    latest_missing = TRUE;
+                    break;
+                }
+                latest_frame_lateness = v;
+                latest_frame_size = s;
+                latest_valid = TRUE;
+                break;
+            }
+        }
+    }
+
     if (selected_source) {
         StatsSample sample = {0};
         sample.timestamp = g_get_monotonic_time() / 1e6;
@@ -718,6 +903,20 @@ static void refresh_stats(GuiContext *ctx) {
         sample.reorder_packets = (double)selected_source->rtp_reordered_packets;
         sample.jitter_ms = selected_source->rfc3550_jitter_ms;
         sample.fps_avg = stats.decoder.average_fps;
+        if (latest_missing) {
+            sample.frame_missing = TRUE;
+            sample.frame_valid = FALSE;
+            sample.frame_lateness_ms = NAN;
+            sample.frame_size_kb = FRAME_BLOCK_MISSING_SENTINEL;
+        } else if (latest_valid) {
+            sample.frame_valid = TRUE;
+            sample.frame_lateness_ms = latest_frame_lateness;
+            sample.frame_size_kb = latest_frame_size;
+        } else {
+            sample.frame_valid = FALSE;
+            sample.frame_lateness_ms = NAN;
+            sample.frame_size_kb = NAN;
+        }
         stats_history_push(ctx, &sample);
 
         for (int i = 0; i < STATS_METRIC_COUNT; i++) {
@@ -816,6 +1015,9 @@ static void refresh_stats(GuiContext *ctx) {
     if (ctx->frame_block_area) {
         gtk_widget_queue_draw(GTK_WIDGET(ctx->frame_block_area));
     }
+    if (ctx->frame_overlay_area) {
+        gtk_widget_queue_draw(GTK_WIDGET(ctx->frame_overlay_area));
+    }
 
     if (source_adj) restore_adjustment(source_adj, source_value);
 
@@ -908,6 +1110,7 @@ static void on_frame_block_enable_toggled(GtkToggleButton *button, gpointer user
     frame_block_sync_controls(ctx, NULL);
     frame_block_update_summary(ctx);
     if (ctx->frame_block_area) gtk_widget_queue_draw(GTK_WIDGET(ctx->frame_block_area));
+    if (ctx->frame_overlay_area) gtk_widget_queue_draw(GTK_WIDGET(ctx->frame_overlay_area));
 }
 
 static void on_frame_block_pause_toggled(GtkToggleButton *button, gpointer user_data) {
@@ -944,6 +1147,7 @@ static void on_frame_block_metric_changed(GObject *dropdown, GParamSpec *pspec, 
     frame_block_sync_controls(ctx, NULL);
     frame_block_update_summary(ctx);
     if (ctx->frame_block_area) gtk_widget_queue_draw(GTK_WIDGET(ctx->frame_block_area));
+    if (ctx->frame_overlay_area) gtk_widget_queue_draw(GTK_WIDGET(ctx->frame_overlay_area));
 }
 
 static void on_frame_block_reset_clicked(GtkButton *button, gpointer user_data) {
@@ -970,6 +1174,7 @@ static void on_frame_block_reset_clicked(GtkButton *button, gpointer user_data) 
     frame_block_sync_controls(ctx, NULL);
     frame_block_update_summary(ctx);
     if (ctx->frame_block_area) gtk_widget_queue_draw(GTK_WIDGET(ctx->frame_block_area));
+    if (ctx->frame_overlay_area) gtk_widget_queue_draw(GTK_WIDGET(ctx->frame_overlay_area));
 }
 
 static void on_frame_block_threshold_changed(GtkSpinButton *spin, gpointer user_data) {
@@ -1495,6 +1700,19 @@ static GtkWidget *build_frame_block_page(GuiContext *ctx) {
     gtk_frame_set_child(GTK_FRAME(frame), drawing);
     gtk_box_append(GTK_BOX(page), frame);
 
+    GtkWidget *overlay_frame = gtk_frame_new("Lateness / Size Timeline");
+    gtk_widget_set_hexpand(overlay_frame, TRUE);
+    gtk_widget_set_vexpand(overlay_frame, FALSE);
+
+    GtkWidget *overlay = gtk_drawing_area_new();
+    ctx->frame_overlay_area = GTK_DRAWING_AREA(overlay);
+    gtk_widget_set_size_request(overlay, 480, 160);
+    gtk_widget_set_hexpand(overlay, TRUE);
+    gtk_widget_set_vexpand(overlay, FALSE);
+    gtk_drawing_area_set_draw_func(ctx->frame_overlay_area, frame_overlay_draw, ctx, NULL);
+    gtk_frame_set_child(GTK_FRAME(overlay_frame), overlay);
+    gtk_box_append(GTK_BOX(page), overlay_frame);
+
     GtkWidget *summary_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
     gtk_box_append(GTK_BOX(page), summary_row);
 
@@ -1758,6 +1976,7 @@ static void on_app_shutdown(GApplication *app, gpointer user_data) {
         ctx->frame_block_values_size = NULL;
     }
     ctx->frame_block_area = NULL;
+    ctx->frame_overlay_area = NULL;
     ctx->frame_block_enable_toggle = NULL;
     ctx->frame_block_pause_toggle = NULL;
     ctx->frame_block_mode_dropdown = NULL;
