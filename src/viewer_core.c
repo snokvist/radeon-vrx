@@ -25,6 +25,9 @@ void uv_viewer_config_init(UvViewerConfig *cfg) {
     cfg->jitter_drop_on_latency = TRUE;
     cfg->jitter_do_lost = TRUE;
     cfg->jitter_post_drop_messages = TRUE;
+    cfg->videorate_enabled = FALSE;
+    cfg->videorate_fps_numerator = 60;
+    cfg->videorate_fps_denominator = 1;
 }
 
 UvViewer *uv_viewer_new(const UvViewerConfig *cfg) {

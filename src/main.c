@@ -5,7 +5,8 @@
 #include <string.h>
 
 static void print_usage(const char *argv0) {
-    g_printerr("Usage: %s [--listen-port N] [--payload PT] [--clockrate Hz] [--sync|--no-sync]\n",
+    g_printerr("Usage: %s [--listen-port N] [--payload PT] [--clockrate Hz] [--sync|--no-sync]"
+               " [--videorate] [--no-videorate] [--videorate-fps NUM[/DEN]]\n",
                argv0);
 }
 
@@ -21,6 +22,38 @@ static gboolean parse_args(int argc, char **argv, UvViewerConfig *cfg) {
             cfg->sync_to_clock = TRUE;
         } else if (!strcmp(argv[i], "--no-sync")) {
             cfg->sync_to_clock = FALSE;
+        } else if (!strcmp(argv[i], "--videorate")) {
+            cfg->videorate_enabled = TRUE;
+        } else if (!strcmp(argv[i], "--no-videorate")) {
+            cfg->videorate_enabled = FALSE;
+        } else if (!strcmp(argv[i], "--videorate-fps")) {
+            if (i + 1 >= argc) {
+                g_printerr("Missing argument for --videorate-fps\n");
+                return FALSE;
+            }
+            const char *spec = argv[++i];
+            char *endptr = NULL;
+            guint64 num = g_ascii_strtoull(spec, &endptr, 10);
+            if (endptr == spec || num == 0 || num > G_MAXUINT) {
+                g_printerr("Invalid videorate numerator: %s\n", spec);
+                return FALSE;
+            }
+            guint64 den = 1;
+            if (*endptr == '/') {
+                const char *den_str = endptr + 1;
+                char *den_end = NULL;
+                den = g_ascii_strtoull(den_str, &den_end, 10);
+                if (den_end == den_str || *den_end != '\0' || den == 0 || den > G_MAXUINT) {
+                    g_printerr("Invalid videorate denominator: %s\n", spec);
+                    return FALSE;
+                }
+            } else if (*endptr != '\0') {
+                g_printerr("Invalid videorate value: %s\n", spec);
+                return FALSE;
+            }
+            cfg->videorate_enabled = TRUE;
+            cfg->videorate_fps_numerator = (guint)num;
+            cfg->videorate_fps_denominator = (guint)den;
         } else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
             print_usage(argv[0]);
             return FALSE;

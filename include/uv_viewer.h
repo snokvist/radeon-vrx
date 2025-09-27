@@ -23,6 +23,9 @@ typedef struct {
     gboolean jitter_drop_on_latency; // drop-late packets
     gboolean jitter_do_lost;         // emit lost events
     gboolean jitter_post_drop_messages; // post drop messages on bus
+    gboolean videorate_enabled; // TRUE to insert videorate to enforce a target FPS
+    guint videorate_fps_numerator; // target framerate numerator (default: 60)
+    guint videorate_fps_denominator; // target framerate denominator (default: 1)
 } UvViewerConfig;
 
 typedef struct {

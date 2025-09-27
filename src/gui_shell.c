@@ -9,12 +9,12 @@
 #define FRAME_BLOCK_DEFAULT_WIDTH   100u
 #define FRAME_BLOCK_DEFAULT_HEIGHT  100u
 #define FRAME_BLOCK_COLOR_COUNT     4u
-#define FRAME_BLOCK_DEFAULT_GREEN_MS   5.0
-#define FRAME_BLOCK_DEFAULT_YELLOW_MS 15.0
-#define FRAME_BLOCK_DEFAULT_ORANGE_MS 30.0
-#define FRAME_BLOCK_DEFAULT_SIZE_GREEN_KB   64.0
-#define FRAME_BLOCK_DEFAULT_SIZE_YELLOW_KB  256.0
-#define FRAME_BLOCK_DEFAULT_SIZE_ORANGE_KB  512.0
+#define FRAME_BLOCK_DEFAULT_GREEN_MS   2.0
+#define FRAME_BLOCK_DEFAULT_YELLOW_MS 3.5
+#define FRAME_BLOCK_DEFAULT_ORANGE_MS 5.0
+#define FRAME_BLOCK_DEFAULT_SIZE_GREEN_KB   16.0
+#define FRAME_BLOCK_DEFAULT_SIZE_YELLOW_KB  32.0
+#define FRAME_BLOCK_DEFAULT_SIZE_ORANGE_KB  64.0
 #define FRAME_BLOCK_MISSING_SENTINEL (-1.0)
 
 typedef struct {
@@ -33,6 +33,9 @@ typedef struct {
     GtkSpinButton *jitter_latency_spin;
     GtkCheckButton *sync_toggle_settings;
     GtkSpinButton *queue_max_buffers_spin;
+    GtkCheckButton *videorate_toggle;
+    GtkSpinButton *videorate_num_spin;
+    GtkSpinButton *videorate_den_spin;
     GtkCheckButton *jitter_drop_toggle;
     GtkCheckButton *jitter_do_lost_toggle;
     GtkCheckButton *jitter_post_drop_toggle;
@@ -137,6 +140,7 @@ static void on_frame_block_metric_changed(GObject *dropdown, GParamSpec *pspec, 
 static void on_frame_block_reset_clicked(GtkButton *button, gpointer user_data);
 static void on_frame_block_threshold_changed(GtkSpinButton *spin, gpointer user_data);
 static void on_frame_block_color_toggled(GtkCheckButton *check, gpointer user_data);
+static void on_videorate_toggled(GtkCheckButton *button, gpointer user_data);
 
 static void format_bitrate(double bps, char *out, size_t outlen) {
     if (bps < 1000.0) {
@@ -621,9 +625,16 @@ static void update_info_label(GuiContext *ctx) {
     if (!ctx || !ctx->info_label) return;
     char info[160];
     UvViewerConfig *cfg = &ctx->current_cfg;
+    guint vr_den = cfg->videorate_fps_denominator ? cfg->videorate_fps_denominator : 1;
+    char videorate_info[24];
+    if (cfg->videorate_enabled && cfg->videorate_fps_numerator > 0) {
+        g_snprintf(videorate_info, sizeof(videorate_info), "%u/%u", cfg->videorate_fps_numerator, vr_den);
+    } else {
+        g_strlcpy(videorate_info, "off", sizeof(videorate_info));
+    }
     g_snprintf(info, sizeof(info),
                "Listening on %d | PT %d | Clock %d | %s | Jitter %ums | Queue buffers %u"
-               " | drop=%s | lost=%s | bus-msg=%s",
+               " | drop=%s | lost=%s | bus-msg=%s | videorate=%s",
                cfg->listen_port,
                cfg->payload_type,
                cfg->clock_rate,
@@ -632,7 +643,8 @@ static void update_info_label(GuiContext *ctx) {
                cfg->queue_max_buffers,
                cfg->jitter_drop_on_latency ? "on" : "off",
                cfg->jitter_do_lost ? "on" : "off",
-               cfg->jitter_post_drop_messages ? "on" : "off");
+               cfg->jitter_post_drop_messages ? "on" : "off",
+               videorate_info);
     gtk_label_set_text(ctx->info_label, info);
 }
 
@@ -646,6 +658,23 @@ static void sync_settings_controls(GuiContext *ctx) {
     }
     if (ctx->queue_max_buffers_spin) {
         gtk_spin_button_set_value(ctx->queue_max_buffers_spin, ctx->current_cfg.queue_max_buffers);
+    }
+    if (ctx->videorate_toggle) {
+        check_set(ctx->videorate_toggle, ctx->current_cfg.videorate_enabled);
+    }
+    if (ctx->videorate_num_spin) {
+        gtk_spin_button_set_value(ctx->videorate_num_spin, ctx->current_cfg.videorate_fps_numerator);
+    }
+    if (ctx->videorate_den_spin) {
+        guint den = ctx->current_cfg.videorate_fps_denominator ? ctx->current_cfg.videorate_fps_denominator : 1;
+        gtk_spin_button_set_value(ctx->videorate_den_spin, den);
+    }
+    gboolean videorate_sensitive = ctx->current_cfg.videorate_enabled;
+    if (ctx->videorate_num_spin) {
+        gtk_widget_set_sensitive(GTK_WIDGET(ctx->videorate_num_spin), videorate_sensitive);
+    }
+    if (ctx->videorate_den_spin) {
+        gtk_widget_set_sensitive(GTK_WIDGET(ctx->videorate_den_spin), videorate_sensitive);
     }
     check_set(ctx->sync_toggle_settings, ctx->current_cfg.sync_to_clock ? TRUE : FALSE);
     check_set(ctx->jitter_drop_toggle, ctx->current_cfg.jitter_drop_on_latency ? TRUE : FALSE);
@@ -1204,6 +1233,9 @@ static gboolean gui_restart_with_config(GuiContext *ctx, const UvViewerConfig *c
         cfg->sync_to_clock == ctx->current_cfg.sync_to_clock &&
         cfg->jitter_latency_ms == ctx->current_cfg.jitter_latency_ms &&
         cfg->queue_max_buffers == ctx->current_cfg.queue_max_buffers &&
+        cfg->videorate_enabled == ctx->current_cfg.videorate_enabled &&
+        cfg->videorate_fps_numerator == ctx->current_cfg.videorate_fps_numerator &&
+        cfg->videorate_fps_denominator == ctx->current_cfg.videorate_fps_denominator &&
         cfg->jitter_drop_on_latency == ctx->current_cfg.jitter_drop_on_latency &&
         cfg->jitter_do_lost == ctx->current_cfg.jitter_do_lost &&
         cfg->jitter_post_drop_messages == ctx->current_cfg.jitter_post_drop_messages) {
@@ -1286,6 +1318,17 @@ static void on_settings_apply_clicked(GtkButton *button, gpointer user_data) {
     if (ctx->queue_max_buffers_spin) {
         new_cfg.queue_max_buffers = gtk_spin_button_get_value_as_int(ctx->queue_max_buffers_spin);
     }
+    new_cfg.videorate_enabled = check_get(ctx->videorate_toggle);
+    if (ctx->videorate_num_spin) {
+        int fps_num = gtk_spin_button_get_value_as_int(ctx->videorate_num_spin);
+        if (fps_num < 0) fps_num = 0;
+        new_cfg.videorate_fps_numerator = (guint)fps_num;
+    }
+    if (ctx->videorate_den_spin) {
+        int fps_den = gtk_spin_button_get_value_as_int(ctx->videorate_den_spin);
+        if (fps_den <= 0) fps_den = 1;
+        new_cfg.videorate_fps_denominator = (guint)fps_den;
+    }
     new_cfg.sync_to_clock = check_get(ctx->sync_toggle_settings);
     new_cfg.jitter_drop_on_latency = check_get(ctx->jitter_drop_toggle);
     new_cfg.jitter_do_lost = check_get(ctx->jitter_do_lost_toggle);
@@ -1293,6 +1336,18 @@ static void on_settings_apply_clicked(GtkButton *button, gpointer user_data) {
 
     if (!gui_restart_with_config(ctx, &new_cfg)) {
         sync_settings_controls(ctx);
+    }
+}
+
+static void on_videorate_toggled(GtkCheckButton *button, gpointer user_data) {
+    GuiContext *ctx = user_data;
+    if (!ctx) return;
+    gboolean active = button ? gtk_check_button_get_active(button) : FALSE;
+    if (ctx->videorate_num_spin) {
+        gtk_widget_set_sensitive(GTK_WIDGET(ctx->videorate_num_spin), active);
+    }
+    if (ctx->videorate_den_spin) {
+        gtk_widget_set_sensitive(GTK_WIDGET(ctx->videorate_den_spin), active);
     }
 }
 
@@ -1514,14 +1569,38 @@ static GtkWidget *build_settings_page(GuiContext *ctx) {
     ctx->queue_max_buffers_spin = GTK_SPIN_BUTTON(gtk_spin_button_new_with_range(0, 2000, 1));
     gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(ctx->queue_max_buffers_spin), 1, 3, 1, 1);
 
+    GtkWidget *videorate_label = gtk_label_new("Videorate:");
+    gtk_label_set_xalign(GTK_LABEL(videorate_label), 0.0);
+    gtk_grid_attach(GTK_GRID(grid), videorate_label, 0, 4, 1, 1);
+
+    GtkWidget *videorate_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    gtk_grid_attach(GTK_GRID(grid), videorate_box, 1, 4, 1, 1);
+
+    ctx->videorate_toggle = GTK_CHECK_BUTTON(gtk_check_button_new_with_label("Enable"));
+    gtk_box_append(GTK_BOX(videorate_box), GTK_WIDGET(ctx->videorate_toggle));
+    g_signal_connect(ctx->videorate_toggle, "toggled", G_CALLBACK(on_videorate_toggled), ctx);
+
+    GtkWidget *target_label = gtk_label_new("Target FPS:");
+    gtk_label_set_xalign(GTK_LABEL(target_label), 0.0);
+    gtk_box_append(GTK_BOX(videorate_box), target_label);
+
+    ctx->videorate_num_spin = GTK_SPIN_BUTTON(gtk_spin_button_new_with_range(1, 480, 1));
+    gtk_box_append(GTK_BOX(videorate_box), GTK_WIDGET(ctx->videorate_num_spin));
+
+    GtkWidget *slash_label = gtk_label_new("/");
+    gtk_box_append(GTK_BOX(videorate_box), slash_label);
+
+    ctx->videorate_den_spin = GTK_SPIN_BUTTON(gtk_spin_button_new_with_range(1, 1000, 1));
+    gtk_box_append(GTK_BOX(videorate_box), GTK_WIDGET(ctx->videorate_den_spin));
+
     ctx->jitter_drop_toggle = GTK_CHECK_BUTTON(gtk_check_button_new_with_label("Drop packets exceeding latency"));
-    gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(ctx->jitter_drop_toggle), 0, 4, 2, 1);
+    gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(ctx->jitter_drop_toggle), 0, 5, 2, 1);
 
     ctx->jitter_do_lost_toggle = GTK_CHECK_BUTTON(gtk_check_button_new_with_label("Emit lost packet notifications"));
-    gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(ctx->jitter_do_lost_toggle), 0, 5, 2, 1);
+    gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(ctx->jitter_do_lost_toggle), 0, 6, 2, 1);
 
     ctx->jitter_post_drop_toggle = GTK_CHECK_BUTTON(gtk_check_button_new_with_label("Post drop messages on bus"));
-    gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(ctx->jitter_post_drop_toggle), 0, 6, 2, 1);
+    gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(ctx->jitter_post_drop_toggle), 0, 7, 2, 1);
 
     GtkWidget *apply_button = gtk_button_new_with_label("Apply Settings");
     g_signal_connect(apply_button, "clicked", G_CALLBACK(on_settings_apply_clicked), ctx);
@@ -1960,6 +2039,9 @@ static void on_app_shutdown(GApplication *app, gpointer user_data) {
     ctx->jitter_latency_spin = NULL;
     ctx->sync_toggle_settings = NULL;
     ctx->queue_max_buffers_spin = NULL;
+    ctx->videorate_toggle = NULL;
+    ctx->videorate_num_spin = NULL;
+    ctx->videorate_den_spin = NULL;
     ctx->jitter_drop_toggle = NULL;
     ctx->jitter_do_lost_toggle = NULL;
     ctx->jitter_post_drop_toggle = NULL;

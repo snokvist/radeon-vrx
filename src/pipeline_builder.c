@@ -108,6 +108,23 @@ static gboolean build_pipeline(PipelineController *pc, GError **error) {
     pc->queue_postdec    = gst_element_factory_make("queue", "queue_postdec");
     pc->video_convert    = gst_element_factory_make("videoconvert", "video_convert");
 
+    if (pc->videorate_fps_den == 0) {
+        pc->videorate_fps_den = 1;
+    }
+    gboolean enable_videorate = pc->use_videorate &&
+                                pc->videorate_fps_num > 0 &&
+                                pc->videorate_fps_den > 0;
+    if (pc->use_videorate && !enable_videorate) {
+        uv_log_warn("Videorate requested but invalid target FPS %u/%u; disabling",
+                    pc->videorate_fps_num, pc->videorate_fps_den);
+    }
+    pc->use_videorate = enable_videorate;
+    if (pc->use_videorate) {
+        pc->videorate = gst_element_factory_make("videorate", "videorate");
+        pc->videorate_caps = gst_element_factory_make("capsfilter", "videorate_caps");
+        pc->queue_postrate = gst_element_factory_make("queue", "queue_postrate");
+    }
+
     gboolean headless = (g_getenv("WAYLAND_DISPLAY") == NULL && g_getenv("DISPLAY") == NULL);
     gboolean sink_is_fakesink = FALSE;
     if (headless) {
@@ -133,7 +150,8 @@ static gboolean build_pipeline(PipelineController *pc, GError **error) {
 
     if (!pc->appsrc_element || !capsf_rtp || !pc->queue0 || !pc->jitterbuffer ||
         !pc->depay || !pc->parser || !pc->capsfilter || !pc->decoder ||
-        !pc->queue_postdec || !pc->video_convert || !pc->sink) {
+        !pc->queue_postdec || !pc->video_convert || !pc->sink ||
+        (pc->use_videorate && (!pc->videorate || !pc->videorate_caps || !pc->queue_postrate))) {
         g_set_error(error, g_quark_from_static_string("uv-viewer"), 10,
                     "Failed to create required GStreamer elements");
         return FALSE;
@@ -194,6 +212,22 @@ static gboolean build_pipeline(PipelineController *pc, GError **error) {
     g_object_set(pc->capsfilter, "caps", caps_h265, NULL);
     gst_caps_unref(caps_h265);
 
+    if (pc->use_videorate) {
+        g_object_set(pc->videorate, "drop-only", FALSE, NULL);
+        GstCaps *fps_caps = gst_caps_new_simple("video/x-raw",
+                                               "framerate", GST_TYPE_FRACTION,
+                                               pc->videorate_fps_num,
+                                               pc->videorate_fps_den,
+                                               NULL);
+        if (!fps_caps) {
+            g_set_error(error, g_quark_from_static_string("uv-viewer"), 15,
+                        "Failed to build videorate caps");
+            return FALSE;
+        }
+        g_object_set(pc->videorate_caps, "caps", fps_caps, NULL);
+        gst_caps_unref(fps_caps);
+    }
+
     if (!sink_is_fakesink) {
         g_object_set(pc->sink, "sync", viewer->config.sync_to_clock ? TRUE : FALSE, NULL);
     }
@@ -203,13 +237,58 @@ static gboolean build_pipeline(PipelineController *pc, GError **error) {
     gst_bin_add_many(GST_BIN(pc->pipeline),
                      pc->appsrc_element, capsf_rtp, pc->queue0, pc->jitterbuffer,
                      pc->depay, pc->parser, pc->capsfilter,
-                     pc->decoder, pc->queue_postdec, pc->video_convert, pc->sink, NULL);
+                     pc->decoder, pc->queue_postdec, pc->video_convert, NULL);
+    if (pc->use_videorate) {
+        gst_bin_add_many(GST_BIN(pc->pipeline), pc->videorate, pc->videorate_caps, pc->queue_postrate, NULL);
+    }
+    gst_bin_add(GST_BIN(pc->pipeline), pc->sink);
 
     if (!gst_element_link_many(pc->appsrc_element, capsf_rtp, pc->queue0, pc->jitterbuffer,
-                               pc->depay, pc->parser, pc->capsfilter,
-                               pc->decoder, pc->queue_postdec, pc->video_convert, pc->sink, NULL)) {
+                               pc->depay, pc->parser, pc->capsfilter, pc->decoder, NULL)) {
         g_set_error(error, g_quark_from_static_string("uv-viewer"), 14,
-                    "Failed to link pipeline");
+                    "Failed to link pipeline (upstream)");
+        return FALSE;
+    }
+
+    if (!gst_element_link(pc->decoder, pc->queue_postdec)) {
+        g_set_error(error, g_quark_from_static_string("uv-viewer"), 14,
+                    "Failed to link decoder to post-decode queue");
+        return FALSE;
+    }
+
+    GstElement *tail = pc->queue_postdec;
+    if (pc->use_videorate) {
+        if (!gst_element_link(tail, pc->videorate)) {
+            g_set_error(error, g_quark_from_static_string("uv-viewer"), 14,
+                        "Failed to link videorate");
+            return FALSE;
+        }
+        tail = pc->videorate;
+
+        if (!gst_element_link(tail, pc->videorate_caps)) {
+            g_set_error(error, g_quark_from_static_string("uv-viewer"), 14,
+                        "Failed to link videorate capsfilter");
+            return FALSE;
+        }
+        tail = pc->videorate_caps;
+
+        if (!gst_element_link(tail, pc->queue_postrate)) {
+            g_set_error(error, g_quark_from_static_string("uv-viewer"), 14,
+                        "Failed to link post-videorate queue");
+            return FALSE;
+        }
+        tail = pc->queue_postrate;
+    }
+
+    if (!gst_element_link(tail, pc->video_convert)) {
+        g_set_error(error, g_quark_from_static_string("uv-viewer"), 14,
+                    "Failed to link video convert");
+        return FALSE;
+    }
+
+    if (!gst_element_link(pc->video_convert, pc->sink)) {
+        g_set_error(error, g_quark_from_static_string("uv-viewer"), 14,
+                    "Failed to link sink");
         return FALSE;
     }
 
@@ -261,6 +340,14 @@ gboolean pipeline_controller_init(PipelineController *pc, struct _UvViewer *view
     pc->payload_type = viewer->config.payload_type;
     pc->clock_rate = viewer->config.clock_rate;
     pc->sync_to_clock = viewer->config.sync_to_clock;
+    pc->videorate_fps_num = viewer->config.videorate_fps_numerator;
+    pc->videorate_fps_den = viewer->config.videorate_fps_denominator;
+    if (pc->videorate_fps_den == 0) {
+        pc->videorate_fps_den = 1;
+    }
+    pc->use_videorate = viewer->config.videorate_enabled &&
+                        pc->videorate_fps_num > 0 &&
+                        pc->videorate_fps_den > 0;
     return TRUE;
 }
 
@@ -276,6 +363,9 @@ void pipeline_controller_deinit(PipelineController *pc) {
         pc->pipeline = NULL;
     }
     pc->video_convert = NULL;
+    pc->videorate = NULL;
+    pc->videorate_caps = NULL;
+    pc->queue_postrate = NULL;
     if (pc->loop) {
         g_main_loop_unref(pc->loop);
         pc->loop = NULL;

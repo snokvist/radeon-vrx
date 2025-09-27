@@ -108,6 +108,9 @@ typedef struct {
     int payload_type;
     int clock_rate;
     gboolean sync_to_clock;
+    gboolean use_videorate;
+    guint videorate_fps_num;
+    guint videorate_fps_den;
 
     struct _UvViewer *viewer;
 
@@ -121,6 +124,9 @@ typedef struct {
     GstElement *decoder;
     GstElement *queue_postdec;
     GstElement *video_convert;
+    GstElement *videorate;
+    GstElement *videorate_caps;
+    GstElement *queue_postrate;
     GstElement *sink;
 
     GThread *loop_thread;
