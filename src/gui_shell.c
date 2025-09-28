@@ -18,24 +18,34 @@
 #define FRAME_BLOCK_MISSING_SENTINEL (-1.0)
 
 typedef struct {
+    UvViewer **viewer_slot;
     UvViewer *viewer;
+    UvViewerConfig *cfg_slot;
     UvViewerConfig current_cfg;
     GtkApplication *app;
     GtkWindow *window;
     GtkLabel *status_label;
     GtkLabel *info_label;
-    GtkListBox *source_list;
+    GtkDropDown *source_dropdown;
+    GtkStringList *source_model;
+    GtkLabel *source_detail_label;
     GtkPicture *video_picture;
-    GtkScrolledWindow *source_scroller;
     GtkWidget *sources_frame;
     GtkToggleButton *sources_toggle;
+    guint known_source_count;
+    gboolean suppress_source_change;
+    guint stats_refresh_interval_ms;
     GtkSpinButton *listen_port_spin;
     GtkSpinButton *jitter_latency_spin;
     GtkCheckButton *sync_toggle_settings;
     GtkSpinButton *queue_max_buffers_spin;
+    GtkSpinButton *stats_refresh_spin;
     GtkCheckButton *videorate_toggle;
     GtkSpinButton *videorate_num_spin;
     GtkSpinButton *videorate_den_spin;
+    GtkCheckButton *audio_toggle;
+    GtkSpinButton *audio_payload_spin;
+    GtkSpinButton *audio_jitter_spin;
     GtkCheckButton *jitter_drop_toggle;
     GtkCheckButton *jitter_do_lost_toggle;
     GtkCheckButton *jitter_post_drop_toggle;
@@ -50,11 +60,12 @@ typedef struct {
     gboolean paintable_bound;
 
     GtkDrawingArea *frame_block_area;
-    GtkDrawingArea *frame_overlay_area;
+    GtkDrawingArea *frame_overlay_lateness;
+    GtkDrawingArea *frame_overlay_size;
     GtkToggleButton *frame_block_enable_toggle;
     GtkToggleButton *frame_block_pause_toggle;
     GtkDropDown *frame_block_mode_dropdown;
-    GtkDropDown *frame_block_metric_dropdown;
+    GtkToggleButton *frame_block_metric_toggle;
     GtkSpinButton *frame_block_threshold_spins[3];
     GtkLabel *frame_block_threshold_labels[3];
     GtkCheckButton *frame_block_color_toggles[4];
@@ -84,6 +95,8 @@ typedef struct {
     guint frame_block_view; // 0 = lateness, 1 = size
     guint frame_block_missing;
     guint frame_block_real_samples;
+    gboolean audio_runtime_enabled;
+    gboolean audio_active;
 } GuiContext;
 
 typedef struct {
@@ -120,6 +133,8 @@ typedef struct {
 
 #define FRAME_BLOCK_VIEW_LATENESS 0u
 #define FRAME_BLOCK_VIEW_SIZE     1u
+#define FRAME_OVERLAY_METRIC_LATENESS 0u
+#define FRAME_OVERLAY_METRIC_SIZE     1u
 
 static GtkWidget *build_monitor_page(GuiContext *ctx);
 static GtkWidget *build_settings_page(GuiContext *ctx);
@@ -129,6 +144,9 @@ static void viewer_event_callback(const UvViewerEvent *event, gpointer user_data
 static void on_notebook_switch_page(GtkNotebook *notebook, GtkWidget *page, guint page_num, gpointer user_data);
 static void detach_bound_sink(GuiContext *ctx);
 static gboolean ensure_video_paintable(GuiContext *ctx);
+static void restart_stats_timer(GuiContext *ctx);
+static void set_stats_refresh_interval(GuiContext *ctx, guint interval_ms);
+static void frame_block_queue_overlay_draws(GuiContext *ctx);
 static void stats_range_changed(GObject *dropdown, GParamSpec *pspec, gpointer user_data);
 static void stats_chart_draw(GtkDrawingArea *area, cairo_t *cr, int width, int height, gpointer user_data);
 static void frame_block_draw(GtkDrawingArea *area, cairo_t *cr, int width, int height, gpointer user_data);
@@ -136,11 +154,13 @@ static void frame_overlay_draw(GtkDrawingArea *area, cairo_t *cr, int width, int
 static void on_frame_block_enable_toggled(GtkToggleButton *button, gpointer user_data);
 static void on_frame_block_pause_toggled(GtkToggleButton *button, gpointer user_data);
 static void on_frame_block_mode_changed(GObject *dropdown, GParamSpec *pspec, gpointer user_data);
-static void on_frame_block_metric_changed(GObject *dropdown, GParamSpec *pspec, gpointer user_data);
+static void on_frame_block_metric_toggled(GtkToggleButton *button, gpointer user_data);
 static void on_frame_block_reset_clicked(GtkButton *button, gpointer user_data);
 static void on_frame_block_threshold_changed(GtkSpinButton *spin, gpointer user_data);
 static void on_frame_block_color_toggled(GtkCheckButton *check, gpointer user_data);
 static void on_videorate_toggled(GtkCheckButton *button, gpointer user_data);
+static void on_audio_toggled(GtkCheckButton *button, gpointer user_data);
+static void on_source_dropdown_changed(GObject *dropdown, GParamSpec *pspec, gpointer user_data);
 
 static void format_bitrate(double bps, char *out, size_t outlen) {
     if (bps < 1000.0) {
@@ -277,6 +297,95 @@ static void frame_block_update_summary(GuiContext *ctx) {
     g_string_free(summary, TRUE);
 }
 
+static void frame_block_queue_overlay_draws(GuiContext *ctx) {
+    if (!ctx) return;
+    if (ctx->frame_overlay_lateness) {
+        gtk_widget_queue_draw(GTK_WIDGET(ctx->frame_overlay_lateness));
+    }
+    if (ctx->frame_overlay_size) {
+        gtk_widget_queue_draw(GTK_WIDGET(ctx->frame_overlay_size));
+    }
+}
+
+static gboolean frame_block_stats_latest(const UvFrameBlockStats *fb,
+                                         double *out_lateness_ms,
+                                         double *out_size_kb,
+                                         gboolean *out_missing) {
+    if (out_missing) *out_missing = FALSE;
+    if (!fb || !fb->lateness_ms || !fb->frame_size_kb) return FALSE;
+    guint capacity = MIN(fb->lateness_ms->len, fb->frame_size_kb->len);
+    if (capacity == 0) return FALSE;
+    guint filled = fb->filled;
+    if (filled == 0) return FALSE;
+    if (filled > capacity) filled = capacity;
+
+    guint next_index = fb->next_index % capacity;
+    for (guint offset = 0; offset < filled; offset++) {
+        guint idx = (next_index + capacity - 1 - offset) % capacity;
+        double lateness = g_array_index(fb->lateness_ms, double, idx);
+        double size = g_array_index(fb->frame_size_kb, double, idx);
+        if (isnan(lateness) || isnan(size)) continue;
+        if (lateness < 0.0 || size < 0.0) {
+            if (out_missing) *out_missing = TRUE;
+            return FALSE;
+        }
+        if (out_lateness_ms) *out_lateness_ms = lateness;
+        if (out_size_kb) *out_size_kb = size;
+        return TRUE;
+    }
+
+    return FALSE;
+}
+
+static gboolean frame_overlay_sample_value(const StatsSample *sample, guint metric, double *out_value, gboolean *missing_flag) {
+    if (!sample || !out_value) return FALSE;
+    if (missing_flag) {
+        *missing_flag = FALSE;
+    }
+    if (!sample->frame_valid) {
+        if (missing_flag && sample->frame_missing) {
+            *missing_flag = TRUE;
+        }
+        return FALSE;
+    }
+
+    if (metric == FRAME_OVERLAY_METRIC_SIZE) {
+        double v = sample->frame_size_kb;
+        if (!isfinite(v) || v < 0.0) {
+            if (missing_flag && sample->frame_missing) {
+                *missing_flag = TRUE;
+            }
+            return FALSE;
+        }
+        *out_value = v;
+        if (missing_flag && sample->frame_missing) {
+            *missing_flag = TRUE;
+        }
+        return TRUE;
+    }
+
+    double v = sample->frame_lateness_ms;
+    if (!isfinite(v) || v < 0.0) {
+        if (missing_flag && sample->frame_missing) {
+            *missing_flag = TRUE;
+        }
+        return FALSE;
+    }
+    *out_value = v;
+    if (missing_flag && sample->frame_missing) {
+        *missing_flag = TRUE;
+    }
+    return TRUE;
+}
+
+static void frame_block_update_metric_toggle_label(GuiContext *ctx) {
+    if (!ctx || !ctx->frame_block_metric_toggle) return;
+    const char *label = (ctx->frame_block_view == FRAME_BLOCK_VIEW_SIZE)
+                            ? "Viewing: Size"
+                            : "Viewing: Lateness";
+    gtk_button_set_label(GTK_BUTTON(ctx->frame_block_metric_toggle), label);
+}
+
 static void frame_block_sync_controls(GuiContext *ctx, const UvFrameBlockStats *fb) {
     if (!ctx) return;
     gboolean active = fb ? fb->active : ctx->frame_block_active;
@@ -316,15 +425,16 @@ static void frame_block_sync_controls(GuiContext *ctx, const UvFrameBlockStats *
         gtk_widget_set_sensitive(GTK_WIDGET(ctx->frame_block_mode_dropdown), TRUE);
     }
 
-    if (ctx->frame_block_metric_dropdown) {
-        guint desired_view = ctx->frame_block_view;
-        guint current_view = gtk_drop_down_get_selected(ctx->frame_block_metric_dropdown);
-        if (current_view != desired_view) {
-            g_signal_handlers_block_by_func(ctx->frame_block_metric_dropdown, G_CALLBACK(on_frame_block_metric_changed), ctx);
-            gtk_drop_down_set_selected(ctx->frame_block_metric_dropdown, desired_view);
-            g_signal_handlers_unblock_by_func(ctx->frame_block_metric_dropdown, G_CALLBACK(on_frame_block_metric_changed), ctx);
+    if (ctx->frame_block_metric_toggle) {
+        gboolean desired = (ctx->frame_block_view == FRAME_BLOCK_VIEW_SIZE);
+        gboolean current = gtk_toggle_button_get_active(ctx->frame_block_metric_toggle);
+        if (current != desired) {
+            g_signal_handlers_block_by_func(ctx->frame_block_metric_toggle, G_CALLBACK(on_frame_block_metric_toggled), ctx);
+            gtk_toggle_button_set_active(ctx->frame_block_metric_toggle, desired);
+            g_signal_handlers_unblock_by_func(ctx->frame_block_metric_toggle, G_CALLBACK(on_frame_block_metric_toggled), ctx);
         }
-        gtk_widget_set_sensitive(GTK_WIDGET(ctx->frame_block_metric_dropdown), TRUE);
+        frame_block_update_metric_toggle_label(ctx);
+        gtk_widget_set_sensitive(GTK_WIDGET(ctx->frame_block_metric_toggle), TRUE);
     }
 
     if (ctx->frame_block_reset_button) {
@@ -465,154 +575,155 @@ static void frame_block_draw(GtkDrawingArea *area, cairo_t *cr, int width, int h
 }
 
 static void frame_overlay_draw(GtkDrawingArea *area, cairo_t *cr, int width, int height, gpointer user_data) {
-    (void)area;
     GuiContext *ctx = user_data;
-    cairo_save(cr);
-    cairo_rectangle(cr, 0, 0, width, height);
-    cairo_set_source_rgb(cr, 0.10, 0.10, 0.10);
-    cairo_fill(cr);
-    cairo_restore(cr);
+    if (!ctx || width <= 0 || height <= 0) return;
 
-    if (!ctx || !ctx->stats_history || ctx->stats_history->len < 2) {
-        cairo_save(cr);
+    guint metric = FRAME_OVERLAY_METRIC_LATENESS;
+    gpointer tag = g_object_get_data(G_OBJECT(area), "overlay-metric");
+    if (tag) {
+        metric = GPOINTER_TO_UINT(tag);
+        if (metric > FRAME_OVERLAY_METRIC_SIZE) {
+            metric = FRAME_OVERLAY_METRIC_LATENESS;
+        }
+    }
+
+    cairo_save(cr);
+    cairo_set_source_rgb(cr, 0.10, 0.10, 0.12);
+    cairo_paint(cr);
+
+    cairo_set_source_rgba(cr, 1, 1, 1, 0.1);
+    cairo_rectangle(cr, 0.5, 0.5, width - 1.0, height - 1.0);
+    cairo_stroke(cr);
+
+    if (!ctx->stats_history || ctx->stats_history->len == 0) {
         cairo_set_source_rgb(cr, 0.7, 0.7, 0.7);
         cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
         cairo_set_font_size(cr, 12.0);
         cairo_move_to(cr, 10, height / 2.0);
-        cairo_show_text(cr, "No frame data yet");
+        cairo_show_text(cr, "No data yet");
         cairo_restore(cr);
         return;
     }
 
-    GArray *hist = ctx->stats_history;
-    guint len = hist->len;
-    double latest_ts = g_array_index(hist, StatsSample, len - 1).timestamp;
-    double range = ctx->stats_range_seconds > 0.1 ? ctx->stats_range_seconds : 60.0;
-    double padding = 8.0;
-    double usable_w = MAX(width - 2.0 * padding, 1.0);
-    double usable_h = MAX(height - 2.0 * padding, 1.0);
+    double range = MAX(ctx->stats_range_seconds, 60.0);
+    double now = g_get_monotonic_time() / 1e6;
+    double start_time = now - range;
 
-    double max_lateness = 0.0;
-    double max_size = 0.0;
-    gboolean has_lateness = FALSE;
-    gboolean has_size = FALSE;
-    gboolean has_missing = FALSE;
-
-    for (guint i = 0; i < len; i++) {
-        StatsSample *sample = &g_array_index(hist, StatsSample, i);
-        double age = latest_ts - sample->timestamp;
-        if (age > range) continue;
-        if (sample->frame_missing) {
-            has_missing = TRUE;
-            has_size = TRUE;
-        }
-        if (sample->frame_valid) {
-            if (!isnan(sample->frame_lateness_ms)) {
-                if (sample->frame_lateness_ms > max_lateness) max_lateness = sample->frame_lateness_ms;
-                has_lateness = TRUE;
-            }
-            if (!isnan(sample->frame_size_kb)) {
-                if (sample->frame_size_kb > max_size) max_size = sample->frame_size_kb;
-                has_size = TRUE;
-            }
-        }
+    StatsSample *samples = (StatsSample *)ctx->stats_history->data;
+    guint len = ctx->stats_history->len;
+    guint start_index = 0;
+    while (start_index < len && samples[start_index].timestamp < start_time) {
+        start_index++;
+    }
+    if (start_index == len) {
+        start_index = len > 0 ? len - 1 : 0;
     }
 
-    if (!has_lateness) max_lateness = 1.0;
-    if (!has_size) max_size = 1.0;
+    double min_val = G_MAXDOUBLE;
+    double max_val = -G_MAXDOUBLE;
+    gboolean any_value = FALSE;
+    gboolean missing_seen = FALSE;
 
-    cairo_save(cr);
-    cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 0.15);
-    cairo_move_to(cr, padding, height - padding);
-    cairo_line_to(cr, width - padding, height - padding);
-    cairo_move_to(cr, padding, padding);
-    cairo_line_to(cr, padding, height - padding);
+    for (guint i = start_index; i < len; i++) {
+        double value = 0.0;
+        gboolean missing_flag = FALSE;
+        if (!frame_overlay_sample_value(&samples[i], metric, &value, &missing_flag)) {
+            if (missing_flag) missing_seen = TRUE;
+            continue;
+        }
+        if (value < min_val) min_val = value;
+        if (value > max_val) max_val = value;
+        any_value = TRUE;
+    }
+
+    if (!any_value) {
+        cairo_set_source_rgb(cr, 0.7, 0.7, 0.7);
+        cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
+        cairo_set_font_size(cr, 12.0);
+        cairo_move_to(cr, 10, height / 2.0);
+        cairo_show_text(cr, "No samples in range");
+        cairo_restore(cr);
+        return;
+    }
+
+    if (min_val == max_val) {
+        double delta = fabs(min_val) > 1.0 ? fabs(min_val) * 0.05 : 1.0;
+        min_val -= delta;
+        max_val += delta;
+    }
+
+    const double padding = 12.0;
+    double plot_width = MAX(1.0, width - 2 * padding);
+    double plot_height = MAX(1.0, height - 2 * padding);
+
+    cairo_set_source_rgba(cr, 1, 1, 1, 0.1);
+    for (int i = 1; i < 4; i++) {
+        double y = padding + (plot_height / 4.0) * i;
+        cairo_move_to(cr, padding, y);
+        cairo_line_to(cr, padding + plot_width, y);
+    }
     cairo_stroke(cr);
-    cairo_restore(cr);
 
-    double bar_width = MAX(1.0, usable_w / 200.0);
-
-    // Draw size bars and missing markers first
-    for (guint i = 0; i < len; i++) {
-        StatsSample *sample = &g_array_index(hist, StatsSample, i);
-        double age = latest_ts - sample->timestamp;
-        if (age > range) continue;
-        double t_norm = 1.0 - (age / range);
-        if (t_norm < 0.0) t_norm = 0.0;
-        if (t_norm > 1.0) t_norm = 1.0;
-        double x = padding + t_norm * usable_w;
-
-        if (sample->frame_missing) {
-            cairo_save(cr);
-            cairo_set_source_rgb(cr, 0.0, 0.0, 0.0);
-            cairo_rectangle(cr, x - bar_width * 0.5, padding, bar_width, usable_h);
-            cairo_fill(cr);
-            cairo_restore(cr);
-            continue;
-        }
-
-        if (sample->frame_valid && !isnan(sample->frame_size_kb) && sample->frame_size_kb >= 0.0) {
-            double ratio = sample->frame_size_kb / max_size;
-            if (ratio > 1.0) ratio = 1.0;
-            double bar_height = ratio * usable_h;
-            cairo_save(cr);
-            cairo_set_source_rgba(cr, 0.98, 0.55, 0.18, 0.55);
-            cairo_rectangle(cr, x - bar_width * 0.5, height - padding - bar_height, bar_width, bar_height);
-            cairo_fill(cr);
-            cairo_restore(cr);
-        }
-    }
-
-    // Draw lateness line
-    cairo_save(cr);
-    cairo_set_source_rgba(cr, 0.2, 0.7, 1.0, 0.9);
+    cairo_set_source_rgb(cr, 0.3, 0.7, 1.0);
     cairo_set_line_width(cr, 1.5);
-    gboolean started = FALSE;
-    for (guint i = 0; i < len; i++) {
-        StatsSample *sample = &g_array_index(hist, StatsSample, i);
-        double age = latest_ts - sample->timestamp;
-        if (age > range) continue;
-        double t_norm = 1.0 - (age / range);
-        if (t_norm < 0.0) t_norm = 0.0;
-        if (t_norm > 1.0) t_norm = 1.0;
-        double x = padding + t_norm * usable_w;
-
-        if (!sample->frame_valid || isnan(sample->frame_lateness_ms)) {
-            started = FALSE;
+    gboolean path_started = FALSE;
+    for (guint i = start_index; i < len; i++) {
+        const StatsSample *sample = &samples[i];
+        double value = 0.0;
+        gboolean missing_flag = FALSE;
+        if (!frame_overlay_sample_value(sample, metric, &value, &missing_flag)) {
+            path_started = FALSE;
             continue;
         }
 
-        double ratio = sample->frame_lateness_ms / max_lateness;
-        if (ratio > 1.0) ratio = 1.0;
-        double y = height - padding - ratio * usable_h;
+        double x_ratio = (sample->timestamp - start_time) / range;
+        if (x_ratio < 0.0) x_ratio = 0.0;
+        if (x_ratio > 1.0) x_ratio = 1.0;
+        double x = padding + x_ratio * plot_width;
 
-        if (!started) {
+        double y_ratio = (value - min_val) / (max_val - min_val);
+        double y = padding + (1.0 - y_ratio) * plot_height;
+
+        if (!path_started) {
             cairo_move_to(cr, x, y);
-            started = TRUE;
+            path_started = TRUE;
         } else {
             cairo_line_to(cr, x, y);
         }
     }
     cairo_stroke(cr);
-    cairo_restore(cr);
 
-    // Annotate maxima
-    cairo_save(cr);
-    cairo_set_source_rgba(cr, 0.7, 0.7, 0.7, 0.8);
-    cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
-    cairo_set_font_size(cr, 11.0);
-    char label[64];
-    g_snprintf(label, sizeof(label), "max lateness %.1f ms", has_lateness ? max_lateness : 0.0);
-    cairo_move_to(cr, padding, padding + 12);
-    cairo_show_text(cr, label);
-    g_snprintf(label, sizeof(label), "max size %.1f KB", has_size ? max_size : 0.0);
-    cairo_move_to(cr, width - padding - 150, padding + 12);
-    cairo_show_text(cr, label);
-    if (has_missing)
-    {
-        cairo_move_to(cr, padding, padding + 26);
-        cairo_show_text(cr, "black bars = missing frames");
+    double latest_value = NAN;
+    for (guint i = len; i > start_index; i--) {
+        double value = 0.0;
+        if (frame_overlay_sample_value(&samples[i - 1], metric, &value, NULL)) {
+            latest_value = value;
+            break;
+        }
     }
+
+    cairo_set_source_rgb(cr, 0.85, 0.85, 0.85);
+    cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
+    cairo_set_font_size(cr, 12.0);
+    char label[64];
+    if (isnan(latest_value)) {
+        g_strlcpy(label, "--", sizeof(label));
+    } else if (metric == FRAME_OVERLAY_METRIC_SIZE) {
+        g_snprintf(label, sizeof(label), "%.2f KB", latest_value);
+    } else {
+        g_snprintf(label, sizeof(label), "%.2f ms", latest_value);
+    }
+    cairo_move_to(cr, padding, padding + 12.0);
+    cairo_show_text(cr, label);
+
+    if (missing_seen) {
+        cairo_set_source_rgba(cr, 0.8, 0.6, 0.2, 0.8);
+        cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
+        cairo_set_font_size(cr, 11.0);
+        cairo_move_to(cr, padding, padding + 26.0);
+        cairo_show_text(cr, "Missing frames present");
+    }
+
     cairo_restore(cr);
 }
 
@@ -632,9 +743,19 @@ static void update_info_label(GuiContext *ctx) {
     } else {
         g_strlcpy(videorate_info, "off", sizeof(videorate_info));
     }
+    const char *audio_state;
+    if (!cfg->audio_enabled) {
+        audio_state = "off";
+    } else if (!ctx->audio_runtime_enabled) {
+        audio_state = "error";
+    } else if (ctx->audio_active) {
+        audio_state = "active";
+    } else {
+        audio_state = "waiting";
+    }
     g_snprintf(info, sizeof(info),
                "Listening on %d | PT %d | Clock %d | %s | Jitter %ums | Queue buffers %u"
-               " | drop=%s | lost=%s | bus-msg=%s | videorate=%s",
+               " | drop=%s | lost=%s | bus-msg=%s | videorate=%s | audio=%s",
                cfg->listen_port,
                cfg->payload_type,
                cfg->clock_rate,
@@ -644,7 +765,8 @@ static void update_info_label(GuiContext *ctx) {
                cfg->jitter_drop_on_latency ? "on" : "off",
                cfg->jitter_do_lost ? "on" : "off",
                cfg->jitter_post_drop_messages ? "on" : "off",
-               videorate_info);
+               videorate_info,
+               audio_state);
     gtk_label_set_text(ctx->info_label, info);
 }
 
@@ -658,6 +780,9 @@ static void sync_settings_controls(GuiContext *ctx) {
     }
     if (ctx->queue_max_buffers_spin) {
         gtk_spin_button_set_value(ctx->queue_max_buffers_spin, ctx->current_cfg.queue_max_buffers);
+    }
+    if (ctx->stats_refresh_spin) {
+        gtk_spin_button_set_value(ctx->stats_refresh_spin, ctx->stats_refresh_interval_ms);
     }
     if (ctx->videorate_toggle) {
         check_set(ctx->videorate_toggle, ctx->current_cfg.videorate_enabled);
@@ -676,73 +801,27 @@ static void sync_settings_controls(GuiContext *ctx) {
     if (ctx->videorate_den_spin) {
         gtk_widget_set_sensitive(GTK_WIDGET(ctx->videorate_den_spin), videorate_sensitive);
     }
+    if (ctx->audio_toggle) {
+        check_set(ctx->audio_toggle, ctx->current_cfg.audio_enabled ? TRUE : FALSE);
+    }
+    if (ctx->audio_payload_spin) {
+        gtk_spin_button_set_value(ctx->audio_payload_spin, ctx->current_cfg.audio_payload_type);
+    }
+    if (ctx->audio_jitter_spin) {
+        gtk_spin_button_set_value(ctx->audio_jitter_spin, ctx->current_cfg.audio_jitter_latency_ms);
+    }
+    gboolean audio_sensitive = ctx->current_cfg.audio_enabled;
+    if (ctx->audio_payload_spin) {
+        gtk_widget_set_sensitive(GTK_WIDGET(ctx->audio_payload_spin), audio_sensitive);
+    }
+    if (ctx->audio_jitter_spin) {
+        gtk_widget_set_sensitive(GTK_WIDGET(ctx->audio_jitter_spin), audio_sensitive);
+    }
     check_set(ctx->sync_toggle_settings, ctx->current_cfg.sync_to_clock ? TRUE : FALSE);
     check_set(ctx->jitter_drop_toggle, ctx->current_cfg.jitter_drop_on_latency ? TRUE : FALSE);
     check_set(ctx->jitter_do_lost_toggle, ctx->current_cfg.jitter_do_lost ? TRUE : FALSE);
     check_set(ctx->jitter_post_drop_toggle, ctx->current_cfg.jitter_post_drop_messages ? TRUE : FALSE);
     update_info_label(ctx);
-}
-
-static void clear_source_list(GuiContext *ctx) {
-    if (!ctx || !ctx->source_list) return;
-    GtkWidget *child = gtk_widget_get_first_child(GTK_WIDGET(ctx->source_list));
-    while (child) {
-        GtkWidget *next = gtk_widget_get_next_sibling(child);
-        gtk_list_box_remove(ctx->source_list, child);
-        child = next;
-    }
-}
-
-static void restore_adjustment(GtkAdjustment *adj, double previous_value) {
-    if (!adj) return;
-    double lower = gtk_adjustment_get_lower(adj);
-    double upper = gtk_adjustment_get_upper(adj);
-    double page = gtk_adjustment_get_page_size(adj);
-    double max_value = MAX(lower, upper - page);
-    double clamped = CLAMP(previous_value, lower, max_value);
-    gtk_adjustment_set_value(adj, clamped);
-}
-
-static void append_source_row(GuiContext *ctx, const UvSourceStats *src, guint index) {
-    if (!ctx || !ctx->source_list || !src) return;
-    GtkListBoxRow *row = GTK_LIST_BOX_ROW(gtk_list_box_row_new());
-    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
-    gtk_list_box_row_set_child(row, box);
-
-    char header[128];
-    g_snprintf(header, sizeof(header), "[%u]%s %s",
-               index,
-               src->selected ? "*" : "",
-               src->address);
-    GtkWidget *header_label = gtk_label_new(header);
-    gtk_label_set_xalign(GTK_LABEL(header_label), 0.0);
-    gtk_box_append(GTK_BOX(box), header_label);
-
-    char bitrate[64];
-    format_bitrate(src->inbound_bitrate_bps, bitrate, sizeof(bitrate));
-
-    char detail[256];
-    g_snprintf(detail, sizeof(detail),
-               "rx=%" G_GUINT64_FORMAT "/%" G_GUINT64_FORMAT
-               " fwd=%" G_GUINT64_FORMAT "/%" G_GUINT64_FORMAT
-               " rate=%s jitter=%.2fms last_seen=%.1fs",
-               src->rx_packets,
-               src->rx_bytes,
-               src->forwarded_packets,
-               src->forwarded_bytes,
-               bitrate,
-               src->rfc3550_jitter_ms,
-               src->seconds_since_last_seen >= 0.0 ? src->seconds_since_last_seen : 0.0);
-    GtkWidget *detail_label = gtk_label_new(detail);
-    gtk_label_set_xalign(GTK_LABEL(detail_label), 0.0);
-    gtk_label_set_wrap(GTK_LABEL(detail_label), TRUE);
-    gtk_box_append(GTK_BOX(box), detail_label);
-
-    gtk_list_box_append(ctx->source_list, GTK_WIDGET(row));
-    g_object_set_data(G_OBJECT(row), "source-index", GINT_TO_POINTER(index));
-    if (src->selected) {
-        gtk_list_box_select_row(ctx->source_list, row);
-    }
 }
 
 static gboolean bind_sink_paintable(GuiContext *ctx, GstElement *sink) {
@@ -859,13 +938,6 @@ static void refresh_stats(GuiContext *ctx) {
         ensure_video_paintable(ctx);
     }
 
-    GtkAdjustment *source_adj = NULL;
-    double source_value = 0.0;
-    if (ctx->source_scroller) {
-        source_adj = gtk_scrolled_window_get_vadjustment(ctx->source_scroller);
-        source_value = gtk_adjustment_get_value(source_adj);
-    }
-
     UvViewerStats stats = {0};
     uv_viewer_stats_init(&stats);
 
@@ -875,52 +947,91 @@ static void refresh_stats(GuiContext *ctx) {
         return;
     }
 
-    if (ctx->source_list) {
-        clear_source_list(ctx);
-    }
+    ctx->audio_runtime_enabled = stats.audio_enabled;
+    ctx->audio_active = stats.audio_active;
+    update_info_label(ctx);
 
+    guint source_count = (stats.sources) ? stats.sources->len : 0u;
+    guint selected_index = GTK_INVALID_LIST_POSITION;
     UvSourceStats *selected_source = NULL;
 
-    if (!stats.sources || stats.sources->len == 0) {
+    if (source_count == 0) {
         update_status(ctx, "Listening for sources...");
-    } else {
-        for (guint i = 0; i < stats.sources->len; i++) {
-            UvSourceStats *src = &g_array_index(stats.sources, UvSourceStats, i);
-            if (ctx->source_list) {
-                append_source_row(ctx, src, i);
-            }
-            if (src->selected) {
-                selected_source = src;
-            }
+        if (ctx->source_model && ctx->known_source_count > 0) {
+            gtk_string_list_splice(ctx->source_model, 0, ctx->known_source_count, NULL);
+            ctx->known_source_count = 0;
         }
-        update_status(ctx, "");
-    }
+        if (ctx->source_dropdown) {
+            ctx->suppress_source_change = TRUE;
+            gtk_drop_down_set_selected(ctx->source_dropdown, GTK_INVALID_LIST_POSITION);
+            ctx->suppress_source_change = FALSE;
+            gtk_widget_set_sensitive(GTK_WIDGET(ctx->source_dropdown), FALSE);
+        }
+        if (ctx->source_detail_label) {
+            gtk_label_set_text(ctx->source_detail_label, "No sources discovered yet.");
+        }
+    } else {
+        if (ctx->source_model) {
+            if (ctx->known_source_count > source_count) {
+                guint remove_count = ctx->known_source_count - source_count;
+                gtk_string_list_splice(ctx->source_model, source_count, remove_count, NULL);
+            }
+            for (guint i = ctx->known_source_count; i < source_count; i++) {
+                UvSourceStats *src = &g_array_index(stats.sources, UvSourceStats, i);
+                char label[128];
+                g_snprintf(label, sizeof(label), "%u: %s", i, src->address);
+                gtk_string_list_append(ctx->source_model, label);
+            }
+            ctx->known_source_count = source_count;
+        }
 
-    double latest_frame_lateness = NAN;
-    double latest_frame_size = NAN;
-    gboolean latest_valid = FALSE;
-    gboolean latest_missing = FALSE;
-    if (stats.frame_block_valid && stats.frame_block.lateness_ms && stats.frame_block.frame_size_kb) {
-        UvFrameBlockStats *fb = &stats.frame_block;
-        guint capacity = fb->lateness_ms->len;
-        guint limit = MIN(fb->filled, capacity);
-        if (capacity > 0 && limit > 0) {
-            guint current = fb->next_index % capacity;
-            for (guint cnt = 0; cnt < limit; cnt++) {
-                guint idx = (current + capacity - 1 - cnt) % capacity;
-                double v = g_array_index(fb->lateness_ms, double, idx);
-                double s = g_array_index(fb->frame_size_kb, double, idx);
-                if (isnan(v)) continue;
-                if (v < 0.0 || s < 0.0) {
-                    latest_missing = TRUE;
-                    break;
-                }
-                latest_frame_lateness = v;
-                latest_frame_size = s;
-                latest_valid = TRUE;
+        for (guint i = 0; i < source_count; i++) {
+            UvSourceStats *src = &g_array_index(stats.sources, UvSourceStats, i);
+            if (src->selected) {
+                selected_index = i;
+                selected_source = src;
                 break;
             }
         }
+
+        if (ctx->source_dropdown) {
+            gtk_widget_set_sensitive(GTK_WIDGET(ctx->source_dropdown), TRUE);
+        }
+
+        if (selected_source && ctx->source_dropdown) {
+            guint current = gtk_drop_down_get_selected(ctx->source_dropdown);
+            if (current != selected_index) {
+                ctx->suppress_source_change = TRUE;
+                gtk_drop_down_set_selected(ctx->source_dropdown, selected_index);
+                ctx->suppress_source_change = FALSE;
+            }
+        }
+
+        if (ctx->source_detail_label) {
+            if (selected_source) {
+                char rate_buf[64];
+                format_bitrate(selected_source->inbound_bitrate_bps, rate_buf, sizeof(rate_buf));
+                char detail[256];
+                g_snprintf(detail, sizeof(detail),
+                           "%u: %s\nrx=%" G_GUINT64_FORMAT "/%" G_GUINT64_FORMAT
+                           " fwd=%" G_GUINT64_FORMAT "/%" G_GUINT64_FORMAT
+                           " rate=%s jitter=%.2fms last_seen=%.1fs",
+                           selected_index,
+                           selected_source->address,
+                           selected_source->rx_packets,
+                           selected_source->rx_bytes,
+                           selected_source->forwarded_packets,
+                           selected_source->forwarded_bytes,
+                           rate_buf,
+                           selected_source->rfc3550_jitter_ms,
+                           selected_source->seconds_since_last_seen >= 0.0 ? selected_source->seconds_since_last_seen : 0.0);
+                gtk_label_set_text(ctx->source_detail_label, detail);
+            } else {
+                gtk_label_set_text(ctx->source_detail_label, "Select a source to view details.");
+            }
+        }
+
+        update_status(ctx, "");
     }
 
     if (selected_source) {
@@ -932,20 +1043,22 @@ static void refresh_stats(GuiContext *ctx) {
         sample.reorder_packets = (double)selected_source->rtp_reordered_packets;
         sample.jitter_ms = selected_source->rfc3550_jitter_ms;
         sample.fps_avg = stats.decoder.average_fps;
-        if (latest_missing) {
-            sample.frame_missing = TRUE;
-            sample.frame_valid = FALSE;
-            sample.frame_lateness_ms = NAN;
-            sample.frame_size_kb = FRAME_BLOCK_MISSING_SENTINEL;
-        } else if (latest_valid) {
-            sample.frame_valid = TRUE;
-            sample.frame_lateness_ms = latest_frame_lateness;
-            sample.frame_size_kb = latest_frame_size;
-        } else {
-            sample.frame_valid = FALSE;
-            sample.frame_lateness_ms = NAN;
-            sample.frame_size_kb = NAN;
+        double latest_lateness = NAN;
+        double latest_size = NAN;
+        gboolean latest_missing = FALSE;
+        gboolean frame_metrics_valid = FALSE;
+        if (stats.frame_block_valid) {
+            frame_metrics_valid = frame_block_stats_latest(&stats.frame_block,
+                                                          &latest_lateness,
+                                                          &latest_size,
+                                                          &latest_missing);
         }
+
+        sample.frame_valid = frame_metrics_valid;
+        sample.frame_missing = latest_missing;
+        sample.frame_lateness_ms = frame_metrics_valid ? latest_lateness : NAN;
+        sample.frame_size_kb = frame_metrics_valid ? latest_size : NAN;
+
         stats_history_push(ctx, &sample);
 
         for (int i = 0; i < STATS_METRIC_COUNT; i++) {
@@ -1044,11 +1157,7 @@ static void refresh_stats(GuiContext *ctx) {
     if (ctx->frame_block_area) {
         gtk_widget_queue_draw(GTK_WIDGET(ctx->frame_block_area));
     }
-    if (ctx->frame_overlay_area) {
-        gtk_widget_queue_draw(GTK_WIDGET(ctx->frame_overlay_area));
-    }
-
-    if (source_adj) restore_adjustment(source_adj, source_value);
+    frame_block_queue_overlay_draws(ctx);
 
     uv_viewer_stats_clear(&stats);
 }
@@ -1058,6 +1167,32 @@ static gboolean stats_timeout_cb(gpointer user_data) {
     if (!ctx || !ctx->window) return G_SOURCE_REMOVE;
     refresh_stats(ctx);
     return G_SOURCE_CONTINUE;
+}
+
+static void restart_stats_timer(GuiContext *ctx) {
+    if (!ctx) return;
+    if (ctx->stats_timeout_id) {
+        GSource *source = g_main_context_find_source_by_id(NULL, ctx->stats_timeout_id);
+        if (source) {
+            g_source_destroy(source);
+        }
+        ctx->stats_timeout_id = 0;
+    }
+    if (ctx->stats_refresh_interval_ms > 0) {
+        ctx->stats_timeout_id = g_timeout_add(ctx->stats_refresh_interval_ms, stats_timeout_cb, ctx);
+    }
+}
+
+static void set_stats_refresh_interval(GuiContext *ctx, guint interval_ms) {
+    if (!ctx) return;
+    guint clamped = interval_ms < 50 ? 50 : interval_ms;
+    if (ctx->stats_refresh_interval_ms != clamped || ctx->stats_timeout_id == 0) {
+        ctx->stats_refresh_interval_ms = clamped;
+        restart_stats_timer(ctx);
+    }
+    if (ctx->stats_refresh_spin) {
+        gtk_spin_button_set_value(ctx->stats_refresh_spin, ctx->stats_refresh_interval_ms);
+    }
 }
 
 static void update_sources_toggle_label(GuiContext *ctx, gboolean hidden) {
@@ -1139,7 +1274,7 @@ static void on_frame_block_enable_toggled(GtkToggleButton *button, gpointer user
     frame_block_sync_controls(ctx, NULL);
     frame_block_update_summary(ctx);
     if (ctx->frame_block_area) gtk_widget_queue_draw(GTK_WIDGET(ctx->frame_block_area));
-    if (ctx->frame_overlay_area) gtk_widget_queue_draw(GTK_WIDGET(ctx->frame_overlay_area));
+    frame_block_queue_overlay_draws(ctx);
 }
 
 static void on_frame_block_pause_toggled(GtkToggleButton *button, gpointer user_data) {
@@ -1165,18 +1300,20 @@ static void on_frame_block_mode_changed(GObject *dropdown, GParamSpec *pspec, gp
     frame_block_update_summary(ctx);
 }
 
-static void on_frame_block_metric_changed(GObject *dropdown, GParamSpec *pspec, gpointer user_data) {
-    (void)pspec;
+static void on_frame_block_metric_toggled(GtkToggleButton *button, gpointer user_data) {
     GuiContext *ctx = user_data;
-    if (!ctx || !GTK_IS_DROP_DOWN(dropdown)) return;
-    guint selected = gtk_drop_down_get_selected(GTK_DROP_DOWN(dropdown));
-    if (selected > FRAME_BLOCK_VIEW_SIZE) selected = FRAME_BLOCK_VIEW_LATENESS;
-    if (ctx->frame_block_view == selected) return;
-    ctx->frame_block_view = selected;
+    if (!ctx || !GTK_IS_TOGGLE_BUTTON(button)) return;
+    gboolean active = gtk_toggle_button_get_active(button);
+    guint new_view = active ? FRAME_BLOCK_VIEW_SIZE : FRAME_BLOCK_VIEW_LATENESS;
+    if (ctx->frame_block_view == new_view) {
+        frame_block_update_metric_toggle_label(ctx);
+        return;
+    }
+    ctx->frame_block_view = new_view;
     frame_block_sync_controls(ctx, NULL);
     frame_block_update_summary(ctx);
     if (ctx->frame_block_area) gtk_widget_queue_draw(GTK_WIDGET(ctx->frame_block_area));
-    if (ctx->frame_overlay_area) gtk_widget_queue_draw(GTK_WIDGET(ctx->frame_overlay_area));
+    frame_block_queue_overlay_draws(ctx);
 }
 
 static void on_frame_block_reset_clicked(GtkButton *button, gpointer user_data) {
@@ -1203,7 +1340,7 @@ static void on_frame_block_reset_clicked(GtkButton *button, gpointer user_data) 
     frame_block_sync_controls(ctx, NULL);
     frame_block_update_summary(ctx);
     if (ctx->frame_block_area) gtk_widget_queue_draw(GTK_WIDGET(ctx->frame_block_area));
-    if (ctx->frame_overlay_area) gtk_widget_queue_draw(GTK_WIDGET(ctx->frame_overlay_area));
+    frame_block_queue_overlay_draws(ctx);
 }
 
 static void on_frame_block_threshold_changed(GtkSpinButton *spin, gpointer user_data) {
@@ -1236,6 +1373,10 @@ static gboolean gui_restart_with_config(GuiContext *ctx, const UvViewerConfig *c
         cfg->videorate_enabled == ctx->current_cfg.videorate_enabled &&
         cfg->videorate_fps_numerator == ctx->current_cfg.videorate_fps_numerator &&
         cfg->videorate_fps_denominator == ctx->current_cfg.videorate_fps_denominator &&
+        cfg->audio_enabled == ctx->current_cfg.audio_enabled &&
+        cfg->audio_payload_type == ctx->current_cfg.audio_payload_type &&
+        cfg->audio_clock_rate == ctx->current_cfg.audio_clock_rate &&
+        cfg->audio_jitter_latency_ms == ctx->current_cfg.audio_jitter_latency_ms &&
         cfg->jitter_drop_on_latency == ctx->current_cfg.jitter_drop_on_latency &&
         cfg->jitter_do_lost == ctx->current_cfg.jitter_do_lost &&
         cfg->jitter_post_drop_messages == ctx->current_cfg.jitter_post_drop_messages) {
@@ -1281,7 +1422,15 @@ static gboolean gui_restart_with_config(GuiContext *ctx, const UvViewerConfig *c
     uv_viewer_free(old_viewer);
     detach_bound_sink(ctx);
     ctx->viewer = new_viewer;
+    if (ctx->viewer_slot) {
+        *ctx->viewer_slot = new_viewer;
+    }
     ctx->current_cfg = *cfg;
+    if (ctx->cfg_slot) {
+        *ctx->cfg_slot = *cfg;
+    }
+    ctx->audio_runtime_enabled = cfg->audio_enabled;
+    ctx->audio_active = FALSE;
     if (ctx->stats_history) {
         g_array_set_size(ctx->stats_history, 0);
     }
@@ -1329,10 +1478,30 @@ static void on_settings_apply_clicked(GtkButton *button, gpointer user_data) {
         if (fps_den <= 0) fps_den = 1;
         new_cfg.videorate_fps_denominator = (guint)fps_den;
     }
+    new_cfg.audio_enabled = check_get(ctx->audio_toggle);
+    if (ctx->audio_payload_spin) {
+        int payload = gtk_spin_button_get_value_as_int(ctx->audio_payload_spin);
+        if (payload < 0) payload = 0;
+        if (payload > 127) payload = 127;
+        new_cfg.audio_payload_type = (guint)payload;
+    }
+    if (ctx->audio_jitter_spin) {
+        int aj = gtk_spin_button_get_value_as_int(ctx->audio_jitter_spin);
+        if (aj < 0) aj = 0;
+        new_cfg.audio_jitter_latency_ms = (guint)aj;
+    }
     new_cfg.sync_to_clock = check_get(ctx->sync_toggle_settings);
     new_cfg.jitter_drop_on_latency = check_get(ctx->jitter_drop_toggle);
     new_cfg.jitter_do_lost = check_get(ctx->jitter_do_lost_toggle);
     new_cfg.jitter_post_drop_messages = check_get(ctx->jitter_post_drop_toggle);
+
+    guint new_refresh_interval = ctx->stats_refresh_interval_ms;
+    if (ctx->stats_refresh_spin) {
+        int refresh = gtk_spin_button_get_value_as_int(ctx->stats_refresh_spin);
+        if (refresh < 50) refresh = 50;
+        new_refresh_interval = (guint)refresh;
+    }
+    set_stats_refresh_interval(ctx, new_refresh_interval);
 
     if (!gui_restart_with_config(ctx, &new_cfg)) {
         sync_settings_controls(ctx);
@@ -1351,17 +1520,33 @@ static void on_videorate_toggled(GtkCheckButton *button, gpointer user_data) {
     }
 }
 
-static void on_source_row_activated(GtkListBox *box, GtkListBoxRow *row, gpointer user_data) {
-    (void)box;
+static void on_audio_toggled(GtkCheckButton *button, gpointer user_data) {
     GuiContext *ctx = user_data;
-    if (!ctx || !ctx->viewer || !row) return;
-    int index = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(row), "source-index"));
+    if (!ctx) return;
+    gboolean active = button ? gtk_check_button_get_active(button) : FALSE;
+    if (ctx->audio_payload_spin) {
+        gtk_widget_set_sensitive(GTK_WIDGET(ctx->audio_payload_spin), active);
+    }
+    if (ctx->audio_jitter_spin) {
+        gtk_widget_set_sensitive(GTK_WIDGET(ctx->audio_jitter_spin), active);
+    }
+}
+
+static void on_source_dropdown_changed(GObject *dropdown, GParamSpec *pspec, gpointer user_data) {
+    (void)pspec;
+    GuiContext *ctx = user_data;
+    if (!ctx || ctx->suppress_source_change || !ctx->viewer) return;
+    if (!GTK_IS_DROP_DOWN(dropdown)) return;
+
+    guint selected = gtk_drop_down_get_selected(GTK_DROP_DOWN(dropdown));
+    if (selected == GTK_INVALID_LIST_POSITION) return;
+
     GError *error = NULL;
-    if (!uv_viewer_select_source(ctx->viewer, index, &error)) {
+    if (!uv_viewer_select_source(ctx->viewer, (int)selected, &error)) {
         update_status(ctx, error ? error->message : "Failed to select source");
     } else {
         char msg[128];
-        g_snprintf(msg, sizeof(msg), "Selected source %d", index);
+        g_snprintf(msg, sizeof(msg), "Selected source %u", selected);
         update_status(ctx, msg);
         refresh_stats(ctx);
     }
@@ -1486,19 +1671,31 @@ static GtkWidget *build_monitor_page(GuiContext *ctx) {
     ctx->sources_frame = gtk_frame_new("Sources");
     gtk_box_append(GTK_BOX(page), ctx->sources_frame);
 
-    ctx->source_scroller = GTK_SCROLLED_WINDOW(gtk_scrolled_window_new());
-    gtk_widget_set_hexpand(GTK_WIDGET(ctx->source_scroller), TRUE);
-    gtk_widget_set_vexpand(GTK_WIDGET(ctx->source_scroller), TRUE);
-    gtk_scrolled_window_set_policy(ctx->source_scroller, GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
-    gtk_widget_set_size_request(GTK_WIDGET(ctx->source_scroller), -1, 140);
+    GtkWidget *sources_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    gtk_widget_set_margin_top(sources_box, 6);
+    gtk_widget_set_margin_bottom(sources_box, 6);
+    gtk_widget_set_margin_start(sources_box, 6);
+    gtk_widget_set_margin_end(sources_box, 6);
+    gtk_frame_set_child(GTK_FRAME(ctx->sources_frame), sources_box);
 
-    ctx->source_list = GTK_LIST_BOX(gtk_list_box_new());
-    gtk_list_box_set_selection_mode(ctx->source_list, GTK_SELECTION_SINGLE);
-    gtk_list_box_set_activate_on_single_click(ctx->source_list, TRUE);
-    g_signal_connect(ctx->source_list, "row-activated", G_CALLBACK(on_source_row_activated), ctx);
+    GtkWidget *dropdown_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    gtk_box_append(GTK_BOX(sources_box), dropdown_row);
 
-    gtk_scrolled_window_set_child(ctx->source_scroller, GTK_WIDGET(ctx->source_list));
-    gtk_frame_set_child(GTK_FRAME(ctx->sources_frame), GTK_WIDGET(ctx->source_scroller));
+    GtkWidget *dropdown_label = gtk_label_new("Active Stream:");
+    gtk_label_set_xalign(GTK_LABEL(dropdown_label), 0.0);
+    gtk_box_append(GTK_BOX(dropdown_row), dropdown_label);
+
+    ctx->source_model = gtk_string_list_new(NULL);
+    GtkWidget *dropdown = gtk_drop_down_new(G_LIST_MODEL(ctx->source_model), NULL);
+    gtk_widget_set_hexpand(dropdown, TRUE);
+    ctx->source_dropdown = GTK_DROP_DOWN(dropdown);
+    g_signal_connect(dropdown, "notify::selected", G_CALLBACK(on_source_dropdown_changed), ctx);
+    gtk_box_append(GTK_BOX(dropdown_row), dropdown);
+
+    ctx->source_detail_label = GTK_LABEL(gtk_label_new("No sources discovered yet."));
+    gtk_label_set_xalign(ctx->source_detail_label, 0.0);
+    gtk_label_set_wrap(ctx->source_detail_label, TRUE);
+    gtk_box_append(GTK_BOX(sources_box), GTK_WIDGET(ctx->source_detail_label));
 
     GtkWidget *button_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
     gtk_box_append(GTK_BOX(page), button_box);
@@ -1569,12 +1766,20 @@ static GtkWidget *build_settings_page(GuiContext *ctx) {
     ctx->queue_max_buffers_spin = GTK_SPIN_BUTTON(gtk_spin_button_new_with_range(0, 2000, 1));
     gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(ctx->queue_max_buffers_spin), 1, 3, 1, 1);
 
+    GtkWidget *stats_refresh_label = gtk_label_new("Stats Refresh (ms):");
+    gtk_label_set_xalign(GTK_LABEL(stats_refresh_label), 0.0);
+    gtk_grid_attach(GTK_GRID(grid), stats_refresh_label, 0, 4, 1, 1);
+
+    ctx->stats_refresh_spin = GTK_SPIN_BUTTON(gtk_spin_button_new_with_range(50, 5000, 10));
+    gtk_spin_button_set_increments(ctx->stats_refresh_spin, 10, 100);
+    gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(ctx->stats_refresh_spin), 1, 4, 1, 1);
+
     GtkWidget *videorate_label = gtk_label_new("Videorate:");
     gtk_label_set_xalign(GTK_LABEL(videorate_label), 0.0);
-    gtk_grid_attach(GTK_GRID(grid), videorate_label, 0, 4, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid), videorate_label, 0, 5, 1, 1);
 
     GtkWidget *videorate_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
-    gtk_grid_attach(GTK_GRID(grid), videorate_box, 1, 4, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid), videorate_box, 1, 5, 1, 1);
 
     ctx->videorate_toggle = GTK_CHECK_BUTTON(gtk_check_button_new_with_label("Enable"));
     gtk_box_append(GTK_BOX(videorate_box), GTK_WIDGET(ctx->videorate_toggle));
@@ -1593,14 +1798,39 @@ static GtkWidget *build_settings_page(GuiContext *ctx) {
     ctx->videorate_den_spin = GTK_SPIN_BUTTON(gtk_spin_button_new_with_range(1, 1000, 1));
     gtk_box_append(GTK_BOX(videorate_box), GTK_WIDGET(ctx->videorate_den_spin));
 
+    GtkWidget *audio_label = gtk_label_new("Audio:");
+    gtk_label_set_xalign(GTK_LABEL(audio_label), 0.0);
+    gtk_grid_attach(GTK_GRID(grid), audio_label, 0, 6, 1, 1);
+
+    GtkWidget *audio_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    gtk_grid_attach(GTK_GRID(grid), audio_box, 1, 6, 1, 1);
+
+    ctx->audio_toggle = GTK_CHECK_BUTTON(gtk_check_button_new_with_label("Enable"));
+    gtk_box_append(GTK_BOX(audio_box), GTK_WIDGET(ctx->audio_toggle));
+    g_signal_connect(ctx->audio_toggle, "toggled", G_CALLBACK(on_audio_toggled), ctx);
+
+    GtkWidget *payload_label = gtk_label_new("PT:");
+    gtk_label_set_xalign(GTK_LABEL(payload_label), 0.0);
+    gtk_box_append(GTK_BOX(audio_box), payload_label);
+
+    ctx->audio_payload_spin = GTK_SPIN_BUTTON(gtk_spin_button_new_with_range(0, 127, 1));
+    gtk_box_append(GTK_BOX(audio_box), GTK_WIDGET(ctx->audio_payload_spin));
+
+    GtkWidget *audio_jitter_label = gtk_label_new("Jitter (ms):");
+    gtk_label_set_xalign(GTK_LABEL(audio_jitter_label), 0.0);
+    gtk_box_append(GTK_BOX(audio_box), audio_jitter_label);
+
+    ctx->audio_jitter_spin = GTK_SPIN_BUTTON(gtk_spin_button_new_with_range(0, 500, 1));
+    gtk_box_append(GTK_BOX(audio_box), GTK_WIDGET(ctx->audio_jitter_spin));
+
     ctx->jitter_drop_toggle = GTK_CHECK_BUTTON(gtk_check_button_new_with_label("Drop packets exceeding latency"));
-    gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(ctx->jitter_drop_toggle), 0, 5, 2, 1);
+    gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(ctx->jitter_drop_toggle), 0, 7, 2, 1);
 
     ctx->jitter_do_lost_toggle = GTK_CHECK_BUTTON(gtk_check_button_new_with_label("Emit lost packet notifications"));
-    gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(ctx->jitter_do_lost_toggle), 0, 6, 2, 1);
+    gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(ctx->jitter_do_lost_toggle), 0, 8, 2, 1);
 
     ctx->jitter_post_drop_toggle = GTK_CHECK_BUTTON(gtk_check_button_new_with_label("Post drop messages on bus"));
-    gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(ctx->jitter_post_drop_toggle), 0, 7, 2, 1);
+    gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(ctx->jitter_post_drop_toggle), 0, 9, 2, 1);
 
     GtkWidget *apply_button = gtk_button_new_with_label("Apply Settings");
     g_signal_connect(apply_button, "clicked", G_CALLBACK(on_settings_apply_clicked), ctx);
@@ -1680,14 +1910,14 @@ static GtkWidget *build_stats_page(GuiContext *ctx) {
 }
 
 static GtkWidget *build_frame_block_page(GuiContext *ctx) {
-    GtkWidget *page = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
-    gtk_widget_set_margin_top(page, 12);
-    gtk_widget_set_margin_start(page, 12);
-    gtk_widget_set_margin_end(page, 12);
-    gtk_widget_set_margin_bottom(page, 12);
+    GtkWidget *content = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
+    gtk_widget_set_margin_top(content, 12);
+    gtk_widget_set_margin_start(content, 12);
+    gtk_widget_set_margin_end(content, 12);
+    gtk_widget_set_margin_bottom(content, 12);
 
     GtkWidget *controls = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-    gtk_box_append(GTK_BOX(page), controls);
+    gtk_box_append(GTK_BOX(content), controls);
 
     ctx->frame_block_enable_toggle = GTK_TOGGLE_BUTTON(gtk_toggle_button_new_with_label("Enable Capture"));
     g_signal_connect(ctx->frame_block_enable_toggle, "toggled", G_CALLBACK(on_frame_block_enable_toggled), ctx);
@@ -1699,11 +1929,11 @@ static GtkWidget *build_frame_block_page(GuiContext *ctx) {
     g_signal_connect(ctx->frame_block_mode_dropdown, "notify::selected", G_CALLBACK(on_frame_block_mode_changed), ctx);
     gtk_box_append(GTK_BOX(controls), GTK_WIDGET(ctx->frame_block_mode_dropdown));
 
-    const char *metric_labels[] = {"Lateness (ms)", "Frame Size (KB)", NULL};
-    ctx->frame_block_metric_dropdown = GTK_DROP_DOWN(gtk_drop_down_new_from_strings(metric_labels));
-    gtk_drop_down_set_selected(ctx->frame_block_metric_dropdown, ctx->frame_block_view);
-    g_signal_connect(ctx->frame_block_metric_dropdown, "notify::selected", G_CALLBACK(on_frame_block_metric_changed), ctx);
-    gtk_box_append(GTK_BOX(controls), GTK_WIDGET(ctx->frame_block_metric_dropdown));
+    ctx->frame_block_metric_toggle = GTK_TOGGLE_BUTTON(gtk_toggle_button_new_with_label(""));
+    gtk_toggle_button_set_active(ctx->frame_block_metric_toggle, ctx->frame_block_view == FRAME_BLOCK_VIEW_SIZE);
+    g_signal_connect(ctx->frame_block_metric_toggle, "toggled", G_CALLBACK(on_frame_block_metric_toggled), ctx);
+    frame_block_update_metric_toggle_label(ctx);
+    gtk_box_append(GTK_BOX(controls), GTK_WIDGET(ctx->frame_block_metric_toggle));
 
     ctx->frame_block_pause_toggle = GTK_TOGGLE_BUTTON(gtk_toggle_button_new_with_label("Pause"));
     gtk_widget_set_sensitive(GTK_WIDGET(ctx->frame_block_pause_toggle), FALSE);
@@ -1744,7 +1974,7 @@ static GtkWidget *build_frame_block_page(GuiContext *ctx) {
         gtk_grid_attach(GTK_GRID(threshold_grid), GTK_WIDGET(spin), 1, (int)i, 1, 1);
         ctx->frame_block_threshold_spins[i] = spin;
     }
-    gtk_box_append(GTK_BOX(page), threshold_grid);
+    gtk_box_append(GTK_BOX(content), threshold_grid);
 
     GtkWidget *color_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
     const char *color_labels[] = {"Green", "Yellow", "Orange", "Red"};
@@ -1764,7 +1994,7 @@ static GtkWidget *build_frame_block_page(GuiContext *ctx) {
         "uses the same color buckets but maps to total frame size in kilobytes, letting you "
         "compare timing spikes with bandwidth spikes inside the same capture window.");
     gtk_box_append(GTK_BOX(color_box), color_help);
-    gtk_box_append(GTK_BOX(page), color_box);
+    gtk_box_append(GTK_BOX(content), color_box);
 
     GtkWidget *frame = gtk_frame_new(NULL);
     gtk_widget_set_hexpand(frame, TRUE);
@@ -1777,23 +2007,38 @@ static GtkWidget *build_frame_block_page(GuiContext *ctx) {
     gtk_widget_set_vexpand(drawing, TRUE);
     gtk_drawing_area_set_draw_func(ctx->frame_block_area, frame_block_draw, ctx, NULL);
     gtk_frame_set_child(GTK_FRAME(frame), drawing);
-    gtk_box_append(GTK_BOX(page), frame);
+    gtk_box_append(GTK_BOX(content), frame);
 
-    GtkWidget *overlay_frame = gtk_frame_new("Lateness / Size Timeline");
-    gtk_widget_set_hexpand(overlay_frame, TRUE);
-    gtk_widget_set_vexpand(overlay_frame, FALSE);
+    GtkWidget *lateness_frame = gtk_frame_new("Frame Lateness Timeline");
+    gtk_widget_set_hexpand(lateness_frame, TRUE);
+    gtk_widget_set_vexpand(lateness_frame, FALSE);
 
-    GtkWidget *overlay = gtk_drawing_area_new();
-    ctx->frame_overlay_area = GTK_DRAWING_AREA(overlay);
-    gtk_widget_set_size_request(overlay, 480, 160);
-    gtk_widget_set_hexpand(overlay, TRUE);
-    gtk_widget_set_vexpand(overlay, FALSE);
-    gtk_drawing_area_set_draw_func(ctx->frame_overlay_area, frame_overlay_draw, ctx, NULL);
-    gtk_frame_set_child(GTK_FRAME(overlay_frame), overlay);
-    gtk_box_append(GTK_BOX(page), overlay_frame);
+    GtkWidget *lateness_area = gtk_drawing_area_new();
+    ctx->frame_overlay_lateness = GTK_DRAWING_AREA(lateness_area);
+    gtk_widget_set_size_request(lateness_area, 480, 140);
+    gtk_widget_set_hexpand(lateness_area, TRUE);
+    gtk_widget_set_vexpand(lateness_area, FALSE);
+    g_object_set_data(G_OBJECT(lateness_area), "overlay-metric", GUINT_TO_POINTER(FRAME_OVERLAY_METRIC_LATENESS));
+    gtk_drawing_area_set_draw_func(ctx->frame_overlay_lateness, frame_overlay_draw, ctx, NULL);
+    gtk_frame_set_child(GTK_FRAME(lateness_frame), lateness_area);
+    gtk_box_append(GTK_BOX(content), lateness_frame);
+
+    GtkWidget *size_frame = gtk_frame_new("Frame Size Timeline");
+    gtk_widget_set_hexpand(size_frame, TRUE);
+    gtk_widget_set_vexpand(size_frame, FALSE);
+
+    GtkWidget *size_area = gtk_drawing_area_new();
+    ctx->frame_overlay_size = GTK_DRAWING_AREA(size_area);
+    gtk_widget_set_size_request(size_area, 480, 140);
+    gtk_widget_set_hexpand(size_area, TRUE);
+    gtk_widget_set_vexpand(size_area, FALSE);
+    g_object_set_data(G_OBJECT(size_area), "overlay-metric", GUINT_TO_POINTER(FRAME_OVERLAY_METRIC_SIZE));
+    gtk_drawing_area_set_draw_func(ctx->frame_overlay_size, frame_overlay_draw, ctx, NULL);
+    gtk_frame_set_child(GTK_FRAME(size_frame), size_area);
+    gtk_box_append(GTK_BOX(content), size_frame);
 
     GtkWidget *summary_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
-    gtk_box_append(GTK_BOX(page), summary_row);
+    gtk_box_append(GTK_BOX(content), summary_row);
 
     ctx->frame_block_summary_label = GTK_LABEL(gtk_label_new("Frame block capture disabled."));
     gtk_label_set_xalign(ctx->frame_block_summary_label, 0.0);
@@ -1811,7 +2056,13 @@ static GtkWidget *build_frame_block_page(GuiContext *ctx) {
     frame_block_sync_controls(ctx, NULL);
     frame_block_update_summary(ctx);
 
-    return page;
+    GtkWidget *scroller = gtk_scrolled_window_new();
+    gtk_widget_set_hexpand(scroller, TRUE);
+    gtk_widget_set_vexpand(scroller, TRUE);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroller), GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroller), content);
+
+    return scroller;
 }
 
 static void stats_range_changed(GObject *dropdown, GParamSpec *pspec, gpointer user_data) {
@@ -1953,7 +2204,8 @@ static void build_ui(GuiContext *ctx) {
     GtkWidget *window = gtk_application_window_new(ctx->app);
     ctx->window = GTK_WINDOW(window);
     gtk_window_set_title(ctx->window, "UDP H.265 Viewer");
-    gtk_window_set_default_size(ctx->window, 960, 720);
+    gtk_window_set_default_size(ctx->window, 900, 680);
+    gtk_window_set_resizable(ctx->window, TRUE);
     g_signal_connect(window, "close-request", G_CALLBACK(on_window_close_request), ctx);
 
     ctx->notebook = GTK_NOTEBOOK(gtk_notebook_new());
@@ -2004,9 +2256,7 @@ static void on_app_activate(GtkApplication *app, gpointer user_data) {
     sync_settings_controls(ctx);
     uv_viewer_set_event_callback(ctx->viewer, viewer_event_callback, ctx);
     refresh_stats(ctx);
-    if (!ctx->stats_timeout_id) {
-        ctx->stats_timeout_id = g_timeout_add(100, stats_timeout_cb, ctx);
-    }
+    restart_stats_timer(ctx);
 }
 
 static void on_app_shutdown(GApplication *app, gpointer user_data) {
@@ -2030,18 +2280,25 @@ static void on_app_shutdown(GApplication *app, gpointer user_data) {
     }
     ctx->status_label = NULL;
     ctx->info_label = NULL;
-    ctx->source_list = NULL;
+    if (ctx->source_model) {
+        g_clear_object(&ctx->source_model);
+    }
+    ctx->source_dropdown = NULL;
+    ctx->source_detail_label = NULL;
     ctx->video_picture = NULL;
-    ctx->source_scroller = NULL;
     ctx->sources_frame = NULL;
     ctx->sources_toggle = NULL;
     ctx->listen_port_spin = NULL;
     ctx->jitter_latency_spin = NULL;
     ctx->sync_toggle_settings = NULL;
     ctx->queue_max_buffers_spin = NULL;
+    ctx->stats_refresh_spin = NULL;
     ctx->videorate_toggle = NULL;
     ctx->videorate_num_spin = NULL;
     ctx->videorate_den_spin = NULL;
+    ctx->audio_toggle = NULL;
+    ctx->audio_payload_spin = NULL;
+    ctx->audio_jitter_spin = NULL;
     ctx->jitter_drop_toggle = NULL;
     ctx->jitter_do_lost_toggle = NULL;
     ctx->jitter_post_drop_toggle = NULL;
@@ -2058,11 +2315,12 @@ static void on_app_shutdown(GApplication *app, gpointer user_data) {
         ctx->frame_block_values_size = NULL;
     }
     ctx->frame_block_area = NULL;
-    ctx->frame_overlay_area = NULL;
+    ctx->frame_overlay_lateness = NULL;
+    ctx->frame_overlay_size = NULL;
     ctx->frame_block_enable_toggle = NULL;
     ctx->frame_block_pause_toggle = NULL;
     ctx->frame_block_mode_dropdown = NULL;
-    ctx->frame_block_metric_dropdown = NULL;
+    ctx->frame_block_metric_toggle = NULL;
     ctx->frame_block_summary_label = NULL;
     ctx->frame_block_reset_button = NULL;
     for (int i = 0; i < 3; i++) {
@@ -2075,15 +2333,19 @@ static void on_app_shutdown(GApplication *app, gpointer user_data) {
     ctx->window = NULL;
 }
 
-int uv_gui_run(UvViewer *viewer, const UvViewerConfig *cfg, const char *program_name) {
-    if (!viewer || !cfg) return 1;
+int uv_gui_run(UvViewer **viewer, UvViewerConfig *cfg, const char *program_name) {
+    if (!viewer || !*viewer || !cfg) return 1;
 
     GtkApplication *app = gtk_application_new("com.radeonvrx.viewer", G_APPLICATION_NON_UNIQUE);
 
     GuiContext *ctx = g_new0(GuiContext, 1);
-    ctx->viewer = viewer;
+    ctx->viewer_slot = viewer;
+    ctx->viewer = *viewer;
+    ctx->cfg_slot = cfg;
     ctx->current_cfg = *cfg;
     ctx->stats_range_seconds = 300.0;
+    ctx->audio_runtime_enabled = cfg->audio_enabled;
+    ctx->audio_active = FALSE;
     ctx->frame_block_thresholds_ms[0] = FRAME_BLOCK_DEFAULT_GREEN_MS;
     ctx->frame_block_thresholds_ms[1] = FRAME_BLOCK_DEFAULT_YELLOW_MS;
     ctx->frame_block_thresholds_ms[2] = FRAME_BLOCK_DEFAULT_ORANGE_MS;
@@ -2097,6 +2359,9 @@ int uv_gui_run(UvViewer *viewer, const UvViewerConfig *cfg, const char *program_
     ctx->frame_block_view = FRAME_BLOCK_VIEW_LATENESS;
     ctx->frame_block_missing = 0;
     ctx->frame_block_real_samples = 0;
+    ctx->known_source_count = 0;
+    ctx->suppress_source_change = FALSE;
+    ctx->stats_refresh_interval_ms = 200;
     for (guint i = 0; i < FRAME_BLOCK_COLOR_COUNT; i++) {
         ctx->frame_block_colors_visible[i] = TRUE;
     }
@@ -2122,6 +2387,10 @@ int uv_gui_run(UvViewer *viewer, const UvViewerConfig *cfg, const char *program_
     }
     if (argv0) {
         g_free(argv0);
+    }
+
+    if (viewer) {
+        *viewer = ctx->viewer;
     }
 
     g_object_unref(app);

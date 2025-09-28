@@ -3,6 +3,6 @@
 
 #include "uv_viewer.h"
 
-int uv_gui_run(UvViewer *viewer, const UvViewerConfig *cfg, const char *program_name);
+int uv_gui_run(UvViewer **viewer, UvViewerConfig *cfg, const char *program_name);
 
 #endif // GUI_SHELL_H

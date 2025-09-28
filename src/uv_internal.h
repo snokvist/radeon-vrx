@@ -111,12 +111,19 @@ typedef struct {
     gboolean use_videorate;
     guint videorate_fps_num;
     guint videorate_fps_den;
+    gboolean audio_enabled;
+    guint audio_payload_type;
+    guint audio_clock_rate;
+    guint audio_jitter_latency_ms;
 
     struct _UvViewer *viewer;
 
     GstElement *pipeline;
     GstElement *appsrc_element;
     GstElement *queue0;
+    GstElement *tee;
+    GstElement *queue_video_in;
+    GstElement *capsfilter_rtp_video;
     GstElement *jitterbuffer;
     GstElement *depay;
     GstElement *parser;
@@ -129,12 +136,26 @@ typedef struct {
     GstElement *queue_postrate;
     GstElement *sink;
 
+    GstElement *queue_audio_in;
+    GstElement *capsfilter_rtp_audio;
+    GstElement *audio_jitter;
+    GstElement *audio_depay;
+    GstElement *audio_decoder;
+    GstElement *audio_convert;
+    GstElement *audio_resample;
+    GstElement *audio_sink;
+
     GThread *loop_thread;
     GMainLoop *loop;
     GMainContext *loop_context;
     guint bus_watch_id;
     gulong decoder_probe_id;
     gboolean sink_is_fakesink;
+    gulong audio_probe_id;
+    gboolean audio_sink_is_fakesink;
+    gint64 audio_last_buffer_us;
+    GMutex audio_lock;
+    gboolean audio_active_cached;
 } PipelineController;
 
 struct _UvViewer {

@@ -26,6 +26,10 @@ typedef struct {
     gboolean videorate_enabled; // TRUE to insert videorate to enforce a target FPS
     guint videorate_fps_numerator; // target framerate numerator (default: 60)
     guint videorate_fps_denominator; // target framerate denominator (default: 1)
+    gboolean audio_enabled; // TRUE to enable audio branch
+    guint audio_payload_type; // RTP payload type carrying OPUS (default: 98)
+    guint audio_clock_rate; // RTP clock rate for audio (default: 48000)
+    guint audio_jitter_latency_ms; // jitter buffer latency for audio (default: 8)
 } UvViewerConfig;
 
 typedef struct {
@@ -105,6 +109,8 @@ typedef struct {
     GArray *sources;      // UvSourceStats elements
     GArray *qos_entries;  // UvNamedQoSStats elements
     UvDecoderStats decoder;
+    gboolean audio_enabled;
+    gboolean audio_active;
     gboolean queue0_valid;
     UvQueueStats queue0;
     gboolean frame_block_valid;

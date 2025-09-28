@@ -28,6 +28,10 @@ void uv_viewer_config_init(UvViewerConfig *cfg) {
     cfg->videorate_enabled = FALSE;
     cfg->videorate_fps_numerator = 60;
     cfg->videorate_fps_denominator = 1;
+    cfg->audio_enabled = FALSE;
+    cfg->audio_payload_type = 98;
+    cfg->audio_clock_rate = 48000;
+    cfg->audio_jitter_latency_ms = 8;
 }
 
 UvViewer *uv_viewer_new(const UvViewerConfig *cfg) {
@@ -166,6 +170,8 @@ void uv_viewer_stats_init(UvViewerStats *stats) {
     stats->sources = g_array_new(FALSE, TRUE, sizeof(UvSourceStats));
     stats->qos_entries = g_array_new(FALSE, TRUE, sizeof(UvNamedQoSStats));
     memset(&stats->decoder, 0, sizeof(stats->decoder));
+    stats->audio_enabled = FALSE;
+    stats->audio_active = FALSE;
     stats->queue0_valid = FALSE;
     memset(&stats->queue0, 0, sizeof(stats->queue0));
     stats->frame_block_valid = FALSE;
@@ -189,6 +195,8 @@ void uv_viewer_stats_clear(UvViewerStats *stats) {
     stats->queue0_valid = FALSE;
     memset(&stats->queue0, 0, sizeof(stats->queue0));
     memset(&stats->decoder, 0, sizeof(stats->decoder));
+    stats->audio_enabled = FALSE;
+    stats->audio_active = FALSE;
     if (stats->frame_block.lateness_ms) {
         g_array_unref(stats->frame_block.lateness_ms);
         stats->frame_block.lateness_ms = NULL;

@@ -56,6 +56,33 @@ static GstPadProbeReturn dec_src_probe(GstPad *pad, GstPadProbeInfo *info, gpoin
     return GST_PAD_PROBE_OK;
 }
 
+static GstPadProbeReturn audio_src_probe(GstPad *pad, GstPadProbeInfo *info, gpointer user_data) {
+    (void)pad;
+    PipelineController *pc = (PipelineController *)user_data;
+    if (!pc) return GST_PAD_PROBE_OK;
+    if (GST_PAD_PROBE_INFO_TYPE(info) & GST_PAD_PROBE_TYPE_BUFFER) {
+        gint64 now_us = g_get_monotonic_time();
+        g_mutex_lock(&pc->audio_lock);
+        pc->audio_last_buffer_us = now_us;
+        g_mutex_unlock(&pc->audio_lock);
+    }
+    return GST_PAD_PROBE_OK;
+}
+
+static void remove_audio_probe(PipelineController *pc) {
+    if (!pc || pc->audio_probe_id == 0) return;
+    if (!pc->audio_resample) {
+        pc->audio_probe_id = 0;
+        return;
+    }
+    GstPad *pad = gst_element_get_static_pad(pc->audio_resample, "src");
+    if (pad) {
+        gst_pad_remove_probe(pad, pc->audio_probe_id);
+        gst_object_unref(pad);
+    }
+    pc->audio_probe_id = 0;
+}
+
 static void on_need_data(GstAppSrc *src, guint length, gpointer user_data) {
     (void)src; (void)length;
     PipelineController *pc = (PipelineController *)user_data;
@@ -93,9 +120,11 @@ static gboolean pipeline_swap_to_fakesink(PipelineController *pc) {
 static gboolean build_pipeline(PipelineController *pc, GError **error) {
     UvViewer *viewer = pc->viewer;
     pc->appsrc_element   = gst_element_factory_make("appsrc", "src");
-    GstElement *capsf_rtp = gst_element_factory_make("capsfilter", "cf_rtp");
-    pc->queue0           = gst_element_factory_make("queue", "queue0");
-    pc->jitterbuffer     = gst_element_factory_make("rtpjitterbuffer", "jbuf");
+    pc->queue0           = gst_element_factory_make("queue", "queue_ingress");
+    pc->tee              = gst_element_factory_make("tee", "tee");
+    pc->queue_video_in   = gst_element_factory_make("queue", "queue_video_in");
+    pc->capsfilter_rtp_video = gst_element_factory_make("capsfilter", "cf_rtp_video");
+    pc->jitterbuffer     = gst_element_factory_make("rtpjitterbuffer", "jbuf_video");
     pc->depay            = gst_element_factory_make("rtph265depay", "depay");
     pc->parser           = gst_element_factory_make("h265parse", "parser");
     pc->capsfilter       = gst_element_factory_make("capsfilter", "h265caps");
@@ -125,6 +154,27 @@ static gboolean build_pipeline(PipelineController *pc, GError **error) {
         pc->queue_postrate = gst_element_factory_make("queue", "queue_postrate");
     }
 
+    if (pc->audio_enabled) {
+        pc->queue_audio_in = gst_element_factory_make("queue", "queue_audio_in");
+        pc->capsfilter_rtp_audio = gst_element_factory_make("capsfilter", "cf_rtp_audio");
+        pc->audio_jitter = gst_element_factory_make("rtpjitterbuffer", "jbuf_audio");
+        pc->audio_depay = gst_element_factory_make("rtpopusdepay", "depay_audio");
+        pc->audio_decoder = gst_element_factory_make("opusdec", "opus_decoder");
+        pc->audio_convert = gst_element_factory_make("audioconvert", "audio_convert");
+        pc->audio_resample = gst_element_factory_make("audioresample", "audio_resample");
+        pc->audio_sink = gst_element_factory_make("autoaudiosink", "audio_sink");
+        pc->audio_sink_is_fakesink = FALSE;
+        if (!pc->audio_sink) pc->audio_sink = gst_element_factory_make("pulsesink", "audio_sink");
+        if (!pc->audio_sink) pc->audio_sink = gst_element_factory_make("alsasink", "audio_sink");
+        if (!pc->audio_sink) {
+            pc->audio_sink = gst_element_factory_make("fakesink", "audio_sink");
+            if (pc->audio_sink) {
+                g_object_set(pc->audio_sink, "sync", FALSE, "async", FALSE, NULL);
+                pc->audio_sink_is_fakesink = TRUE;
+            }
+        }
+    }
+
     gboolean headless = (g_getenv("WAYLAND_DISPLAY") == NULL && g_getenv("DISPLAY") == NULL);
     gboolean sink_is_fakesink = FALSE;
     if (headless) {
@@ -148,13 +198,32 @@ static gboolean build_pipeline(PipelineController *pc, GError **error) {
         }
     }
 
-    if (!pc->appsrc_element || !capsf_rtp || !pc->queue0 || !pc->jitterbuffer ||
-        !pc->depay || !pc->parser || !pc->capsfilter || !pc->decoder ||
+    if (!pc->appsrc_element || !pc->queue0 || !pc->tee || !pc->queue_video_in ||
+        !pc->capsfilter_rtp_video || !pc->jitterbuffer || !pc->depay ||
+        !pc->parser || !pc->capsfilter || !pc->decoder ||
         !pc->queue_postdec || !pc->video_convert || !pc->sink ||
         (pc->use_videorate && (!pc->videorate || !pc->videorate_caps || !pc->queue_postrate))) {
         g_set_error(error, g_quark_from_static_string("uv-viewer"), 10,
                     "Failed to create required GStreamer elements");
         return FALSE;
+    }
+
+    if (pc->audio_enabled) {
+        if (!pc->queue_audio_in || !pc->capsfilter_rtp_audio || !pc->audio_jitter ||
+            !pc->audio_depay || !pc->audio_decoder || !pc->audio_convert ||
+            !pc->audio_resample || !pc->audio_sink) {
+            uv_log_warn("Audio pipeline requested but missing components; disabling audio");
+            if (pc->queue_audio_in) { gst_object_unref(pc->queue_audio_in); pc->queue_audio_in = NULL; }
+            if (pc->capsfilter_rtp_audio) { gst_object_unref(pc->capsfilter_rtp_audio); pc->capsfilter_rtp_audio = NULL; }
+            if (pc->audio_jitter) { gst_object_unref(pc->audio_jitter); pc->audio_jitter = NULL; }
+            if (pc->audio_depay) { gst_object_unref(pc->audio_depay); pc->audio_depay = NULL; }
+            if (pc->audio_decoder) { gst_object_unref(pc->audio_decoder); pc->audio_decoder = NULL; }
+            if (pc->audio_convert) { gst_object_unref(pc->audio_convert); pc->audio_convert = NULL; }
+            if (pc->audio_resample) { gst_object_unref(pc->audio_resample); pc->audio_resample = NULL; }
+            if (pc->audio_sink) { gst_object_unref(pc->audio_sink); pc->audio_sink = NULL; }
+            pc->audio_enabled = FALSE;
+            pc->audio_sink_is_fakesink = FALSE;
+        }
     }
 
     pc->pipeline = gst_pipeline_new("uv-udp-h265");
@@ -164,12 +233,8 @@ static gboolean build_pipeline(PipelineController *pc, GError **error) {
         return FALSE;
     }
 
-    gchar *caps_rtp_str = g_strdup_printf(
-        "application/x-rtp,media=video,encoding-name=H265,payload=%d,clock-rate=%d",
-        pc->payload_type, pc->clock_rate);
-    GstCaps *caps_rtp = gst_caps_from_string(caps_rtp_str);
-    g_free(caps_rtp_str);
-    if (!caps_rtp) {
+    GstCaps *caps_appsrc = gst_caps_new_empty_simple("application/x-rtp");
+    if (!caps_appsrc) {
         g_set_error(error, g_quark_from_static_string("uv-viewer"), 12,
                     "Failed to build RTP caps");
         return FALSE;
@@ -177,7 +242,7 @@ static gboolean build_pipeline(PipelineController *pc, GError **error) {
 
     GstCaps *caps_h265 = gst_caps_from_string("video/x-h265,stream-format=byte-stream,alignment=au");
     if (!caps_h265) {
-        gst_caps_unref(caps_rtp);
+        gst_caps_unref(caps_appsrc);
         g_set_error(error, g_quark_from_static_string("uv-viewer"), 13,
                     "Failed to build H265 caps");
         return FALSE;
@@ -190,9 +255,8 @@ static gboolean build_pipeline(PipelineController *pc, GError **error) {
                  "max-bytes", (guint64)(2 * 1024 * 1024),
                  "stream-type", GST_APP_STREAM_TYPE_STREAM,
                  NULL);
-    gst_app_src_set_caps(GST_APP_SRC(pc->appsrc_element), caps_rtp);
-    g_object_set(capsf_rtp, "caps", caps_rtp, NULL);
-    gst_caps_unref(caps_rtp);
+    gst_app_src_set_caps(GST_APP_SRC(pc->appsrc_element), caps_appsrc);
+    gst_caps_unref(caps_appsrc);
 
     g_object_set(pc->queue0,
                  "leaky", 2,
@@ -201,12 +265,36 @@ static gboolean build_pipeline(PipelineController *pc, GError **error) {
                  "max-size-time", (guint64)0,
                  NULL);
 
+    if (pc->queue_video_in) {
+        g_object_set(pc->queue_video_in,
+                     "leaky", 2,
+                     "max-size-buffers", 0,
+                     "max-size-bytes", 0,
+                     "max-size-time", (guint64)0,
+                     NULL);
+    }
+
     g_object_set(pc->jitterbuffer,
                  "latency", (guint)MAX(viewer->config.jitter_latency_ms, 0u),
                  "drop-on-latency", viewer->config.jitter_drop_on_latency,
                  "do-lost", viewer->config.jitter_do_lost,
                  "post-drop-messages", viewer->config.jitter_post_drop_messages,
                  NULL);
+
+    GstCaps *caps_rtp_video = gst_caps_new_simple("application/x-rtp",
+                                                  "media", G_TYPE_STRING, "video",
+                                                  "encoding-name", G_TYPE_STRING, "H265",
+                                                  "payload", G_TYPE_INT, pc->payload_type,
+                                                  "clock-rate", G_TYPE_INT, pc->clock_rate,
+                                                  NULL);
+    if (!caps_rtp_video) {
+        gst_caps_unref(caps_h265);
+        g_set_error(error, g_quark_from_static_string("uv-viewer"), 16,
+                    "Failed to build video RTP caps");
+        return FALSE;
+    }
+    g_object_set(pc->capsfilter_rtp_video, "caps", caps_rtp_video, NULL);
+    gst_caps_unref(caps_rtp_video);
 
     g_object_set(pc->parser, "config-interval", -1, NULL);
     g_object_set(pc->capsfilter, "caps", caps_h265, NULL);
@@ -228,6 +316,37 @@ static gboolean build_pipeline(PipelineController *pc, GError **error) {
         gst_caps_unref(fps_caps);
     }
 
+    if (pc->audio_enabled) {
+        g_object_set(pc->queue_audio_in,
+                     "leaky", 1,
+                     "max-size-time", (guint64)1,
+                     NULL);
+        g_object_set(pc->audio_jitter,
+                     "latency", (guint)MAX(pc->audio_jitter_latency_ms, 0u),
+                     "drop-on-latency", viewer->config.jitter_drop_on_latency,
+                     "do-lost", viewer->config.jitter_do_lost,
+                     "post-drop-messages", viewer->config.jitter_post_drop_messages,
+                     NULL);
+
+        GstCaps *caps_rtp_audio = gst_caps_new_simple("application/x-rtp",
+                                                      "media", G_TYPE_STRING, "audio",
+                                                      "encoding-name", G_TYPE_STRING, "OPUS",
+                                                      "payload", G_TYPE_INT, (gint)pc->audio_payload_type,
+                                                      "clock-rate", G_TYPE_INT, (gint)pc->audio_clock_rate,
+                                                      NULL);
+        if (!caps_rtp_audio) {
+            g_set_error(error, g_quark_from_static_string("uv-viewer"), 17,
+                        "Failed to build audio RTP caps");
+            return FALSE;
+        }
+        g_object_set(pc->capsfilter_rtp_audio, "caps", caps_rtp_audio, NULL);
+        gst_caps_unref(caps_rtp_audio);
+
+        if (pc->audio_sink && !pc->audio_sink_is_fakesink) {
+            g_object_set(pc->audio_sink, "sync", FALSE, NULL);
+        }
+    }
+
     if (!sink_is_fakesink) {
         g_object_set(pc->sink, "sync", viewer->config.sync_to_clock ? TRUE : FALSE, NULL);
     }
@@ -235,7 +354,8 @@ static gboolean build_pipeline(PipelineController *pc, GError **error) {
     pc->sink_is_fakesink = sink_is_fakesink;
 
     gst_bin_add_many(GST_BIN(pc->pipeline),
-                     pc->appsrc_element, capsf_rtp, pc->queue0, pc->jitterbuffer,
+                     pc->appsrc_element, pc->queue0, pc->tee,
+                     pc->queue_video_in, pc->capsfilter_rtp_video, pc->jitterbuffer,
                      pc->depay, pc->parser, pc->capsfilter,
                      pc->decoder, pc->queue_postdec, pc->video_convert, NULL);
     if (pc->use_videorate) {
@@ -243,16 +363,41 @@ static gboolean build_pipeline(PipelineController *pc, GError **error) {
     }
     gst_bin_add(GST_BIN(pc->pipeline), pc->sink);
 
-    if (!gst_element_link_many(pc->appsrc_element, capsf_rtp, pc->queue0, pc->jitterbuffer,
-                               pc->depay, pc->parser, pc->capsfilter, pc->decoder, NULL)) {
+    if (pc->audio_enabled) {
+        gst_bin_add_many(GST_BIN(pc->pipeline),
+                         pc->queue_audio_in,
+                         pc->capsfilter_rtp_audio,
+                         pc->audio_jitter,
+                         pc->audio_depay,
+                         pc->audio_decoder,
+                         pc->audio_convert,
+                         pc->audio_resample,
+                         pc->audio_sink,
+                         NULL);
+    }
+
+    if (!gst_element_link(pc->appsrc_element, pc->queue0)) {
         g_set_error(error, g_quark_from_static_string("uv-viewer"), 14,
-                    "Failed to link pipeline (upstream)");
+                    "Failed to link appsrc to ingress queue");
         return FALSE;
     }
 
-    if (!gst_element_link(pc->decoder, pc->queue_postdec)) {
+    if (!gst_element_link(pc->queue0, pc->tee)) {
         g_set_error(error, g_quark_from_static_string("uv-viewer"), 14,
-                    "Failed to link decoder to post-decode queue");
+                    "Failed to link ingress queue to tee");
+        return FALSE;
+    }
+
+    if (!gst_element_link(pc->tee, pc->queue_video_in)) {
+        g_set_error(error, g_quark_from_static_string("uv-viewer"), 14,
+                    "Failed to link tee to video queue");
+        return FALSE;
+    }
+
+    if (!gst_element_link_many(pc->queue_video_in, pc->capsfilter_rtp_video, pc->jitterbuffer,
+                               pc->depay, pc->parser, pc->capsfilter, pc->decoder, pc->queue_postdec, NULL)) {
+        g_set_error(error, g_quark_from_static_string("uv-viewer"), 14,
+                    "Failed to link video branch");
         return FALSE;
     }
 
@@ -292,6 +437,27 @@ static gboolean build_pipeline(PipelineController *pc, GError **error) {
         return FALSE;
     }
 
+    if (pc->audio_enabled) {
+        if (!gst_element_link(pc->tee, pc->queue_audio_in)) {
+            g_set_error(error, g_quark_from_static_string("uv-viewer"), 14,
+                        "Failed to link tee to audio queue");
+            return FALSE;
+        }
+        if (!gst_element_link_many(pc->queue_audio_in,
+                                   pc->capsfilter_rtp_audio,
+                                   pc->audio_jitter,
+                                   pc->audio_depay,
+                                   pc->audio_decoder,
+                                   pc->audio_convert,
+                                   pc->audio_resample,
+                                   pc->audio_sink,
+                                   NULL)) {
+            g_set_error(error, g_quark_from_static_string("uv-viewer"), 14,
+                        "Failed to link audio branch");
+            return FALSE;
+        }
+    }
+
     set_appsrc_callbacks(pc);
 
     GstPad *dec_src = gst_element_get_static_pad(pc->decoder, "src");
@@ -299,6 +465,15 @@ static gboolean build_pipeline(PipelineController *pc, GError **error) {
         pc->decoder_probe_id = gst_pad_add_probe(dec_src, GST_PAD_PROBE_TYPE_BUFFER,
                                                  dec_src_probe, pc, NULL);
         gst_object_unref(dec_src);
+    }
+
+    if (pc->audio_enabled && pc->audio_resample) {
+        GstPad *audio_pad = gst_element_get_static_pad(pc->audio_resample, "src");
+        if (audio_pad) {
+            pc->audio_probe_id = gst_pad_add_probe(audio_pad, GST_PAD_PROBE_TYPE_BUFFER,
+                                                   audio_src_probe, pc, NULL);
+            gst_object_unref(audio_pad);
+        }
     }
 
     GstBus *bus = gst_element_get_bus(pc->pipeline);
@@ -348,6 +523,18 @@ gboolean pipeline_controller_init(PipelineController *pc, struct _UvViewer *view
     pc->use_videorate = viewer->config.videorate_enabled &&
                         pc->videorate_fps_num > 0 &&
                         pc->videorate_fps_den > 0;
+    pc->audio_enabled = viewer->config.audio_enabled;
+    pc->audio_payload_type = viewer->config.audio_payload_type;
+    pc->audio_clock_rate = viewer->config.audio_clock_rate;
+    if (pc->audio_clock_rate == 0) {
+        pc->audio_clock_rate = 48000;
+    }
+    pc->audio_jitter_latency_ms = viewer->config.audio_jitter_latency_ms;
+    pc->audio_sink_is_fakesink = FALSE;
+    pc->audio_probe_id = 0;
+    pc->audio_last_buffer_us = 0;
+    pc->audio_active_cached = FALSE;
+    g_mutex_init(&pc->audio_lock);
     return TRUE;
 }
 
@@ -358,6 +545,7 @@ void pipeline_controller_deinit(PipelineController *pc) {
         g_source_remove(pc->bus_watch_id);
         pc->bus_watch_id = 0;
     }
+    remove_audio_probe(pc);
     if (pc->pipeline) {
         gst_object_unref(pc->pipeline);
         pc->pipeline = NULL;
@@ -366,6 +554,22 @@ void pipeline_controller_deinit(PipelineController *pc) {
     pc->videorate = NULL;
     pc->videorate_caps = NULL;
     pc->queue_postrate = NULL;
+    pc->tee = NULL;
+    pc->queue_video_in = NULL;
+    pc->capsfilter_rtp_video = NULL;
+    pc->queue_audio_in = NULL;
+    pc->capsfilter_rtp_audio = NULL;
+    pc->audio_jitter = NULL;
+    pc->audio_depay = NULL;
+    pc->audio_decoder = NULL;
+    pc->audio_convert = NULL;
+    pc->audio_resample = NULL;
+    pc->audio_sink = NULL;
+    pc->audio_sink_is_fakesink = FALSE;
+    pc->audio_probe_id = 0;
+    pc->audio_last_buffer_us = 0;
+    pc->audio_active_cached = FALSE;
+    g_mutex_clear(&pc->audio_lock);
     if (pc->loop) {
         g_main_loop_unref(pc->loop);
         pc->loop = NULL;
@@ -434,9 +638,14 @@ void pipeline_controller_stop(PipelineController *pc) {
         g_thread_join(pc->loop_thread);
         pc->loop_thread = NULL;
     }
+    remove_audio_probe(pc);
     if (pc->pipeline) {
         gst_element_set_state(pc->pipeline, GST_STATE_NULL);
     }
+    g_mutex_lock(&pc->audio_lock);
+    pc->audio_last_buffer_us = 0;
+    pc->audio_active_cached = FALSE;
+    g_mutex_unlock(&pc->audio_lock);
 }
 
 GstAppSrc *pipeline_controller_get_appsrc(PipelineController *pc) {
@@ -464,6 +673,20 @@ void pipeline_controller_snapshot(PipelineController *pc, UvViewerStats *stats) 
     }
 
     gint64 now_us = g_get_monotonic_time();
+    gboolean audio_active = FALSE;
+    stats->audio_enabled = pc->audio_enabled;
+    g_mutex_lock(&pc->audio_lock);
+    if (pc->audio_enabled) {
+        gint64 last = pc->audio_last_buffer_us;
+        if (last > 0 && now_us > last && (now_us - last) <= 2000000) {
+            audio_active = TRUE;
+        }
+        pc->audio_active_cached = audio_active;
+    } else {
+        pc->audio_active_cached = FALSE;
+    }
+    g_mutex_unlock(&pc->audio_lock);
+    stats->audio_active = audio_active;
     guint64 frames_total;
     gint64 first_us, prev_us;
     guint64 prev_frames;

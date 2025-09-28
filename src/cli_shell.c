@@ -137,6 +137,13 @@ static void print_stats(UvViewer *viewer, int clock_rate) {
             stats.decoder.frames_total,
             caps_str);
 
+    g_print("audio: %s", stats.audio_enabled ? "enabled" : "disabled");
+    if (stats.audio_enabled) {
+        g_print(" (%s)\n", stats.audio_active ? "active" : "waiting");
+    } else {
+        g_print("\n");
+    }
+
     print_qos(&stats);
     uv_viewer_stats_clear(&stats);
     (void)clock_rate;
