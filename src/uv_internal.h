@@ -111,6 +111,7 @@ typedef struct {
     gboolean use_videorate;
     guint videorate_fps_num;
     guint videorate_fps_den;
+    UvDecoderPreference decoder_preference;
     gboolean audio_enabled;
     guint audio_payload_type;
     guint audio_clock_rate;
@@ -130,6 +131,7 @@ typedef struct {
     GstElement *capsfilter;
     GstElement *decoder;
     GstElement *queue_postdec;
+    GstElement *video_hw_convert;
     GstElement *video_convert;
     GstElement *videorate;
     GstElement *videorate_caps;

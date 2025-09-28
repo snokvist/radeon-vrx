@@ -40,6 +40,7 @@ typedef struct {
     GtkCheckButton *sync_toggle_settings;
     GtkSpinButton *queue_max_buffers_spin;
     GtkSpinButton *stats_refresh_spin;
+    GtkDropDown *decoder_dropdown;
     GtkCheckButton *videorate_toggle;
     GtkSpinButton *videorate_num_spin;
     GtkSpinButton *videorate_den_spin;
@@ -161,6 +162,37 @@ static void on_frame_block_color_toggled(GtkCheckButton *check, gpointer user_da
 static void on_videorate_toggled(GtkCheckButton *button, gpointer user_data);
 static void on_audio_toggled(GtkCheckButton *button, gpointer user_data);
 static void on_source_dropdown_changed(GObject *dropdown, GParamSpec *pspec, gpointer user_data);
+
+static const char *decoder_option_labels[] = {
+    "Auto",
+    "Intel VAAPI",
+    "NVIDIA",
+    "Generic VAAPI",
+    "Software (CPU)",
+    NULL
+};
+
+static guint decoder_pref_to_index(UvDecoderPreference pref) {
+    switch (pref) {
+        case UV_DECODER_INTEL_VAAPI:   return 1u;
+        case UV_DECODER_NVIDIA:        return 2u;
+        case UV_DECODER_GENERIC_VAAPI: return 3u;
+        case UV_DECODER_SOFTWARE:      return 4u;
+        case UV_DECODER_AUTO:
+        default:                       return 0u;
+    }
+}
+
+static UvDecoderPreference decoder_index_to_pref(guint index) {
+    switch (index) {
+        case 1:  return UV_DECODER_INTEL_VAAPI;
+        case 2:  return UV_DECODER_NVIDIA;
+        case 3:  return UV_DECODER_GENERIC_VAAPI;
+        case 4:  return UV_DECODER_SOFTWARE;
+        case 0:
+        default: return UV_DECODER_AUTO;
+    }
+}
 
 static void format_bitrate(double bps, char *out, size_t outlen) {
     if (bps < 1000.0) {
@@ -753,9 +785,11 @@ static void update_info_label(GuiContext *ctx) {
     } else {
         audio_state = "waiting";
     }
+    const char *decoder_pref = decoder_option_labels[decoder_pref_to_index(cfg->decoder_preference)];
+    if (!decoder_pref) decoder_pref = "Auto";
     g_snprintf(info, sizeof(info),
                "Listening on %d | PT %d | Clock %d | %s | Jitter %ums | Queue buffers %u"
-               " | drop=%s | lost=%s | bus-msg=%s | videorate=%s | audio=%s",
+               " | drop=%s | lost=%s | bus-msg=%s | videorate=%s | decoder=%s | audio=%s",
                cfg->listen_port,
                cfg->payload_type,
                cfg->clock_rate,
@@ -766,6 +800,7 @@ static void update_info_label(GuiContext *ctx) {
                cfg->jitter_do_lost ? "on" : "off",
                cfg->jitter_post_drop_messages ? "on" : "off",
                videorate_info,
+               decoder_pref,
                audio_state);
     gtk_label_set_text(ctx->info_label, info);
 }
@@ -783,6 +818,10 @@ static void sync_settings_controls(GuiContext *ctx) {
     }
     if (ctx->stats_refresh_spin) {
         gtk_spin_button_set_value(ctx->stats_refresh_spin, ctx->stats_refresh_interval_ms);
+    }
+    if (ctx->decoder_dropdown) {
+        gtk_drop_down_set_selected(ctx->decoder_dropdown,
+                                   decoder_pref_to_index(ctx->current_cfg.decoder_preference));
     }
     if (ctx->videorate_toggle) {
         check_set(ctx->videorate_toggle, ctx->current_cfg.videorate_enabled);
@@ -1373,6 +1412,7 @@ static gboolean gui_restart_with_config(GuiContext *ctx, const UvViewerConfig *c
         cfg->videorate_enabled == ctx->current_cfg.videorate_enabled &&
         cfg->videorate_fps_numerator == ctx->current_cfg.videorate_fps_numerator &&
         cfg->videorate_fps_denominator == ctx->current_cfg.videorate_fps_denominator &&
+        cfg->decoder_preference == ctx->current_cfg.decoder_preference &&
         cfg->audio_enabled == ctx->current_cfg.audio_enabled &&
         cfg->audio_payload_type == ctx->current_cfg.audio_payload_type &&
         cfg->audio_clock_rate == ctx->current_cfg.audio_clock_rate &&
@@ -1502,6 +1542,14 @@ static void on_settings_apply_clicked(GtkButton *button, gpointer user_data) {
         new_refresh_interval = (guint)refresh;
     }
     set_stats_refresh_interval(ctx, new_refresh_interval);
+
+    if (ctx->decoder_dropdown) {
+        guint decoder_idx = gtk_drop_down_get_selected(ctx->decoder_dropdown);
+        if (decoder_idx == GTK_INVALID_LIST_POSITION) {
+            decoder_idx = decoder_pref_to_index(ctx->current_cfg.decoder_preference);
+        }
+        new_cfg.decoder_preference = decoder_index_to_pref(decoder_idx);
+    }
 
     if (!gui_restart_with_config(ctx, &new_cfg)) {
         sync_settings_controls(ctx);
@@ -1774,12 +1822,21 @@ static GtkWidget *build_settings_page(GuiContext *ctx) {
     gtk_spin_button_set_increments(ctx->stats_refresh_spin, 10, 100);
     gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(ctx->stats_refresh_spin), 1, 4, 1, 1);
 
+    GtkWidget *decoder_label = gtk_label_new("Decoder:");
+    gtk_label_set_xalign(GTK_LABEL(decoder_label), 0.0);
+    gtk_grid_attach(GTK_GRID(grid), decoder_label, 0, 5, 1, 1);
+
+    ctx->decoder_dropdown = GTK_DROP_DOWN(gtk_drop_down_new_from_strings(decoder_option_labels));
+    gtk_drop_down_set_selected(ctx->decoder_dropdown,
+                               decoder_pref_to_index(ctx->current_cfg.decoder_preference));
+    gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(ctx->decoder_dropdown), 1, 5, 1, 1);
+
     GtkWidget *videorate_label = gtk_label_new("Videorate:");
     gtk_label_set_xalign(GTK_LABEL(videorate_label), 0.0);
-    gtk_grid_attach(GTK_GRID(grid), videorate_label, 0, 5, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid), videorate_label, 0, 6, 1, 1);
 
     GtkWidget *videorate_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
-    gtk_grid_attach(GTK_GRID(grid), videorate_box, 1, 5, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid), videorate_box, 1, 6, 1, 1);
 
     ctx->videorate_toggle = GTK_CHECK_BUTTON(gtk_check_button_new_with_label("Enable"));
     gtk_box_append(GTK_BOX(videorate_box), GTK_WIDGET(ctx->videorate_toggle));
@@ -1800,10 +1857,10 @@ static GtkWidget *build_settings_page(GuiContext *ctx) {
 
     GtkWidget *audio_label = gtk_label_new("Audio:");
     gtk_label_set_xalign(GTK_LABEL(audio_label), 0.0);
-    gtk_grid_attach(GTK_GRID(grid), audio_label, 0, 6, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid), audio_label, 0, 7, 1, 1);
 
     GtkWidget *audio_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
-    gtk_grid_attach(GTK_GRID(grid), audio_box, 1, 6, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid), audio_box, 1, 7, 1, 1);
 
     ctx->audio_toggle = GTK_CHECK_BUTTON(gtk_check_button_new_with_label("Enable"));
     gtk_box_append(GTK_BOX(audio_box), GTK_WIDGET(ctx->audio_toggle));
@@ -1824,13 +1881,13 @@ static GtkWidget *build_settings_page(GuiContext *ctx) {
     gtk_box_append(GTK_BOX(audio_box), GTK_WIDGET(ctx->audio_jitter_spin));
 
     ctx->jitter_drop_toggle = GTK_CHECK_BUTTON(gtk_check_button_new_with_label("Drop packets exceeding latency"));
-    gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(ctx->jitter_drop_toggle), 0, 7, 2, 1);
+    gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(ctx->jitter_drop_toggle), 0, 8, 2, 1);
 
     ctx->jitter_do_lost_toggle = GTK_CHECK_BUTTON(gtk_check_button_new_with_label("Emit lost packet notifications"));
-    gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(ctx->jitter_do_lost_toggle), 0, 8, 2, 1);
+    gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(ctx->jitter_do_lost_toggle), 0, 9, 2, 1);
 
     ctx->jitter_post_drop_toggle = GTK_CHECK_BUTTON(gtk_check_button_new_with_label("Post drop messages on bus"));
-    gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(ctx->jitter_post_drop_toggle), 0, 9, 2, 1);
+    gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(ctx->jitter_post_drop_toggle), 0, 10, 2, 1);
 
     GtkWidget *apply_button = gtk_button_new_with_label("Apply Settings");
     g_signal_connect(apply_button, "clicked", G_CALLBACK(on_settings_apply_clicked), ctx);
@@ -2293,6 +2350,7 @@ static void on_app_shutdown(GApplication *app, gpointer user_data) {
     ctx->sync_toggle_settings = NULL;
     ctx->queue_max_buffers_spin = NULL;
     ctx->stats_refresh_spin = NULL;
+    ctx->decoder_dropdown = NULL;
     ctx->videorate_toggle = NULL;
     ctx->videorate_num_spin = NULL;
     ctx->videorate_den_spin = NULL;

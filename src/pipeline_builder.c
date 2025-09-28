@@ -12,6 +12,121 @@ static void ensure_gstreamer_initialized(void) {
     }
 }
 
+typedef struct {
+    const char *factory_name;
+    gboolean requires_nvconv;
+    gboolean enable_memory_copy;
+} DecoderCandidate;
+
+static const DecoderCandidate decoder_candidates_auto[] = {
+    {"vah265dec", FALSE, FALSE},
+    {"vaapih265dec", FALSE, FALSE},
+    {"nvh265dec", TRUE, FALSE},
+    {"nvv4l2decoder", FALSE, TRUE},
+    {"nvdec_h265", TRUE, FALSE},
+    {NULL, FALSE, FALSE}
+};
+
+static const DecoderCandidate decoder_candidates_intel[] = {
+    {"vah265dec", FALSE, FALSE},
+    {"vaapih265dec", FALSE, FALSE},
+    {NULL, FALSE, FALSE}
+};
+
+static const DecoderCandidate decoder_candidates_vaapi[] = {
+    {"vaapih265dec", FALSE, FALSE},
+    {"vah265dec", FALSE, FALSE},
+    {NULL, FALSE, FALSE}
+};
+
+static const DecoderCandidate decoder_candidates_nvidia[] = {
+    {"nvh265dec", TRUE, FALSE},
+    {"nvv4l2decoder", FALSE, TRUE},
+    {"nvdec_h265", TRUE, FALSE},
+    {NULL, FALSE, FALSE}
+};
+
+static const DecoderCandidate decoder_candidates_software[] = {
+    {"avdec_h265", FALSE, FALSE},
+    {NULL, FALSE, FALSE}
+};
+
+static const DecoderCandidate *pick_decoder_candidate_list(UvDecoderPreference pref) {
+    switch (pref) {
+        case UV_DECODER_INTEL_VAAPI:
+            return decoder_candidates_intel;
+        case UV_DECODER_NVIDIA:
+            return decoder_candidates_nvidia;
+        case UV_DECODER_GENERIC_VAAPI:
+            return decoder_candidates_vaapi;
+        case UV_DECODER_SOFTWARE:
+            return decoder_candidates_software;
+        case UV_DECODER_AUTO:
+        default:
+            return decoder_candidates_auto;
+    }
+}
+
+static gboolean configure_video_decoder(PipelineController *pc) {
+    const DecoderCandidate *primary = pick_decoder_candidate_list(pc->decoder_preference);
+    const DecoderCandidate *fallback = NULL;
+    if (pc->decoder_preference == UV_DECODER_AUTO) {
+        fallback = decoder_candidates_auto;
+    }
+
+    const DecoderCandidate *lists[2] = { primary, fallback };
+
+    for (guint list_idx = 0; list_idx < G_N_ELEMENTS(lists); list_idx++) {
+        const DecoderCandidate *candidates = lists[list_idx];
+        if (!candidates) continue;
+        if (list_idx > 0 && candidates == lists[list_idx - 1]) continue;
+        for (const DecoderCandidate *cand = candidates; cand->factory_name; cand++) {
+            GstElement *decoder = gst_element_factory_make(cand->factory_name, "decoder");
+            if (!decoder) continue;
+
+            if (cand->enable_memory_copy) {
+                if (g_object_class_find_property(G_OBJECT_GET_CLASS(decoder), "enable-memory-copy")) {
+                    g_object_set(decoder, "enable-memory-copy", TRUE, NULL);
+                }
+            }
+
+            GstElement *hw_convert = NULL;
+            if (cand->requires_nvconv) {
+                hw_convert = gst_element_factory_make("nvvidconv", "nvvidconv");
+                if (!hw_convert) {
+                    uv_log_warn("Decoder %s requires nvvidconv but it was not found; skipping candidate", cand->factory_name);
+                    gst_object_unref(decoder);
+                    continue;
+                }
+                if (g_object_class_find_property(G_OBJECT_GET_CLASS(hw_convert), "nvbuf-memory-type")) {
+                    g_object_set(hw_convert, "nvbuf-memory-type", 0, NULL);
+                }
+            }
+
+            pc->decoder = decoder;
+            pc->video_hw_convert = hw_convert;
+            uv_log_info("Using decoder factory %s", cand->factory_name);
+            return TRUE;
+        }
+        if (pc->decoder) {
+            break;
+        }
+    }
+
+    /* Final fallback to software decoder */
+    if (pc->decoder_preference == UV_DECODER_AUTO || pc->decoder_preference == UV_DECODER_SOFTWARE) {
+        pc->decoder = gst_element_factory_make("avdec_h265", "decoder");
+        if (pc->decoder) {
+            uv_log_warn("Falling back to avdec_h265 software decoder");
+            pc->video_hw_convert = NULL;
+            return TRUE;
+        }
+    }
+
+    uv_log_error("Failed to create any H.265 decoder element");
+    return FALSE;
+}
+
 static void set_appsrc_callbacks(PipelineController *pc);
 
 static gboolean bus_cb(GstBus *bus, GstMessage *msg, gpointer user_data) {
@@ -128,12 +243,6 @@ static gboolean build_pipeline(PipelineController *pc, GError **error) {
     pc->depay            = gst_element_factory_make("rtph265depay", "depay");
     pc->parser           = gst_element_factory_make("h265parse", "parser");
     pc->capsfilter       = gst_element_factory_make("capsfilter", "h265caps");
-    pc->decoder          = gst_element_factory_make("vah265dec", "decoder");
-    if (!pc->decoder) pc->decoder = gst_element_factory_make("vaapih265dec", "decoder");
-    if (!pc->decoder) {
-        pc->decoder = gst_element_factory_make("avdec_h265", "decoder");
-        if (pc->decoder) uv_log_warn("Using avdec_h265 software decoder fallback");
-    }
     pc->queue_postdec    = gst_element_factory_make("queue", "queue_postdec");
     pc->video_convert    = gst_element_factory_make("videoconvert", "video_convert");
 
@@ -196,6 +305,12 @@ static gboolean build_pipeline(PipelineController *pc, GError **error) {
             g_object_set(pc->sink, "sync", FALSE, "async", FALSE, NULL);
             sink_is_fakesink = TRUE;
         }
+    }
+
+    if (!configure_video_decoder(pc)) {
+        g_set_error(error, g_quark_from_static_string("uv-viewer"), 10,
+                    "Failed to create a suitable H.265 decoder");
+        return FALSE;
     }
 
     if (!pc->appsrc_element || !pc->queue0 || !pc->tee || !pc->queue_video_in ||
@@ -357,7 +472,11 @@ static gboolean build_pipeline(PipelineController *pc, GError **error) {
                      pc->appsrc_element, pc->queue0, pc->tee,
                      pc->queue_video_in, pc->capsfilter_rtp_video, pc->jitterbuffer,
                      pc->depay, pc->parser, pc->capsfilter,
-                     pc->decoder, pc->queue_postdec, pc->video_convert, NULL);
+                     pc->decoder, pc->queue_postdec, NULL);
+    if (pc->video_hw_convert) {
+        gst_bin_add(GST_BIN(pc->pipeline), pc->video_hw_convert);
+    }
+    gst_bin_add(GST_BIN(pc->pipeline), pc->video_convert);
     if (pc->use_videorate) {
         gst_bin_add_many(GST_BIN(pc->pipeline), pc->videorate, pc->videorate_caps, pc->queue_postrate, NULL);
     }
@@ -402,6 +521,14 @@ static gboolean build_pipeline(PipelineController *pc, GError **error) {
     }
 
     GstElement *tail = pc->queue_postdec;
+    if (pc->video_hw_convert) {
+        if (!gst_element_link(tail, pc->video_hw_convert)) {
+            g_set_error(error, g_quark_from_static_string("uv-viewer"), 14,
+                        "Failed to link hardware video converter");
+            return FALSE;
+        }
+        tail = pc->video_hw_convert;
+    }
     if (pc->use_videorate) {
         if (!gst_element_link(tail, pc->videorate)) {
             g_set_error(error, g_quark_from_static_string("uv-viewer"), 14,
@@ -523,6 +650,7 @@ gboolean pipeline_controller_init(PipelineController *pc, struct _UvViewer *view
     pc->use_videorate = viewer->config.videorate_enabled &&
                         pc->videorate_fps_num > 0 &&
                         pc->videorate_fps_den > 0;
+    pc->decoder_preference = viewer->config.decoder_preference;
     pc->audio_enabled = viewer->config.audio_enabled;
     pc->audio_payload_type = viewer->config.audio_payload_type;
     pc->audio_clock_rate = viewer->config.audio_clock_rate;
@@ -551,6 +679,8 @@ void pipeline_controller_deinit(PipelineController *pc) {
         pc->pipeline = NULL;
     }
     pc->video_convert = NULL;
+    pc->video_hw_convert = NULL;
+    pc->video_hw_convert = NULL;
     pc->videorate = NULL;
     pc->videorate_caps = NULL;
     pc->queue_postrate = NULL;

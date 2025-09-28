@@ -32,6 +32,7 @@ void uv_viewer_config_init(UvViewerConfig *cfg) {
     cfg->audio_payload_type = 98;
     cfg->audio_clock_rate = 48000;
     cfg->audio_jitter_latency_ms = 8;
+    cfg->decoder_preference = UV_DECODER_AUTO;
 }
 
 UvViewer *uv_viewer_new(const UvViewerConfig *cfg) {

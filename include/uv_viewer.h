@@ -12,6 +12,14 @@ G_BEGIN_DECLS
 
 typedef struct _UvViewer UvViewer;
 
+typedef enum {
+    UV_DECODER_AUTO = 0,
+    UV_DECODER_INTEL_VAAPI,
+    UV_DECODER_NVIDIA,
+    UV_DECODER_GENERIC_VAAPI,
+    UV_DECODER_SOFTWARE
+} UvDecoderPreference;
+
 typedef struct {
     int listen_port;   // UDP port to bind (default: 5600)
     int payload_type;  // RTP payload type (default: 97)
@@ -30,6 +38,7 @@ typedef struct {
     guint audio_payload_type; // RTP payload type carrying OPUS (default: 98)
     guint audio_clock_rate; // RTP clock rate for audio (default: 48000)
     guint audio_jitter_latency_ms; // jitter buffer latency for audio (default: 8)
+    UvDecoderPreference decoder_preference;
 } UvViewerConfig;
 
 typedef struct {

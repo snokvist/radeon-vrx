@@ -8,8 +8,33 @@ static void print_usage(const char *argv0) {
     g_printerr("Usage: %s [--listen-port N] [--payload PT] [--clockrate Hz] [--sync|--no-sync]"
                " [--videorate] [--no-videorate] [--videorate-fps NUM[/DEN]]"
                " [--audio] [--no-audio] [--audio-payload PT] [--audio-clockrate Hz]"
-               " [--audio-jitter ms]\n",
+               " [--audio-jitter ms] [--decoder auto|intel|nvidia|vaapi|software]\n",
                argv0);
+}
+
+static gboolean parse_decoder_option(const char *value, UvViewerConfig *cfg) {
+    if (!value || !cfg) return FALSE;
+    if (g_ascii_strcasecmp(value, "auto") == 0) {
+        cfg->decoder_preference = UV_DECODER_AUTO;
+        return TRUE;
+    }
+    if (g_ascii_strcasecmp(value, "intel") == 0 || g_ascii_strcasecmp(value, "intel-vaapi") == 0) {
+        cfg->decoder_preference = UV_DECODER_INTEL_VAAPI;
+        return TRUE;
+    }
+    if (g_ascii_strcasecmp(value, "nvidia") == 0) {
+        cfg->decoder_preference = UV_DECODER_NVIDIA;
+        return TRUE;
+    }
+    if (g_ascii_strcasecmp(value, "vaapi") == 0 || g_ascii_strcasecmp(value, "generic-vaapi") == 0) {
+        cfg->decoder_preference = UV_DECODER_GENERIC_VAAPI;
+        return TRUE;
+    }
+    if (g_ascii_strcasecmp(value, "software") == 0 || g_ascii_strcasecmp(value, "cpu") == 0) {
+        cfg->decoder_preference = UV_DECODER_SOFTWARE;
+        return TRUE;
+    }
+    return FALSE;
 }
 
 static gboolean parse_args(int argc, char **argv, UvViewerConfig *cfg) {
@@ -72,6 +97,12 @@ static gboolean parse_args(int argc, char **argv, UvViewerConfig *cfg) {
             int latency = atoi(argv[++i]);
             if (latency < 0) latency = 0;
             cfg->audio_jitter_latency_ms = (guint)latency;
+        } else if (!strcmp(argv[i], "--decoder") && i + 1 < argc) {
+            const char *choice = argv[++i];
+            if (!parse_decoder_option(choice, cfg)) {
+                g_printerr("Unknown decoder option: %s\n", choice);
+                return FALSE;
+            }
         } else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
             print_usage(argv[0]);
             return FALSE;
