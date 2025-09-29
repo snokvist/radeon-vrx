@@ -83,6 +83,8 @@ typedef struct {
     gint64 first_frame_us;
     guint64 prev_frames;
     gint64 prev_timestamp_us;
+    gint64 prev_snapshot_us;
+    double last_snapshot_fps;
     GMutex lock;
 } DecoderStats;
 

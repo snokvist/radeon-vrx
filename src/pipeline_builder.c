@@ -818,28 +818,54 @@ void pipeline_controller_snapshot(PipelineController *pc, UvViewerStats *stats) 
     g_mutex_unlock(&pc->audio_lock);
     stats->audio_active = audio_active;
     guint64 frames_total;
-    gint64 first_us, prev_us;
+    gint64 first_us;
+    gint64 prev_snapshot_us;
     guint64 prev_frames;
+    gint64 last_frame_us;
+    double last_snapshot_fps;
+    double inst_fps = 0.0;
+    double avg_fps = 0.0;
+    gboolean recent_frame = FALSE;
 
     g_mutex_lock(&pc->viewer->decoder.lock);
     frames_total = pc->viewer->decoder.frames_total;
     first_us = pc->viewer->decoder.first_frame_us;
-    prev_us = pc->viewer->decoder.prev_timestamp_us;
+    prev_snapshot_us = pc->viewer->decoder.prev_snapshot_us;
     prev_frames = pc->viewer->decoder.prev_frames;
-    pc->viewer->decoder.prev_timestamp_us = now_us;
-    pc->viewer->decoder.prev_frames = frames_total;
-    g_mutex_unlock(&pc->viewer->decoder.lock);
+    last_frame_us = pc->viewer->decoder.prev_timestamp_us;
+    last_snapshot_fps = pc->viewer->decoder.last_snapshot_fps;
 
-    double inst_fps = 0.0;
-    double avg_fps = 0.0;
-    if (prev_us != 0 && now_us > prev_us && frames_total >= prev_frames) {
-        double dt = (now_us - prev_us) / 1e6;
-        if (dt > 0.0) inst_fps = (double)(frames_total - prev_frames) / dt;
-    }
     if (first_us != 0 && now_us > first_us) {
         double dt = (now_us - first_us) / 1e6;
         if (dt > 0.0) avg_fps = (double)frames_total / dt;
     }
+
+    gboolean have_new_frames = frames_total > prev_frames;
+    if (have_new_frames && prev_snapshot_us != 0 && now_us > prev_snapshot_us) {
+        double dt = (now_us - prev_snapshot_us) / 1e6;
+        if (dt > 0.0) inst_fps = (double)(frames_total - prev_frames) / dt;
+    }
+
+    if (last_frame_us > 0 && now_us > last_frame_us) {
+        recent_frame = (now_us - last_frame_us) < 500000; // 0.5s
+    }
+
+    if (!have_new_frames) {
+        if (recent_frame && last_snapshot_fps > 0.0) {
+            inst_fps = last_snapshot_fps;
+        } else if (avg_fps > 0.0) {
+            inst_fps = avg_fps;
+        } else {
+            inst_fps = 0.0;
+        }
+    } else if (inst_fps <= 0.0 && avg_fps > 0.0) {
+        inst_fps = avg_fps;
+    }
+
+    pc->viewer->decoder.prev_frames = frames_total;
+    pc->viewer->decoder.prev_snapshot_us = now_us;
+    pc->viewer->decoder.last_snapshot_fps = inst_fps;
+    g_mutex_unlock(&pc->viewer->decoder.lock);
 
     stats->decoder.frames_total = frames_total;
     stats->decoder.instantaneous_fps = inst_fps;

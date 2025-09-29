@@ -126,7 +126,7 @@ typedef struct {
     double dup_packets;
     double reorder_packets;
     double jitter_ms;
-    double fps_avg;
+    double fps_current;
     double frame_lateness_ms;
     double frame_size_kb;
     gboolean frame_valid;
@@ -1011,7 +1011,7 @@ static double stats_metric_value(const StatsSample *sample, StatsMetric metric) 
         case STATS_METRIC_DUP:     return sample->dup_packets;
         case STATS_METRIC_REORDER: return sample->reorder_packets;
         case STATS_METRIC_JITTER:  return sample->jitter_ms;
-        case STATS_METRIC_FPS:     return sample->fps_avg;
+        case STATS_METRIC_FPS:     return sample->fps_current;
         default:                   return 0.0;
     }
 }
@@ -1154,7 +1154,7 @@ static void refresh_stats(GuiContext *ctx) {
         sample.dup_packets = (double)selected_source->rtp_duplicate_packets;
         sample.reorder_packets = (double)selected_source->rtp_reordered_packets;
         sample.jitter_ms = selected_source->rfc3550_jitter_ms;
-        sample.fps_avg = stats.decoder.average_fps;
+        sample.fps_current = stats.decoder.instantaneous_fps;
         double latest_lateness = NAN;
         double latest_size = NAN;
         gboolean latest_missing = FALSE;
@@ -2052,7 +2052,7 @@ static GtkWidget *build_stats_page(GuiContext *ctx) {
         "RTP Duplicate Packets",
         "RTP Reordered Packets",
         "RTP Jitter (ms)",
-        "Decoder FPS (avg)"
+        "Decoder FPS (current)"
     };
 
     for (int i = 0; i < STATS_METRIC_COUNT; i++) {
