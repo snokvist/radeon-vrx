@@ -167,6 +167,7 @@ bool uv_viewer_update_pipeline(UvViewer *viewer, const UvPipelineOverrides *over
 void uv_viewer_frame_block_configure(UvViewer *viewer, gboolean enabled, gboolean snapshot_mode);
 void uv_viewer_frame_block_pause(UvViewer *viewer, gboolean paused);
 void uv_viewer_frame_block_reset(UvViewer *viewer);
+void uv_viewer_frame_block_set_width(UvViewer *viewer, guint width);
 void uv_viewer_frame_block_set_thresholds(UvViewer *viewer,
                                           double green_ms,
                                           double yellow_ms,

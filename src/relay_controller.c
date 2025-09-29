@@ -9,7 +9,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-#define UV_FRAME_BLOCK_DEFAULT_WIDTH  100u
+#define UV_FRAME_BLOCK_DEFAULT_WIDTH   60u
 #define UV_FRAME_BLOCK_DEFAULT_HEIGHT 100u
 #define UV_FRAME_BLOCK_COLOR_BUCKETS  4u
 #define UV_FRAME_BLOCK_DEFAULT_SIZE_GREEN_KB  64.0
@@ -910,6 +910,32 @@ void relay_controller_frame_block_configure(RelayController *rc, gboolean enable
         src->frame_block_accum_bytes = 0;
     }
     rc->frame_block.reset_requested = FALSE;
+    g_mutex_unlock(&rc->lock);
+}
+
+void relay_controller_frame_block_set_width(RelayController *rc, guint width) {
+    if (!rc) return;
+    guint clamped = MAX(width, 1u);
+
+    g_mutex_lock(&rc->lock);
+    if (rc->frame_block.width == clamped) {
+        g_mutex_unlock(&rc->lock);
+        return;
+    }
+
+    rc->frame_block.width = clamped;
+    guint height = rc->frame_block.height ? rc->frame_block.height : UV_FRAME_BLOCK_DEFAULT_HEIGHT;
+
+    for (guint i = 0; i < rc->sources_count; i++) {
+        UvRelaySource *src = &rc->sources[i];
+        if (!src->frame_block) continue;
+        UvFrameBlockState *old_state = src->frame_block;
+        src->frame_block = frame_block_state_new(rc->frame_block.width, height);
+        frame_block_state_apply_lateness_thresholds(src->frame_block, rc->frame_block.thresholds_ms);
+        frame_block_state_apply_size_thresholds(src->frame_block, rc->frame_block.thresholds_kb);
+        frame_block_state_free(old_state);
+    }
+
     g_mutex_unlock(&rc->lock);
 }
 
