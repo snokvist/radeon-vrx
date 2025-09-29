@@ -150,6 +150,11 @@ void uv_viewer_frame_block_reset(UvViewer *viewer) {
     relay_controller_frame_block_reset(&viewer->relay);
 }
 
+void uv_viewer_frame_block_set_width(UvViewer *viewer, guint width) {
+    if (!viewer) return;
+    relay_controller_frame_block_set_width(&viewer->relay, width);
+}
+
 void uv_viewer_frame_block_set_thresholds(UvViewer *viewer,
                                           double green_ms,
                                           double yellow_ms,

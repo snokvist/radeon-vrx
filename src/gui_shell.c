@@ -6,7 +6,7 @@
 #include <string.h>
 #include <math.h>
 
-#define FRAME_BLOCK_DEFAULT_WIDTH   100u
+#define FRAME_BLOCK_DEFAULT_WIDTH    60u
 #define FRAME_BLOCK_DEFAULT_HEIGHT  100u
 #define FRAME_BLOCK_COLOR_COUNT     4u
 #define FRAME_BLOCK_DEFAULT_GREEN_MS   2.0
@@ -66,6 +66,7 @@ typedef struct {
     GtkToggleButton *frame_block_enable_toggle;
     GtkToggleButton *frame_block_pause_toggle;
     GtkDropDown *frame_block_mode_dropdown;
+    GtkDropDown *frame_block_width_dropdown;
     GtkToggleButton *frame_block_metric_toggle;
     GtkSpinButton *frame_block_threshold_spins[3];
     GtkLabel *frame_block_threshold_labels[3];
@@ -137,6 +138,9 @@ typedef struct {
 #define FRAME_OVERLAY_METRIC_LATENESS 0u
 #define FRAME_OVERLAY_METRIC_SIZE     1u
 
+static const guint FRAME_BLOCK_WIDTH_OPTIONS[] = {30u, 60u, 90u, 120u};
+#define FRAME_BLOCK_WIDTH_OPTION_COUNT (G_N_ELEMENTS(FRAME_BLOCK_WIDTH_OPTIONS))
+
 static GtkWidget *build_monitor_page(GuiContext *ctx);
 static GtkWidget *build_settings_page(GuiContext *ctx);
 static GtkWidget *build_stats_page(GuiContext *ctx);
@@ -155,6 +159,7 @@ static void frame_overlay_draw(GtkDrawingArea *area, cairo_t *cr, int width, int
 static void on_frame_block_enable_toggled(GtkToggleButton *button, gpointer user_data);
 static void on_frame_block_pause_toggled(GtkToggleButton *button, gpointer user_data);
 static void on_frame_block_mode_changed(GObject *dropdown, GParamSpec *pspec, gpointer user_data);
+static void on_frame_block_width_changed(GObject *dropdown, GParamSpec *pspec, gpointer user_data);
 static void on_frame_block_metric_toggled(GtkToggleButton *button, gpointer user_data);
 static void on_frame_block_reset_clicked(GtkButton *button, gpointer user_data);
 static void on_frame_block_threshold_changed(GtkSpinButton *spin, gpointer user_data);
@@ -220,6 +225,47 @@ static guint frame_block_capacity_for(const GuiContext *ctx) {
     guint w = ctx->frame_block_width ? ctx->frame_block_width : FRAME_BLOCK_DEFAULT_WIDTH;
     guint h = ctx->frame_block_height ? ctx->frame_block_height : FRAME_BLOCK_DEFAULT_HEIGHT;
     return w * h;
+}
+
+static guint frame_block_width_value_for_index(guint index) {
+    if (index >= FRAME_BLOCK_WIDTH_OPTION_COUNT) {
+        return FRAME_BLOCK_DEFAULT_WIDTH;
+    }
+    return FRAME_BLOCK_WIDTH_OPTIONS[index];
+}
+
+static guint frame_block_width_index_for_value(guint width) {
+    for (guint i = 0; i < FRAME_BLOCK_WIDTH_OPTION_COUNT; i++) {
+        if (FRAME_BLOCK_WIDTH_OPTIONS[i] == width) {
+            return i;
+        }
+    }
+    for (guint i = 0; i < FRAME_BLOCK_WIDTH_OPTION_COUNT; i++) {
+        if (FRAME_BLOCK_WIDTH_OPTIONS[i] == FRAME_BLOCK_DEFAULT_WIDTH) {
+            return i;
+        }
+    }
+    return 0;
+}
+
+static void frame_block_reset_local_buffers(GuiContext *ctx, guint width, guint height) {
+    if (!ctx) return;
+    guint w = width ? width : FRAME_BLOCK_DEFAULT_WIDTH;
+    guint h = height ? height : FRAME_BLOCK_DEFAULT_HEIGHT;
+    guint capacity = w * h;
+
+    if (ctx->frame_block_values_lateness) {
+        g_array_set_size(ctx->frame_block_values_lateness, capacity);
+        for (guint i = 0; i < ctx->frame_block_values_lateness->len; i++) {
+            g_array_index(ctx->frame_block_values_lateness, double, i) = NAN;
+        }
+    }
+    if (ctx->frame_block_values_size) {
+        g_array_set_size(ctx->frame_block_values_size, capacity);
+        for (guint i = 0; i < ctx->frame_block_values_size->len; i++) {
+            g_array_index(ctx->frame_block_values_size, double, i) = NAN;
+        }
+    }
 }
 
 static void frame_block_apply_thresholds(GuiContext *ctx) {
@@ -457,6 +503,18 @@ static void frame_block_sync_controls(GuiContext *ctx, const UvFrameBlockStats *
         gtk_widget_set_sensitive(GTK_WIDGET(ctx->frame_block_mode_dropdown), TRUE);
     }
 
+    if (ctx->frame_block_width_dropdown) {
+        guint width_value = ctx->frame_block_width ? ctx->frame_block_width : FRAME_BLOCK_DEFAULT_WIDTH;
+        guint desired = frame_block_width_index_for_value(width_value);
+        guint current = gtk_drop_down_get_selected(ctx->frame_block_width_dropdown);
+        if (current != desired) {
+            g_signal_handlers_block_by_func(ctx->frame_block_width_dropdown, G_CALLBACK(on_frame_block_width_changed), ctx);
+            gtk_drop_down_set_selected(ctx->frame_block_width_dropdown, desired);
+            g_signal_handlers_unblock_by_func(ctx->frame_block_width_dropdown, G_CALLBACK(on_frame_block_width_changed), ctx);
+        }
+        gtk_widget_set_sensitive(GTK_WIDGET(ctx->frame_block_width_dropdown), TRUE);
+    }
+
     if (ctx->frame_block_metric_toggle) {
         gboolean desired = (ctx->frame_block_view == FRAME_BLOCK_VIEW_SIZE);
         gboolean current = gtk_toggle_button_get_active(ctx->frame_block_metric_toggle);
@@ -520,11 +578,17 @@ static void frame_block_draw(GtkDrawingArea *area, cairo_t *cr, int width, int h
     guint h = ctx->frame_block_height ? ctx->frame_block_height : FRAME_BLOCK_DEFAULT_HEIGHT;
     guint capacity = w * h;
 
-    if (capacity == 0 || values->len < capacity) return;
+    if (capacity == 0) return;
 
     double cell_w = (w > 0) ? (double)width / (double)w : 0.0;
     double cell_h = (h > 0) ? (double)height / (double)h : 0.0;
-    if (cell_w <= 0.0 || cell_h <= 0.0) return;
+    double cell_size = MIN(cell_w, cell_h);
+    if (cell_size <= 0.0) return;
+
+    double grid_width = cell_size * (double)w;
+    double grid_height = cell_size * (double)h;
+    double offset_x = (width - grid_width) / 2.0;
+    double offset_y = (height - grid_height) / 2.0;
 
     const double colors[FRAME_BLOCK_COLOR_COUNT][3] = {
         {0.20, 0.78, 0.24},
@@ -536,7 +600,10 @@ static void frame_block_draw(GtkDrawingArea *area, cairo_t *cr, int width, int h
     for (guint row = 0; row < h; row++) {
         for (guint col = 0; col < w; col++) {
             guint idx = row * w + col;
-            double value = g_array_index(values, double, idx);
+            double value = NAN;
+            if (idx < values->len) {
+                value = g_array_index(values, double, idx);
+            }
             gboolean has_value = !isnan(value);
             gboolean is_missing = has_value && value < 0.0;
 
@@ -564,9 +631,9 @@ static void frame_block_draw(GtkDrawingArea *area, cairo_t *cr, int width, int h
                 }
             }
 
-            double x = (double)col * cell_w;
-            double y = (double)row * cell_h;
-            cairo_rectangle(cr, x, y, cell_w + 0.5, cell_h + 0.5);
+            double x = offset_x + (double)col * cell_size;
+            double y = offset_y + (double)row * cell_size;
+            cairo_rectangle(cr, x, y, cell_size, cell_size);
             cairo_set_source_rgb(cr, r, g, b);
             cairo_fill(cr);
         }
@@ -576,12 +643,18 @@ static void frame_block_draw(GtkDrawingArea *area, cairo_t *cr, int width, int h
         guint idx = ctx->frame_block_next_index;
         guint row = idx / w;
         guint col = idx % w;
-        double x = (double)col * cell_w;
-        double y = (double)row * cell_h;
+        double x = offset_x + (double)col * cell_size;
+        double y = offset_y + (double)row * cell_size;
+        double inset = MIN(cell_size * 0.15, 1.5);
+        double rect_size = cell_size - 2.0 * inset;
+        if (rect_size < cell_size * 0.2) {
+            rect_size = cell_size * 0.2;
+            inset = (cell_size - rect_size) / 2.0;
+        }
         cairo_save(cr);
-        cairo_rectangle(cr, x + 0.5, y + 0.5, cell_w - 1.0, cell_h - 1.0);
+        cairo_rectangle(cr, x + inset, y + inset, rect_size, rect_size);
         cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 0.6);
-        cairo_set_line_width(cr, MAX(MIN(cell_w, cell_h) / 6.0, 0.6));
+        cairo_set_line_width(cr, MAX(cell_size * 0.12, 0.6));
         cairo_stroke(cr);
         cairo_restore(cr);
     }
@@ -1339,6 +1412,42 @@ static void on_frame_block_mode_changed(GObject *dropdown, GParamSpec *pspec, gp
     frame_block_update_summary(ctx);
 }
 
+static void on_frame_block_width_changed(GObject *dropdown, GParamSpec *pspec, gpointer user_data) {
+    (void)pspec;
+    GuiContext *ctx = user_data;
+    if (!ctx || !GTK_IS_DROP_DOWN(dropdown)) return;
+
+    guint selected = gtk_drop_down_get_selected(GTK_DROP_DOWN(dropdown));
+    if (selected == GTK_INVALID_LIST_POSITION) return;
+
+    guint new_width = frame_block_width_value_for_index(selected);
+    if (new_width == 0) new_width = FRAME_BLOCK_DEFAULT_WIDTH;
+    if (ctx->frame_block_width == new_width) return;
+
+    ctx->frame_block_width = new_width;
+    ctx->frame_block_filled = 0;
+    ctx->frame_block_next_index = 0;
+    ctx->frame_block_snapshot_complete = FALSE;
+    ctx->frame_block_min_ms = 0.0;
+    ctx->frame_block_max_ms = 0.0;
+    ctx->frame_block_avg_ms = 0.0;
+    ctx->frame_block_min_kb = 0.0;
+    ctx->frame_block_max_kb = 0.0;
+    ctx->frame_block_avg_kb = 0.0;
+    ctx->frame_block_missing = 0;
+    ctx->frame_block_real_samples = 0;
+    memset(ctx->frame_block_color_counts_ms, 0, sizeof(ctx->frame_block_color_counts_ms));
+    memset(ctx->frame_block_color_counts_kb, 0, sizeof(ctx->frame_block_color_counts_kb));
+
+    frame_block_reset_local_buffers(ctx, new_width, ctx->frame_block_height);
+    frame_block_update_summary(ctx);
+    if (ctx->viewer) {
+        uv_viewer_frame_block_set_width(ctx->viewer, new_width);
+    }
+    if (ctx->frame_block_area) gtk_widget_queue_draw(GTK_WIDGET(ctx->frame_block_area));
+    frame_block_queue_overlay_draws(ctx);
+}
+
 static void on_frame_block_metric_toggled(GtkToggleButton *button, gpointer user_data) {
     GuiContext *ctx = user_data;
     if (!ctx || !GTK_IS_TOGGLE_BUTTON(button)) return;
@@ -1986,6 +2095,18 @@ static GtkWidget *build_frame_block_page(GuiContext *ctx) {
     g_signal_connect(ctx->frame_block_mode_dropdown, "notify::selected", G_CALLBACK(on_frame_block_mode_changed), ctx);
     gtk_box_append(GTK_BOX(controls), GTK_WIDGET(ctx->frame_block_mode_dropdown));
 
+    const char *width_labels[] = {"30", "60", "90", "120", NULL};
+    GtkWidget *width_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
+    GtkWidget *width_label = gtk_label_new("Row width");
+    gtk_widget_set_valign(width_label, GTK_ALIGN_CENTER);
+    gtk_box_append(GTK_BOX(width_box), width_label);
+    ctx->frame_block_width_dropdown = GTK_DROP_DOWN(gtk_drop_down_new_from_strings(width_labels));
+    guint width_index = frame_block_width_index_for_value(ctx->frame_block_width ? ctx->frame_block_width : FRAME_BLOCK_DEFAULT_WIDTH);
+    gtk_drop_down_set_selected(ctx->frame_block_width_dropdown, width_index);
+    g_signal_connect(ctx->frame_block_width_dropdown, "notify::selected", G_CALLBACK(on_frame_block_width_changed), ctx);
+    gtk_box_append(GTK_BOX(width_box), GTK_WIDGET(ctx->frame_block_width_dropdown));
+    gtk_box_append(GTK_BOX(controls), width_box);
+
     ctx->frame_block_metric_toggle = GTK_TOGGLE_BUTTON(gtk_toggle_button_new_with_label(""));
     gtk_toggle_button_set_active(ctx->frame_block_metric_toggle, ctx->frame_block_view == FRAME_BLOCK_VIEW_SIZE);
     g_signal_connect(ctx->frame_block_metric_toggle, "toggled", G_CALLBACK(on_frame_block_metric_toggled), ctx);
@@ -2378,6 +2499,7 @@ static void on_app_shutdown(GApplication *app, gpointer user_data) {
     ctx->frame_block_enable_toggle = NULL;
     ctx->frame_block_pause_toggle = NULL;
     ctx->frame_block_mode_dropdown = NULL;
+    ctx->frame_block_width_dropdown = NULL;
     ctx->frame_block_metric_toggle = NULL;
     ctx->frame_block_summary_label = NULL;
     ctx->frame_block_reset_button = NULL;
