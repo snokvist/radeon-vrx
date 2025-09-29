@@ -140,11 +140,6 @@ void uv_viewer_frame_block_configure(UvViewer *viewer, gboolean enabled, gboolea
     relay_controller_frame_block_configure(&viewer->relay, enabled, snapshot_mode);
 }
 
-void uv_viewer_frame_block_set_dimensions(UvViewer *viewer, guint width, guint height) {
-    if (!viewer) return;
-    relay_controller_frame_block_set_dimensions(&viewer->relay, width, height);
-}
-
 void uv_viewer_frame_block_pause(UvViewer *viewer, gboolean paused) {
     if (!viewer) return;
     relay_controller_frame_block_pause(&viewer->relay, paused);
