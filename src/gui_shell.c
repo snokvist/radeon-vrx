@@ -156,6 +156,7 @@ static gboolean ensure_video_paintable(GuiContext *ctx);
 static void restart_stats_timer(GuiContext *ctx);
 static void set_stats_refresh_interval(GuiContext *ctx, guint interval_ms);
 static void frame_block_queue_overlay_draws(GuiContext *ctx);
+static void frame_block_update_summary(GuiContext *ctx);
 static void frame_block_update_width_option_label(GuiContext *ctx);
 static void frame_block_sync_width_dropdown(GuiContext *ctx);
 static void frame_block_apply_dimensions(GuiContext *ctx, guint width, guint height);
