@@ -165,6 +165,7 @@ int  uv_viewer_get_selected_source(const UvViewer *viewer);
 bool uv_viewer_update_pipeline(UvViewer *viewer, const UvPipelineOverrides *overrides, GError **error);
 
 void uv_viewer_frame_block_configure(UvViewer *viewer, gboolean enabled, gboolean snapshot_mode);
+void uv_viewer_frame_block_set_dimensions(UvViewer *viewer, guint width, guint height);
 void uv_viewer_frame_block_pause(UvViewer *viewer, gboolean paused);
 void uv_viewer_frame_block_reset(UvViewer *viewer);
 void uv_viewer_frame_block_set_thresholds(UvViewer *viewer,

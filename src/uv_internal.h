@@ -197,6 +197,7 @@ void     relay_controller_snapshot(RelayController *rc, UvViewerStats *stats, in
 void     relay_controller_set_appsrc(RelayController *rc, GstAppSrc *appsrc);
 void     relay_controller_set_push_enabled(RelayController *rc, gboolean enabled);
 void     relay_controller_frame_block_configure(RelayController *rc, gboolean enabled, gboolean snapshot_mode);
+void     relay_controller_frame_block_set_dimensions(RelayController *rc, guint width, guint height);
 void     relay_controller_frame_block_pause(RelayController *rc, gboolean paused);
 void     relay_controller_frame_block_reset(RelayController *rc);
 void     relay_controller_frame_block_set_thresholds(RelayController *rc,
