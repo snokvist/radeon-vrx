@@ -818,27 +818,29 @@ void pipeline_controller_snapshot(PipelineController *pc, UvViewerStats *stats) 
     g_mutex_unlock(&pc->audio_lock);
     stats->audio_active = audio_active;
     guint64 frames_total;
-    gint64 first_us, prev_us;
+    gint64 first_us, prev_snapshot_us;
     guint64 prev_frames;
 
     g_mutex_lock(&pc->viewer->decoder.lock);
     frames_total = pc->viewer->decoder.frames_total;
     first_us = pc->viewer->decoder.first_frame_us;
-    prev_us = pc->viewer->decoder.prev_timestamp_us;
+    prev_snapshot_us = pc->viewer->decoder.prev_snapshot_us;
     prev_frames = pc->viewer->decoder.prev_frames;
-    pc->viewer->decoder.prev_timestamp_us = now_us;
     pc->viewer->decoder.prev_frames = frames_total;
+    pc->viewer->decoder.prev_snapshot_us = now_us;
     g_mutex_unlock(&pc->viewer->decoder.lock);
 
     double inst_fps = 0.0;
     double avg_fps = 0.0;
-    if (prev_us != 0 && now_us > prev_us && frames_total >= prev_frames) {
-        double dt = (now_us - prev_us) / 1e6;
-        if (dt > 0.0) inst_fps = (double)(frames_total - prev_frames) / dt;
-    }
     if (first_us != 0 && now_us > first_us) {
         double dt = (now_us - first_us) / 1e6;
         if (dt > 0.0) avg_fps = (double)frames_total / dt;
+    }
+    if (prev_snapshot_us != 0 && now_us > prev_snapshot_us && frames_total >= prev_frames) {
+        double dt = (now_us - prev_snapshot_us) / 1e6;
+        if (dt > 0.0) inst_fps = (double)(frames_total - prev_frames) / dt;
+    } else if (avg_fps > 0.0) {
+        inst_fps = avg_fps;
     }
 
     stats->decoder.frames_total = frames_total;

@@ -22,6 +22,7 @@ void uv_internal_decoder_stats_reset(DecoderStats *stats) {
     stats->first_frame_us = 0;
     stats->prev_frames = 0;
     stats->prev_timestamp_us = 0;
+    stats->prev_snapshot_us = 0;
     g_mutex_unlock(&stats->lock);
 }
 
