@@ -20,6 +20,16 @@ typedef enum {
     UV_DECODER_SOFTWARE
 } UvDecoderPreference;
 
+typedef enum {
+    UV_VIDEO_SINK_AUTO = 0,
+    UV_VIDEO_SINK_GTK4,
+    UV_VIDEO_SINK_WAYLAND,
+    UV_VIDEO_SINK_GLIMAGE,
+    UV_VIDEO_SINK_XVIMAGE,
+    UV_VIDEO_SINK_AUTOVIDEO,
+    UV_VIDEO_SINK_FAKESINK
+} UvVideoSinkPreference;
+
 typedef struct {
     int listen_port;   // UDP port to bind (default: 5600)
     int payload_type;  // RTP payload type (default: 97)
@@ -39,6 +49,7 @@ typedef struct {
     guint audio_clock_rate; // RTP clock rate for audio (default: 48000)
     guint audio_jitter_latency_ms; // jitter buffer latency for audio (default: 8)
     UvDecoderPreference decoder_preference;
+    UvVideoSinkPreference video_sink_preference;
 } UvViewerConfig;
 
 typedef struct {
