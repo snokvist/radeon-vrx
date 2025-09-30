@@ -232,6 +232,104 @@ static gboolean pipeline_swap_to_fakesink(PipelineController *pc) {
     return TRUE;
 }
 
+static const char *video_sink_preference_to_factory(UvVideoSinkPreference pref) {
+    switch (pref) {
+        case UV_VIDEO_SINK_GTK4:      return "gtk4paintablesink";
+        case UV_VIDEO_SINK_WAYLAND:   return "waylandsink";
+        case UV_VIDEO_SINK_GLIMAGE:   return "glimagesink";
+        case UV_VIDEO_SINK_XVIMAGE:   return "xvimagesink";
+        case UV_VIDEO_SINK_AUTOVIDEO: return "autovideosink";
+        case UV_VIDEO_SINK_FAKESINK:  return "fakesink";
+        case UV_VIDEO_SINK_AUTO:
+        default:
+            return NULL;
+    }
+}
+
+static gboolean pipeline_sink_list_contains(GPtrArray *factories, const char *factory) {
+    if (!factories || !factory) return FALSE;
+    for (guint i = 0; i < factories->len; i++) {
+        const char *existing = (const char *)g_ptr_array_index(factories, i);
+        if (g_strcmp0(existing, factory) == 0) {
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+static void pipeline_add_sink_candidate(GPtrArray *factories, const char *factory) {
+    if (!factories || !factory || *factory == '\0') return;
+    if (pipeline_sink_list_contains(factories, factory)) return;
+    g_ptr_array_add(factories, g_strdup(factory));
+}
+
+static const char *pipeline_sink_factory_name_at(const PipelineController *pc, guint index) {
+    if (!pc || !pc->sink_factories) return NULL;
+    if (index >= pc->sink_factories->len) return NULL;
+    return (const char *)g_ptr_array_index(pc->sink_factories, index);
+}
+
+static const char *pipeline_current_sink_factory_name(const PipelineController *pc) {
+    return pipeline_sink_factory_name_at(pc, pc->sink_factory_index);
+}
+
+static void pipeline_detach_current_sink(PipelineController *pc) {
+    if (!pc || !pc->sink || !pc->pipeline) return;
+    GstElement *upstream = pc->video_convert ? pc->video_convert : pc->queue_postdec;
+    gst_element_set_state(pc->sink, GST_STATE_NULL);
+    if (upstream) {
+        gst_element_unlink(upstream, pc->sink);
+    }
+    gst_bin_remove(GST_BIN(pc->pipeline), pc->sink);
+    pc->sink = NULL;
+    pc->sink_is_fakesink = FALSE;
+}
+
+static gboolean pipeline_attach_sink_at(PipelineController *pc, guint index) {
+    if (!pc || !pc->pipeline) return FALSE;
+    const char *factory_name = pipeline_sink_factory_name_at(pc, index);
+    if (!factory_name) return FALSE;
+
+    GstElement *sink = gst_element_factory_make(factory_name, "sink");
+    if (!sink) {
+        return FALSE;
+    }
+
+    gboolean is_fakesink = (g_strcmp0(factory_name, "fakesink") == 0);
+    if (is_fakesink) {
+        g_object_set(sink, "sync", FALSE, "async", FALSE, NULL);
+    } else {
+        g_object_set(sink, "sync", pc->sync_to_clock ? TRUE : FALSE, NULL);
+    }
+
+    GstElement *upstream = pc->video_convert ? pc->video_convert : pc->queue_postdec;
+    if (!upstream) {
+        gst_object_unref(sink);
+        return FALSE;
+    }
+
+    gst_bin_add(GST_BIN(pc->pipeline), sink);
+    if (!gst_element_link(upstream, sink)) {
+        gst_bin_remove(GST_BIN(pc->pipeline), sink);
+        return FALSE;
+    }
+
+    pc->sink = sink;
+    pc->sink_is_fakesink = is_fakesink;
+    pc->sink_factory_index = index;
+    return TRUE;
+}
+
+static gboolean pipeline_attach_sink_from(PipelineController *pc, guint start_index) {
+    if (!pc || !pc->sink_factories) return FALSE;
+    for (guint idx = start_index; idx < pc->sink_factories->len; idx++) {
+        if (pipeline_attach_sink_at(pc, idx)) {
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
 static gboolean build_pipeline(PipelineController *pc, GError **error) {
     UvViewer *viewer = pc->viewer;
     pc->appsrc_element   = gst_element_factory_make("appsrc", "src");
@@ -285,27 +383,39 @@ static gboolean build_pipeline(PipelineController *pc, GError **error) {
     }
 
     gboolean headless = (g_getenv("WAYLAND_DISPLAY") == NULL && g_getenv("DISPLAY") == NULL);
-    gboolean sink_is_fakesink = FALSE;
-    if (headless) {
-        pc->sink = gst_element_factory_make("fakesink", "sink");
-        if (pc->sink) {
-            g_object_set(pc->sink, "sync", FALSE, "async", FALSE, NULL);
-            sink_is_fakesink = TRUE;
-        }
+    if (!pc->sink_factories) {
+        pc->sink_factories = g_ptr_array_new_with_free_func(g_free);
     } else {
-        pc->sink = gst_element_factory_make("gtk4paintablesink", "sink");
-        if (!pc->sink) pc->sink = gst_element_factory_make("waylandsink", "sink");
-        if (!pc->sink) pc->sink = gst_element_factory_make("glimagesink", "sink");
-        if (!pc->sink) pc->sink = gst_element_factory_make("xvimagesink", "sink");
-        if (!pc->sink) pc->sink = gst_element_factory_make("autovideosink", "sink");
+        g_ptr_array_set_size(pc->sink_factories, 0);
     }
-    if (!pc->sink) {
-        pc->sink = gst_element_factory_make("fakesink", "sink");
-        if (pc->sink) {
-            g_object_set(pc->sink, "sync", FALSE, "async", FALSE, NULL);
-            sink_is_fakesink = TRUE;
+    const char *forced_sink = video_sink_preference_to_factory(pc->video_sink_preference);
+    if (forced_sink) {
+        pipeline_add_sink_candidate(pc->sink_factories, forced_sink);
+    }
+    if (headless) {
+        pipeline_add_sink_candidate(pc->sink_factories, "fakesink");
+    } else {
+        const char *candidates[] = {
+            "gtk4paintablesink",
+            "waylandsink",
+            "glimagesink",
+            "xvimagesink",
+            "autovideosink",
+            "fakesink"
+        };
+        for (guint i = 0; i < G_N_ELEMENTS(candidates); i++) {
+            pipeline_add_sink_candidate(pc->sink_factories, candidates[i]);
         }
     }
+    if (!pc->sink_factories || pc->sink_factories->len == 0) {
+        if (!pc->sink_factories) {
+            pc->sink_factories = g_ptr_array_new_with_free_func(g_free);
+        }
+        pipeline_add_sink_candidate(pc->sink_factories, "fakesink");
+    }
+    pc->sink = NULL;
+    pc->sink_is_fakesink = FALSE;
+    pc->sink_factory_index = 0;
 
     if (!configure_video_decoder(pc)) {
         g_set_error(error, g_quark_from_static_string("uv-viewer"), 10,
@@ -316,7 +426,7 @@ static gboolean build_pipeline(PipelineController *pc, GError **error) {
     if (!pc->appsrc_element || !pc->queue0 || !pc->tee || !pc->queue_video_in ||
         !pc->capsfilter_rtp_video || !pc->jitterbuffer || !pc->depay ||
         !pc->parser || !pc->capsfilter || !pc->decoder ||
-        !pc->queue_postdec || !pc->video_convert || !pc->sink ||
+        !pc->queue_postdec || !pc->video_convert ||
         (pc->use_videorate && (!pc->videorate || !pc->videorate_caps || !pc->queue_postrate))) {
         g_set_error(error, g_quark_from_static_string("uv-viewer"), 10,
                     "Failed to create required GStreamer elements");
@@ -462,12 +572,6 @@ static gboolean build_pipeline(PipelineController *pc, GError **error) {
         }
     }
 
-    if (!sink_is_fakesink) {
-        g_object_set(pc->sink, "sync", viewer->config.sync_to_clock ? TRUE : FALSE, NULL);
-    }
-
-    pc->sink_is_fakesink = sink_is_fakesink;
-
     gst_bin_add_many(GST_BIN(pc->pipeline),
                      pc->appsrc_element, pc->queue0, pc->tee,
                      pc->queue_video_in, pc->capsfilter_rtp_video, pc->jitterbuffer,
@@ -480,7 +584,6 @@ static gboolean build_pipeline(PipelineController *pc, GError **error) {
     if (pc->use_videorate) {
         gst_bin_add_many(GST_BIN(pc->pipeline), pc->videorate, pc->videorate_caps, pc->queue_postrate, NULL);
     }
-    gst_bin_add(GST_BIN(pc->pipeline), pc->sink);
 
     if (pc->audio_enabled) {
         gst_bin_add_many(GST_BIN(pc->pipeline),
@@ -558,9 +661,9 @@ static gboolean build_pipeline(PipelineController *pc, GError **error) {
         return FALSE;
     }
 
-    if (!gst_element_link(pc->video_convert, pc->sink)) {
+    if (!pipeline_attach_sink_from(pc, 0)) {
         g_set_error(error, g_quark_from_static_string("uv-viewer"), 14,
-                    "Failed to link sink");
+                    "Failed to create and link video sink");
         return FALSE;
     }
 
@@ -651,6 +754,7 @@ gboolean pipeline_controller_init(PipelineController *pc, struct _UvViewer *view
                         pc->videorate_fps_num > 0 &&
                         pc->videorate_fps_den > 0;
     pc->decoder_preference = viewer->config.decoder_preference;
+    pc->video_sink_preference = viewer->config.video_sink_preference;
     pc->audio_enabled = viewer->config.audio_enabled;
     pc->audio_payload_type = viewer->config.audio_payload_type;
     pc->audio_clock_rate = viewer->config.audio_clock_rate;
@@ -663,6 +767,8 @@ gboolean pipeline_controller_init(PipelineController *pc, struct _UvViewer *view
     pc->audio_last_buffer_us = 0;
     pc->audio_active_cached = FALSE;
     g_mutex_init(&pc->audio_lock);
+    pc->sink_factories = NULL;
+    pc->sink_factory_index = 0;
     return TRUE;
 }
 
@@ -708,6 +814,11 @@ void pipeline_controller_deinit(PipelineController *pc) {
         g_main_context_unref(pc->loop_context);
         pc->loop_context = NULL;
     }
+    if (pc->sink_factories) {
+        g_ptr_array_unref(pc->sink_factories);
+        pc->sink_factories = NULL;
+    }
+    pc->sink_factory_index = 0;
 }
 
 gboolean pipeline_controller_start(PipelineController *pc, GError **error) {
@@ -738,13 +849,63 @@ gboolean pipeline_controller_start(PipelineController *pc, GError **error) {
     GstStateChangeReturn ret = gst_element_set_state(pc->pipeline, GST_STATE_PLAYING);
     if (ret == GST_STATE_CHANGE_FAILURE) {
         gst_element_set_state(pc->pipeline, GST_STATE_NULL);
-        if (!pc->sink_is_fakesink && pipeline_swap_to_fakesink(pc)) {
+
+        gboolean started = FALSE;
+        while (pc->sink_factories && pc->sink_factory_index + 1 < pc->sink_factories->len) {
+            guint next_index = pc->sink_factory_index + 1;
+            const char *current_name = pipeline_current_sink_factory_name(pc);
+            const char *next_name = pipeline_sink_factory_name_at(pc, next_index);
+            uv_log_warn("Video sink factory %s failed to start; trying %s",
+                        current_name ? current_name : "unknown",
+                        next_name ? next_name : "unknown");
+
+            pipeline_detach_current_sink(pc);
+            if (!pipeline_attach_sink_from(pc, next_index)) {
+                break;
+            }
+
             ret = gst_element_set_state(pc->pipeline, GST_STATE_PLAYING);
+            if (ret != GST_STATE_CHANGE_FAILURE) {
+                started = TRUE;
+                break;
+            }
+
+            gst_element_set_state(pc->pipeline, GST_STATE_NULL);
         }
-        if (ret == GST_STATE_CHANGE_FAILURE) {
-            g_set_error(error, g_quark_from_static_string("uv-viewer"), 20,
-                        "Failed to set pipeline to PLAYING");
-            return FALSE;
+
+        if (!started) {
+            if (!pc->sink_is_fakesink && pipeline_swap_to_fakesink(pc)) {
+                if (pc->sink_factories) {
+                    for (guint idx = 0; idx < pc->sink_factories->len; idx++) {
+                        const char *candidate = pipeline_sink_factory_name_at(pc, idx);
+                        if (candidate && g_strcmp0(candidate, "fakesink") == 0) {
+                            pc->sink_factory_index = idx;
+                            break;
+                        }
+                    }
+                }
+                ret = gst_element_set_state(pc->pipeline, GST_STATE_PLAYING);
+                if (ret != GST_STATE_CHANGE_FAILURE) {
+                    uv_log_warn("Falling back to fakesink after sink failures");
+                    started = TRUE;
+                }
+            }
+
+            if (!started) {
+                g_set_error(error, g_quark_from_static_string("uv-viewer"), 20,
+                            "Failed to set pipeline to PLAYING");
+                return FALSE;
+            }
+        }
+    }
+
+    if (ret != GST_STATE_CHANGE_FAILURE) {
+        const char *sink_name = pipeline_current_sink_factory_name(pc);
+        if (!sink_name && pc->sink_is_fakesink) {
+            sink_name = "fakesink";
+        }
+        if (sink_name) {
+            uv_log_info("Using video sink factory %s", sink_name);
         }
     }
 

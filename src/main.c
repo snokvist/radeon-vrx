@@ -8,7 +8,8 @@ static void print_usage(const char *argv0) {
     g_printerr("Usage: %s [--listen-port N] [--payload PT] [--clockrate Hz] [--sync|--no-sync]"
                " [--videorate] [--no-videorate] [--videorate-fps NUM[/DEN]]"
                " [--audio] [--no-audio] [--audio-payload PT] [--audio-clockrate Hz]"
-               " [--audio-jitter ms] [--decoder auto|intel|nvidia|vaapi|software]\n",
+               " [--audio-jitter ms] [--decoder auto|intel|nvidia|vaapi|software]"
+               " [--video-sink auto|gtk4|wayland|gl|xv|autovideo|fakesink]\n",
                argv0);
 }
 
@@ -32,6 +33,48 @@ static gboolean parse_decoder_option(const char *value, UvViewerConfig *cfg) {
     }
     if (g_ascii_strcasecmp(value, "software") == 0 || g_ascii_strcasecmp(value, "cpu") == 0) {
         cfg->decoder_preference = UV_DECODER_SOFTWARE;
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static gboolean parse_video_sink_option(const char *value, UvViewerConfig *cfg) {
+    if (!value || !cfg) return FALSE;
+    if (g_ascii_strcasecmp(value, "auto") == 0) {
+        cfg->video_sink_preference = UV_VIDEO_SINK_AUTO;
+        return TRUE;
+    }
+    if (g_ascii_strcasecmp(value, "gtk4") == 0 ||
+        g_ascii_strcasecmp(value, "gtk4paintable") == 0 ||
+        g_ascii_strcasecmp(value, "gtk") == 0) {
+        cfg->video_sink_preference = UV_VIDEO_SINK_GTK4;
+        return TRUE;
+    }
+    if (g_ascii_strcasecmp(value, "wayland") == 0 ||
+        g_ascii_strcasecmp(value, "waylandsink") == 0) {
+        cfg->video_sink_preference = UV_VIDEO_SINK_WAYLAND;
+        return TRUE;
+    }
+    if (g_ascii_strcasecmp(value, "gl") == 0 ||
+        g_ascii_strcasecmp(value, "glimage") == 0 ||
+        g_ascii_strcasecmp(value, "glimagesink") == 0) {
+        cfg->video_sink_preference = UV_VIDEO_SINK_GLIMAGE;
+        return TRUE;
+    }
+    if (g_ascii_strcasecmp(value, "xv") == 0 ||
+        g_ascii_strcasecmp(value, "xvimage") == 0 ||
+        g_ascii_strcasecmp(value, "xvimagesink") == 0) {
+        cfg->video_sink_preference = UV_VIDEO_SINK_XVIMAGE;
+        return TRUE;
+    }
+    if (g_ascii_strcasecmp(value, "autovideo") == 0 ||
+        g_ascii_strcasecmp(value, "autovideosink") == 0 ||
+        g_ascii_strcasecmp(value, "auto-video") == 0) {
+        cfg->video_sink_preference = UV_VIDEO_SINK_AUTOVIDEO;
+        return TRUE;
+    }
+    if (g_ascii_strcasecmp(value, "fakesink") == 0) {
+        cfg->video_sink_preference = UV_VIDEO_SINK_FAKESINK;
         return TRUE;
     }
     return FALSE;
@@ -101,6 +144,12 @@ static gboolean parse_args(int argc, char **argv, UvViewerConfig *cfg) {
             const char *choice = argv[++i];
             if (!parse_decoder_option(choice, cfg)) {
                 g_printerr("Unknown decoder option: %s\n", choice);
+                return FALSE;
+            }
+        } else if (!strcmp(argv[i], "--video-sink") && i + 1 < argc) {
+            const char *sink_choice = argv[++i];
+            if (!parse_video_sink_option(sink_choice, cfg)) {
+                g_printerr("Unknown video sink option: %s\n", sink_choice);
                 return FALSE;
             }
         } else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {

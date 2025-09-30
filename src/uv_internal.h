@@ -114,6 +114,7 @@ typedef struct {
     guint videorate_fps_num;
     guint videorate_fps_den;
     UvDecoderPreference decoder_preference;
+    UvVideoSinkPreference video_sink_preference;
     gboolean audio_enabled;
     guint audio_payload_type;
     guint audio_clock_rate;
@@ -155,6 +156,8 @@ typedef struct {
     guint bus_watch_id;
     gulong decoder_probe_id;
     gboolean sink_is_fakesink;
+    GPtrArray *sink_factories;
+    guint sink_factory_index;
     gulong audio_probe_id;
     gboolean audio_sink_is_fakesink;
     gint64 audio_last_buffer_us;
