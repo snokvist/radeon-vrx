@@ -17,6 +17,16 @@
 #define FRAME_BLOCK_DEFAULT_SIZE_ORANGE_KB  64.0
 #define FRAME_BLOCK_MISSING_SENTINEL (-1.0)
 
+typedef enum {
+    STATS_METRIC_RATE = 0,
+    STATS_METRIC_LOST,
+    STATS_METRIC_DUP,
+    STATS_METRIC_REORDER,
+    STATS_METRIC_JITTER,
+    STATS_METRIC_FPS,
+    STATS_METRIC_COUNT
+} StatsMetric;
+
 typedef struct {
     UvViewer **viewer_slot;
     UvViewer *viewer;
@@ -111,16 +121,6 @@ typedef struct {
     char *address;
     char *error_message;
 } UiEvent;
-
-typedef enum {
-    STATS_METRIC_RATE = 0,
-    STATS_METRIC_LOST,
-    STATS_METRIC_DUP,
-    STATS_METRIC_REORDER,
-    STATS_METRIC_JITTER,
-    STATS_METRIC_FPS,
-    STATS_METRIC_COUNT
-} StatsMetric;
 
 typedef struct {
     double timestamp;
