@@ -2383,10 +2383,14 @@ static void stats_chart_draw(GtkDrawingArea *area, cairo_t *cr, int width, int h
         return;
     }
 
-    if (min_val == max_val) {
-        double delta = fabs(min_val) > 1.0 ? fabs(min_val) * 0.05 : 1.0;
-        min_val -= delta;
-        max_val += delta;
+    double axis_min = 0.0;
+    double axis_max = max_val;
+    if (!isfinite(axis_max) || axis_max < axis_min) {
+        axis_max = axis_min;
+    }
+    if (axis_max == axis_min) {
+        double delta = axis_max > 1.0 ? axis_max * 0.05 : 1.0;
+        axis_max += delta;
     }
 
     const double padding = 12.0;
@@ -2411,7 +2415,12 @@ static void stats_chart_draw(GtkDrawingArea *area, cairo_t *cr, int width, int h
         if (x_ratio > 1.0) x_ratio = 1.0;
         double x = padding + x_ratio * plot_width;
         double value = stats_metric_value(sample, metric);
-        double y_ratio = (value - min_val) / (max_val - min_val);
+        double y_ratio = (value - axis_min) / (axis_max - axis_min);
+        if (y_ratio < 0.0) {
+            y_ratio = 0.0;
+        } else if (y_ratio > 1.0) {
+            y_ratio = 1.0;
+        }
         double y = padding + (1.0 - y_ratio) * plot_height;
         if (!path_started) {
             cairo_move_to(cr, x, y);
@@ -2426,16 +2435,34 @@ static void stats_chart_draw(GtkDrawingArea *area, cairo_t *cr, int width, int h
     cairo_set_source_rgb(cr, 0.85, 0.85, 0.85);
     cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
     cairo_set_font_size(cr, 12.0);
-    char label[64];
+
+    char latest_label[64];
+    char max_label[64];
     if (metric == STATS_METRIC_RATE) {
-        char formatted[32];
-        format_bitrate(latest_value, formatted, sizeof(formatted));
-        g_snprintf(label, sizeof(label), "%s", formatted);
+        char formatted_live[32];
+        char formatted_max[32];
+        format_bitrate(latest_value, formatted_live, sizeof(formatted_live));
+        format_bitrate(max_val, formatted_max, sizeof(formatted_max));
+        g_snprintf(latest_label, sizeof(latest_label), "Live: %s", formatted_live);
+        g_snprintf(max_label, sizeof(max_label), "Max: %s", formatted_max);
     } else {
-        g_snprintf(label, sizeof(label), "%.2f", latest_value);
+        g_snprintf(latest_label, sizeof(latest_label), "Live: %.2f", latest_value);
+        g_snprintf(max_label, sizeof(max_label), "Max: %.2f", max_val);
     }
-    cairo_move_to(cr, padding, padding + 12.0);
-    cairo_show_text(cr, label);
+
+    cairo_text_extents_t live_extents;
+    cairo_text_extents(cr, latest_label, &live_extents);
+    double live_x = padding + plot_width - (live_extents.width + live_extents.x_bearing);
+    double live_y = padding + 12.0;
+    cairo_move_to(cr, live_x, live_y);
+    cairo_show_text(cr, latest_label);
+
+    cairo_text_extents_t max_extents;
+    cairo_text_extents(cr, max_label, &max_extents);
+    double max_x = padding + plot_width - (max_extents.width + max_extents.x_bearing);
+    double max_y = live_y + 14.0;
+    cairo_move_to(cr, max_x, max_y);
+    cairo_show_text(cr, max_label);
 
     cairo_restore(cr);
 }
