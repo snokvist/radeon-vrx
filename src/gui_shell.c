@@ -2393,17 +2393,48 @@ static void stats_chart_draw(GtkDrawingArea *area, cairo_t *cr, int width, int h
         axis_max += delta;
     }
 
-    const double padding = 12.0;
-    double plot_width = MAX(1.0, width - 2 * padding);
-    double plot_height = MAX(1.0, height - 2 * padding);
+    const double left_margin = 80.0;
+    const double right_margin = 12.0;
+    const double top_margin = 12.0;
+    const double bottom_margin = 24.0;
+    double plot_width = MAX(1.0, width - (left_margin + right_margin));
+    double plot_height = MAX(1.0, height - (top_margin + bottom_margin));
+    double plot_left = left_margin;
+    double plot_top = top_margin;
+    double plot_bottom = plot_top + plot_height;
+    double plot_right = plot_left + plot_width;
 
+    const int tick_count = 4;
     cairo_set_source_rgba(cr, 1, 1, 1, 0.1);
-    for (int i = 1; i < 4; i++) {
-        double y = padding + (plot_height / 4.0) * i;
-        cairo_move_to(cr, padding, y);
-        cairo_line_to(cr, padding + plot_width, y);
+    for (int i = 0; i <= tick_count; i++) {
+        double y = plot_bottom - (plot_height / tick_count) * i;
+        cairo_move_to(cr, plot_left, y);
+        cairo_line_to(cr, plot_right, y);
     }
     cairo_stroke(cr);
+
+    cairo_set_source_rgb(cr, 0.8, 0.8, 0.85);
+    cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
+    cairo_set_font_size(cr, 11.0);
+    for (int i = 0; i <= tick_count; i++) {
+        double fraction = (double)i / (double)tick_count;
+        double value = axis_min + (axis_max - axis_min) * fraction;
+        double y = plot_bottom - plot_height * fraction;
+
+        char label[64];
+        if (metric == STATS_METRIC_RATE) {
+            format_bitrate(value, label, sizeof(label));
+        } else {
+            g_snprintf(label, sizeof(label), "%.2f", value);
+        }
+
+        cairo_text_extents_t label_extents;
+        cairo_text_extents(cr, label, &label_extents);
+        double text_x = plot_left - 10.0 - (label_extents.width + label_extents.x_bearing);
+        double text_y = y + (label_extents.height / 2.0) - label_extents.y_bearing;
+        cairo_move_to(cr, text_x, text_y);
+        cairo_show_text(cr, label);
+    }
 
     cairo_set_source_rgb(cr, 0.3, 0.7, 1.0);
     cairo_set_line_width(cr, 1.5);
@@ -2413,7 +2444,7 @@ static void stats_chart_draw(GtkDrawingArea *area, cairo_t *cr, int width, int h
         double x_ratio = (sample->timestamp - start_time) / range;
         if (x_ratio < 0.0) x_ratio = 0.0;
         if (x_ratio > 1.0) x_ratio = 1.0;
-        double x = padding + x_ratio * plot_width;
+        double x = plot_left + x_ratio * plot_width;
         double value = stats_metric_value(sample, metric);
         double y_ratio = (value - axis_min) / (axis_max - axis_min);
         if (y_ratio < 0.0) {
@@ -2421,7 +2452,7 @@ static void stats_chart_draw(GtkDrawingArea *area, cairo_t *cr, int width, int h
         } else if (y_ratio > 1.0) {
             y_ratio = 1.0;
         }
-        double y = padding + (1.0 - y_ratio) * plot_height;
+        double y = plot_bottom - y_ratio * plot_height;
         if (!path_started) {
             cairo_move_to(cr, x, y);
             path_started = TRUE;
@@ -2452,14 +2483,14 @@ static void stats_chart_draw(GtkDrawingArea *area, cairo_t *cr, int width, int h
 
     cairo_text_extents_t live_extents;
     cairo_text_extents(cr, latest_label, &live_extents);
-    double live_x = padding + plot_width - (live_extents.width + live_extents.x_bearing);
-    double live_y = padding + 12.0;
+    double live_x = plot_right - (live_extents.width + live_extents.x_bearing);
+    double live_y = plot_top + 12.0;
     cairo_move_to(cr, live_x, live_y);
     cairo_show_text(cr, latest_label);
 
     cairo_text_extents_t max_extents;
     cairo_text_extents(cr, max_label, &max_extents);
-    double max_x = padding + plot_width - (max_extents.width + max_extents.x_bearing);
+    double max_x = plot_right - (max_extents.width + max_extents.x_bearing);
     double max_y = live_y + 14.0;
     cairo_move_to(cr, max_x, max_y);
     cairo_show_text(cr, max_label);
