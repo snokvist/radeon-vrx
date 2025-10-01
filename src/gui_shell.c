@@ -53,7 +53,9 @@ typedef struct {
     GtkCheckButton *jitter_post_drop_toggle;
     GtkNotebook *notebook;
     GtkDropDown *stats_range_dropdown;
-    GtkDrawingArea *stats_charts[6];
+    GtkDrawingArea *stats_charts[STATS_METRIC_COUNT];
+    GtkLabel *stats_live_labels[STATS_METRIC_COUNT];
+    GtkLabel *stats_max_labels[STATS_METRIC_COUNT];
     double stats_range_seconds;
     GArray *stats_history;
     guint stats_timeout_id;
@@ -599,6 +601,7 @@ static void frame_block_sync_controls(GuiContext *ctx, const UvFrameBlockStats *
 static void frame_block_draw(GtkDrawingArea *area, cairo_t *cr, int width, int height, gpointer user_data) {
     (void)area;
     GuiContext *ctx = user_data;
+
     cairo_save(cr);
     cairo_rectangle(cr, 0, 0, width, height);
     cairo_set_source_rgb(cr, 0.12, 0.12, 0.12);
@@ -2109,7 +2112,7 @@ static GtkWidget *build_stats_page(GuiContext *ctx) {
     gtk_box_append(GTK_BOX(page), grid);
 
     static const char *titles[STATS_METRIC_COUNT] = {
-        "Inbound Rate (bps)",
+        "Inbound Rate (Mbps)",
         "RTP Lost Packets",
         "RTP Duplicate Packets",
         "RTP Reordered Packets",
@@ -2118,20 +2121,44 @@ static GtkWidget *build_stats_page(GuiContext *ctx) {
     };
 
     for (int i = 0; i < STATS_METRIC_COUNT; i++) {
-        GtkWidget *frame = gtk_frame_new(titles[i]);
+        GtkWidget *frame = gtk_frame_new(NULL);
         gtk_widget_set_hexpand(frame, TRUE);
         gtk_widget_set_vexpand(frame, TRUE);
         int row = i / 2;
         int col = i % 2;
         gtk_grid_attach(GTK_GRID(grid), frame, col, row, 1, 1);
 
+        GtkWidget *label_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+        gtk_widget_set_hexpand(label_box, TRUE);
+
+        GtkWidget *title_label = gtk_label_new(titles[i]);
+        gtk_label_set_xalign(GTK_LABEL(title_label), 0.0);
+        gtk_widget_set_hexpand(title_label, TRUE);
+        gtk_box_append(GTK_BOX(label_box), title_label);
+
+        GtkWidget *live_widget = gtk_label_new("Live: --");
+        gtk_label_set_xalign(GTK_LABEL(live_widget), 1.0);
+        gtk_widget_set_valign(live_widget, GTK_ALIGN_CENTER);
+        gtk_box_append(GTK_BOX(label_box), live_widget);
+
+        GtkWidget *max_widget = gtk_label_new("Max: --");
+        gtk_label_set_xalign(GTK_LABEL(max_widget), 1.0);
+        gtk_widget_set_valign(max_widget, GTK_ALIGN_CENTER);
+        gtk_box_append(GTK_BOX(label_box), max_widget);
+
+        gtk_frame_set_label_widget(GTK_FRAME(frame), label_box);
+
         GtkDrawingArea *area = GTK_DRAWING_AREA(gtk_drawing_area_new());
         gtk_widget_set_hexpand(GTK_WIDGET(area), TRUE);
         gtk_widget_set_vexpand(GTK_WIDGET(area), TRUE);
         gtk_drawing_area_set_draw_func(area, stats_chart_draw, ctx, NULL);
         g_object_set_data(G_OBJECT(area), "stats-metric", GINT_TO_POINTER(i));
+        g_object_set_data(G_OBJECT(area), "stats-live-label", live_widget);
+        g_object_set_data(G_OBJECT(area), "stats-max-label", max_widget);
         gtk_frame_set_child(GTK_FRAME(frame), GTK_WIDGET(area));
         ctx->stats_charts[i] = area;
+        ctx->stats_live_labels[i] = GTK_LABEL(live_widget);
+        ctx->stats_max_labels[i] = GTK_LABEL(max_widget);
     }
 
     return page;
@@ -2332,6 +2359,11 @@ static void stats_chart_draw(GtkDrawingArea *area, cairo_t *cr, int width, int h
     if (metric_val < 0 || metric_val >= STATS_METRIC_COUNT) return;
     StatsMetric metric = (StatsMetric)metric_val;
 
+    GtkLabel *live_value_label = GTK_LABEL(g_object_get_data(G_OBJECT(area), "stats-live-label"));
+    GtkLabel *max_value_label = GTK_LABEL(g_object_get_data(G_OBJECT(area), "stats-max-label"));
+    const char *default_live = "Live: --";
+    const char *default_max = "Max: --";
+
     cairo_save(cr);
     cairo_set_source_rgb(cr, 0.10, 0.10, 0.12);
     cairo_paint(cr);
@@ -2341,6 +2373,8 @@ static void stats_chart_draw(GtkDrawingArea *area, cairo_t *cr, int width, int h
     cairo_stroke(cr);
 
     if (!ctx->stats_history || ctx->stats_history->len == 0) {
+        if (live_value_label) gtk_label_set_text(live_value_label, default_live);
+        if (max_value_label) gtk_label_set_text(max_value_label, default_max);
         cairo_set_source_rgb(cr, 0.7, 0.7, 0.7);
         cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
         cairo_set_font_size(cr, 12.0);
@@ -2374,6 +2408,8 @@ static void stats_chart_draw(GtkDrawingArea *area, cairo_t *cr, int width, int h
     }
 
     if (min_val == G_MAXDOUBLE || max_val == -G_MAXDOUBLE) {
+        if (live_value_label) gtk_label_set_text(live_value_label, default_live);
+        if (max_value_label) gtk_label_set_text(max_value_label, default_max);
         cairo_set_source_rgb(cr, 0.7, 0.7, 0.7);
         cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
         cairo_set_font_size(cr, 12.0);
@@ -2423,7 +2459,8 @@ static void stats_chart_draw(GtkDrawingArea *area, cairo_t *cr, int width, int h
 
         char label[64];
         if (metric == STATS_METRIC_RATE) {
-            format_bitrate(value, label, sizeof(label));
+            double value_mbps = value / 1e6;
+            g_snprintf(label, sizeof(label), "%.2f", value_mbps);
         } else {
             g_snprintf(label, sizeof(label), "%.2f", value);
         }
@@ -2462,38 +2499,42 @@ static void stats_chart_draw(GtkDrawingArea *area, cairo_t *cr, int width, int h
     }
     cairo_stroke(cr);
 
-    double latest_value = stats_metric_value(&samples[len - 1], metric);
-    cairo_set_source_rgb(cr, 0.85, 0.85, 0.85);
-    cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
-    cairo_set_font_size(cr, 12.0);
-
-    char latest_label[64];
-    char max_label[64];
-    if (metric == STATS_METRIC_RATE) {
-        char formatted_live[32];
-        char formatted_max[32];
-        format_bitrate(latest_value, formatted_live, sizeof(formatted_live));
-        format_bitrate(max_val, formatted_max, sizeof(formatted_max));
-        g_snprintf(latest_label, sizeof(latest_label), "Live: %s", formatted_live);
-        g_snprintf(max_label, sizeof(max_label), "Max: %s", formatted_max);
-    } else {
-        g_snprintf(latest_label, sizeof(latest_label), "Live: %.2f", latest_value);
-        g_snprintf(max_label, sizeof(max_label), "Max: %.2f", max_val);
+    double latest_value = NAN;
+    for (gint i = (gint)len - 1; i >= (gint)start_index; i--) {
+        double candidate = stats_metric_value(&samples[i], metric);
+        if (isfinite(candidate)) {
+            latest_value = candidate;
+            break;
+        }
     }
 
-    cairo_text_extents_t live_extents;
-    cairo_text_extents(cr, latest_label, &live_extents);
-    double live_x = plot_right - (live_extents.width + live_extents.x_bearing);
-    double live_y = plot_top + 12.0;
-    cairo_move_to(cr, live_x, live_y);
-    cairo_show_text(cr, latest_label);
+    if (!isfinite(latest_value)) {
+        if (live_value_label) {
+            gtk_label_set_text(live_value_label, default_live);
+        }
+    } else if (metric == STATS_METRIC_RATE) {
+        double latest_mbps = latest_value / 1e6;
+        char latest_text[64];
+        g_snprintf(latest_text, sizeof(latest_text), "Live: %.2f Mbps", latest_mbps);
+        if (live_value_label) gtk_label_set_text(live_value_label, latest_text);
+    } else {
+        char latest_text[64];
+        g_snprintf(latest_text, sizeof(latest_text), "Live: %.2f", latest_value);
+        if (live_value_label) gtk_label_set_text(live_value_label, latest_text);
+    }
 
-    cairo_text_extents_t max_extents;
-    cairo_text_extents(cr, max_label, &max_extents);
-    double max_x = plot_right - (max_extents.width + max_extents.x_bearing);
-    double max_y = live_y + 14.0;
-    cairo_move_to(cr, max_x, max_y);
-    cairo_show_text(cr, max_label);
+    if (isfinite(max_val)) {
+        char max_text[64];
+        if (metric == STATS_METRIC_RATE) {
+            double max_mbps = max_val / 1e6;
+            g_snprintf(max_text, sizeof(max_text), "Max: %.2f Mbps", max_mbps);
+        } else {
+            g_snprintf(max_text, sizeof(max_text), "Max: %.2f", max_val);
+        }
+        if (max_value_label) gtk_label_set_text(max_value_label, max_text);
+    } else {
+        if (max_value_label) gtk_label_set_text(max_value_label, default_max);
+    }
 
     cairo_restore(cr);
 }
@@ -2605,6 +2646,8 @@ static void on_app_shutdown(GApplication *app, gpointer user_data) {
     ctx->stats_range_dropdown = NULL;
     for (int i = 0; i < STATS_METRIC_COUNT; i++) {
         ctx->stats_charts[i] = NULL;
+        ctx->stats_live_labels[i] = NULL;
+        ctx->stats_max_labels[i] = NULL;
     }
     if (ctx->frame_block_values_lateness) {
         g_array_free(ctx->frame_block_values_lateness, TRUE);
