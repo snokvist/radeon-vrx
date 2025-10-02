@@ -76,6 +76,8 @@ typedef struct {
     GtkDrawingArea *frame_block_area;
     GtkDrawingArea *frame_overlay_lateness;
     GtkDrawingArea *frame_overlay_size;
+    GtkLabel *frame_overlay_live_labels[2];
+    GtkLabel *frame_overlay_max_labels[2];
     GtkToggleButton *frame_block_enable_toggle;
     GtkToggleButton *frame_block_pause_toggle;
     GtkDropDown *frame_block_mode_dropdown;
@@ -733,6 +735,11 @@ static void frame_overlay_draw(GtkDrawingArea *area, cairo_t *cr, int width, int
         }
     }
 
+    GtkLabel *live_label = GTK_LABEL(g_object_get_data(G_OBJECT(area), "overlay-live-label"));
+    GtkLabel *max_label = GTK_LABEL(g_object_get_data(G_OBJECT(area), "overlay-max-label"));
+    const char *default_live = "Live: --";
+    const char *default_max = "Max: --";
+
     cairo_save(cr);
     cairo_set_source_rgb(cr, 0.10, 0.10, 0.12);
     cairo_paint(cr);
@@ -742,6 +749,8 @@ static void frame_overlay_draw(GtkDrawingArea *area, cairo_t *cr, int width, int
     cairo_stroke(cr);
 
     if (!ctx->stats_history || ctx->stats_history->len == 0) {
+        if (live_label) gtk_label_set_text(live_label, default_live);
+        if (max_label) gtk_label_set_text(max_label, default_max);
         cairo_set_source_rgb(cr, 0.7, 0.7, 0.7);
         cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
         cairo_set_font_size(cr, 12.0);
@@ -765,7 +774,6 @@ static void frame_overlay_draw(GtkDrawingArea *area, cairo_t *cr, int width, int
         start_index = len > 0 ? len - 1 : 0;
     }
 
-    double min_val = G_MAXDOUBLE;
     double max_val = -G_MAXDOUBLE;
     gboolean any_value = FALSE;
     gboolean missing_seen = FALSE;
@@ -777,12 +785,13 @@ static void frame_overlay_draw(GtkDrawingArea *area, cairo_t *cr, int width, int
             if (missing_flag) missing_seen = TRUE;
             continue;
         }
-        if (value < min_val) min_val = value;
         if (value > max_val) max_val = value;
         any_value = TRUE;
     }
 
     if (!any_value) {
+        if (live_label) gtk_label_set_text(live_label, default_live);
+        if (max_label) gtk_label_set_text(max_label, default_max);
         cairo_set_source_rgb(cr, 0.7, 0.7, 0.7);
         cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
         cairo_set_font_size(cr, 12.0);
@@ -792,27 +801,62 @@ static void frame_overlay_draw(GtkDrawingArea *area, cairo_t *cr, int width, int
         return;
     }
 
-    if (min_val == max_val) {
-        double delta = fabs(min_val) > 1.0 ? fabs(min_val) * 0.05 : 1.0;
-        min_val -= delta;
-        max_val += delta;
+    double peak_value = max_val;
+    if (!isfinite(peak_value)) {
+        peak_value = 0.0;
     }
 
-    const double padding = 12.0;
-    double plot_width = MAX(1.0, width - 2 * padding);
-    double plot_height = MAX(1.0, height - 2 * padding);
+    double axis_min = 0.0;
+    double axis_max = peak_value;
+    if (!isfinite(axis_max) || axis_max <= axis_min) {
+        axis_max = axis_min + 1.0;
+    }
 
+    const double left_margin = 60.0;
+    const double right_margin = 12.0;
+    const double top_margin = 16.0;
+    const double bottom_margin = 24.0;
+    double plot_width = MAX(1.0, width - (left_margin + right_margin));
+    double plot_height = MAX(1.0, height - (top_margin + bottom_margin));
+    double plot_left = left_margin;
+    double plot_top = top_margin;
+    double plot_bottom = plot_top + plot_height;
+    double plot_right = plot_left + plot_width;
+
+    const int tick_count = 4;
     cairo_set_source_rgba(cr, 1, 1, 1, 0.1);
-    for (int i = 1; i < 4; i++) {
-        double y = padding + (plot_height / 4.0) * i;
-        cairo_move_to(cr, padding, y);
-        cairo_line_to(cr, padding + plot_width, y);
+    for (int i = 0; i <= tick_count; i++) {
+        double y = plot_bottom - (plot_height / tick_count) * i;
+        cairo_move_to(cr, plot_left, y);
+        cairo_line_to(cr, plot_right, y);
     }
     cairo_stroke(cr);
+
+    cairo_set_source_rgb(cr, 0.8, 0.8, 0.85);
+    cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
+    cairo_set_font_size(cr, 11.0);
+    for (int i = 0; i <= tick_count; i++) {
+        double fraction = (double)i / (double)tick_count;
+        double value = axis_min + (axis_max - axis_min) * fraction;
+        double y = plot_bottom - plot_height * fraction;
+
+        char tick_label[64];
+        g_snprintf(tick_label, sizeof(tick_label), "%.2f", value);
+        cairo_text_extents_t label_extents;
+        cairo_text_extents(cr, tick_label, &label_extents);
+        double text_x = plot_left - 8.0 - (label_extents.width + label_extents.x_bearing);
+        double text_y = y + (label_extents.height / 2.0) - label_extents.y_bearing;
+        cairo_move_to(cr, text_x, text_y);
+        cairo_show_text(cr, tick_label);
+    }
 
     cairo_set_source_rgb(cr, 0.3, 0.7, 1.0);
     cairo_set_line_width(cr, 1.5);
     gboolean path_started = FALSE;
+    double axis_range = axis_max - axis_min;
+    if (axis_range <= 0.0) {
+        axis_range = 1.0;
+    }
     for (guint i = start_index; i < len; i++) {
         const StatsSample *sample = &samples[i];
         double value = 0.0;
@@ -822,13 +866,16 @@ static void frame_overlay_draw(GtkDrawingArea *area, cairo_t *cr, int width, int
             continue;
         }
 
+        if (value < axis_min) value = axis_min;
         double x_ratio = (sample->timestamp - start_time) / range;
         if (x_ratio < 0.0) x_ratio = 0.0;
         if (x_ratio > 1.0) x_ratio = 1.0;
-        double x = padding + x_ratio * plot_width;
+        double x = plot_left + x_ratio * plot_width;
 
-        double y_ratio = (value - min_val) / (max_val - min_val);
-        double y = padding + (1.0 - y_ratio) * plot_height;
+        double y_ratio = (value - axis_min) / axis_range;
+        if (y_ratio < 0.0) y_ratio = 0.0;
+        if (y_ratio > 1.0) y_ratio = 1.0;
+        double y = plot_bottom - y_ratio * plot_height;
 
         if (!path_started) {
             cairo_move_to(cr, x, y);
@@ -848,25 +895,35 @@ static void frame_overlay_draw(GtkDrawingArea *area, cairo_t *cr, int width, int
         }
     }
 
-    cairo_set_source_rgb(cr, 0.85, 0.85, 0.85);
-    cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
-    cairo_set_font_size(cr, 12.0);
-    char label[64];
-    if (isnan(latest_value)) {
-        g_strlcpy(label, "--", sizeof(label));
+    if (!isfinite(latest_value)) {
+        if (live_label) gtk_label_set_text(live_label, default_live);
     } else if (metric == FRAME_OVERLAY_METRIC_SIZE) {
-        g_snprintf(label, sizeof(label), "%.2f KB", latest_value);
+        char latest_text[64];
+        g_snprintf(latest_text, sizeof(latest_text), "Live: %.2f KB", latest_value);
+        if (live_label) gtk_label_set_text(live_label, latest_text);
     } else {
-        g_snprintf(label, sizeof(label), "%.2f ms", latest_value);
+        char latest_text[64];
+        g_snprintf(latest_text, sizeof(latest_text), "Live: %.2f ms", latest_value);
+        if (live_label) gtk_label_set_text(live_label, latest_text);
     }
-    cairo_move_to(cr, padding, padding + 12.0);
-    cairo_show_text(cr, label);
+
+    if (isfinite(peak_value)) {
+        char max_text[64];
+        if (metric == FRAME_OVERLAY_METRIC_SIZE) {
+            g_snprintf(max_text, sizeof(max_text), "Max: %.2f KB", peak_value);
+        } else {
+            g_snprintf(max_text, sizeof(max_text), "Max: %.2f ms", peak_value);
+        }
+        if (max_label) gtk_label_set_text(max_label, max_text);
+    } else if (max_label) {
+        gtk_label_set_text(max_label, default_max);
+    }
 
     if (missing_seen) {
         cairo_set_source_rgba(cr, 0.8, 0.6, 0.2, 0.8);
         cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
         cairo_set_font_size(cr, 11.0);
-        cairo_move_to(cr, padding, padding + 26.0);
+        cairo_move_to(cr, plot_left + 6.0, plot_top + 14.0);
         cairo_show_text(cr, "Missing frames present");
     }
 
@@ -2171,6 +2228,11 @@ static GtkWidget *build_frame_block_page(GuiContext *ctx) {
     gtk_widget_set_margin_end(content, 12);
     gtk_widget_set_margin_bottom(content, 12);
 
+    for (int i = 0; i < 2; i++) {
+        ctx->frame_overlay_live_labels[i] = NULL;
+        ctx->frame_overlay_max_labels[i] = NULL;
+    }
+
     GtkWidget *controls = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
     gtk_box_append(GTK_BOX(content), controls);
 
@@ -2276,9 +2338,27 @@ static GtkWidget *build_frame_block_page(GuiContext *ctx) {
     gtk_frame_set_child(GTK_FRAME(frame), drawing);
     gtk_box_append(GTK_BOX(content), frame);
 
-    GtkWidget *lateness_frame = gtk_frame_new("Frame Lateness Timeline");
+    GtkWidget *lateness_frame = gtk_frame_new(NULL);
     gtk_widget_set_hexpand(lateness_frame, TRUE);
     gtk_widget_set_vexpand(lateness_frame, FALSE);
+
+    GtkWidget *lateness_label_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    GtkWidget *lateness_title = gtk_label_new("Frame Lateness Timeline");
+    gtk_label_set_xalign(GTK_LABEL(lateness_title), 0.0);
+    gtk_widget_set_hexpand(lateness_title, TRUE);
+    gtk_box_append(GTK_BOX(lateness_label_box), lateness_title);
+
+    GtkWidget *lateness_live = gtk_label_new("Live: --");
+    gtk_label_set_xalign(GTK_LABEL(lateness_live), 1.0);
+    gtk_widget_set_valign(lateness_live, GTK_ALIGN_CENTER);
+    gtk_box_append(GTK_BOX(lateness_label_box), lateness_live);
+
+    GtkWidget *lateness_max = gtk_label_new("Max: --");
+    gtk_label_set_xalign(GTK_LABEL(lateness_max), 1.0);
+    gtk_widget_set_valign(lateness_max, GTK_ALIGN_CENTER);
+    gtk_box_append(GTK_BOX(lateness_label_box), lateness_max);
+
+    gtk_frame_set_label_widget(GTK_FRAME(lateness_frame), lateness_label_box);
 
     GtkWidget *lateness_area = gtk_drawing_area_new();
     ctx->frame_overlay_lateness = GTK_DRAWING_AREA(lateness_area);
@@ -2287,12 +2367,34 @@ static GtkWidget *build_frame_block_page(GuiContext *ctx) {
     gtk_widget_set_vexpand(lateness_area, FALSE);
     g_object_set_data(G_OBJECT(lateness_area), "overlay-metric", GUINT_TO_POINTER(FRAME_OVERLAY_METRIC_LATENESS));
     gtk_drawing_area_set_draw_func(ctx->frame_overlay_lateness, frame_overlay_draw, ctx, NULL);
+    g_object_set_data(G_OBJECT(lateness_area), "overlay-live-label", lateness_live);
+    g_object_set_data(G_OBJECT(lateness_area), "overlay-max-label", lateness_max);
+    ctx->frame_overlay_live_labels[FRAME_OVERLAY_METRIC_LATENESS] = GTK_LABEL(lateness_live);
+    ctx->frame_overlay_max_labels[FRAME_OVERLAY_METRIC_LATENESS] = GTK_LABEL(lateness_max);
     gtk_frame_set_child(GTK_FRAME(lateness_frame), lateness_area);
     gtk_box_append(GTK_BOX(content), lateness_frame);
 
-    GtkWidget *size_frame = gtk_frame_new("Frame Size Timeline");
+    GtkWidget *size_frame = gtk_frame_new(NULL);
     gtk_widget_set_hexpand(size_frame, TRUE);
     gtk_widget_set_vexpand(size_frame, FALSE);
+
+    GtkWidget *size_label_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    GtkWidget *size_title = gtk_label_new("Frame Size Timeline");
+    gtk_label_set_xalign(GTK_LABEL(size_title), 0.0);
+    gtk_widget_set_hexpand(size_title, TRUE);
+    gtk_box_append(GTK_BOX(size_label_box), size_title);
+
+    GtkWidget *size_live = gtk_label_new("Live: --");
+    gtk_label_set_xalign(GTK_LABEL(size_live), 1.0);
+    gtk_widget_set_valign(size_live, GTK_ALIGN_CENTER);
+    gtk_box_append(GTK_BOX(size_label_box), size_live);
+
+    GtkWidget *size_max = gtk_label_new("Max: --");
+    gtk_label_set_xalign(GTK_LABEL(size_max), 1.0);
+    gtk_widget_set_valign(size_max, GTK_ALIGN_CENTER);
+    gtk_box_append(GTK_BOX(size_label_box), size_max);
+
+    gtk_frame_set_label_widget(GTK_FRAME(size_frame), size_label_box);
 
     GtkWidget *size_area = gtk_drawing_area_new();
     ctx->frame_overlay_size = GTK_DRAWING_AREA(size_area);
@@ -2301,6 +2403,10 @@ static GtkWidget *build_frame_block_page(GuiContext *ctx) {
     gtk_widget_set_vexpand(size_area, FALSE);
     g_object_set_data(G_OBJECT(size_area), "overlay-metric", GUINT_TO_POINTER(FRAME_OVERLAY_METRIC_SIZE));
     gtk_drawing_area_set_draw_func(ctx->frame_overlay_size, frame_overlay_draw, ctx, NULL);
+    g_object_set_data(G_OBJECT(size_area), "overlay-live-label", size_live);
+    g_object_set_data(G_OBJECT(size_area), "overlay-max-label", size_max);
+    ctx->frame_overlay_live_labels[FRAME_OVERLAY_METRIC_SIZE] = GTK_LABEL(size_live);
+    ctx->frame_overlay_max_labels[FRAME_OVERLAY_METRIC_SIZE] = GTK_LABEL(size_max);
     gtk_frame_set_child(GTK_FRAME(size_frame), size_area);
     gtk_box_append(GTK_BOX(content), size_frame);
 
@@ -2429,7 +2535,7 @@ static void stats_chart_draw(GtkDrawingArea *area, cairo_t *cr, int width, int h
         axis_max += delta;
     }
 
-    const double left_margin = 80.0;
+    const double left_margin = 64.0;
     const double right_margin = 12.0;
     const double top_margin = 12.0;
     const double bottom_margin = 24.0;
@@ -2467,7 +2573,7 @@ static void stats_chart_draw(GtkDrawingArea *area, cairo_t *cr, int width, int h
 
         cairo_text_extents_t label_extents;
         cairo_text_extents(cr, label, &label_extents);
-        double text_x = plot_left - 10.0 - (label_extents.width + label_extents.x_bearing);
+        double text_x = plot_left - 8.0 - (label_extents.width + label_extents.x_bearing);
         double text_y = y + (label_extents.height / 2.0) - label_extents.y_bearing;
         cairo_move_to(cr, text_x, text_y);
         cairo_show_text(cr, label);
@@ -2585,6 +2691,12 @@ static void on_notebook_switch_page(GtkNotebook *notebook, GtkWidget *page, guin
         if (ctx->frame_block_area) {
             gtk_widget_queue_draw(GTK_WIDGET(ctx->frame_block_area));
         }
+        if (ctx->frame_overlay_lateness) {
+            gtk_widget_queue_draw(GTK_WIDGET(ctx->frame_overlay_lateness));
+        }
+        if (ctx->frame_overlay_size) {
+            gtk_widget_queue_draw(GTK_WIDGET(ctx->frame_overlay_size));
+        }
     }
 }
 
@@ -2660,6 +2772,10 @@ static void on_app_shutdown(GApplication *app, gpointer user_data) {
     ctx->frame_block_area = NULL;
     ctx->frame_overlay_lateness = NULL;
     ctx->frame_overlay_size = NULL;
+    for (int i = 0; i < 2; i++) {
+        ctx->frame_overlay_live_labels[i] = NULL;
+        ctx->frame_overlay_max_labels[i] = NULL;
+    }
     ctx->frame_block_enable_toggle = NULL;
     ctx->frame_block_pause_toggle = NULL;
     ctx->frame_block_mode_dropdown = NULL;
