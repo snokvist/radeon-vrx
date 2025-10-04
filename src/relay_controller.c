@@ -223,10 +223,15 @@ static void frame_block_state_record(UvFrameBlockState *state,
     }
 }
 
-static void addr_to_str(const struct sockaddr_in *sa, char *out, size_t outlen) {
+static void addr_to_str(const struct sockaddr_in *sa, int listen_port, char *out, size_t outlen) {
     char ip[INET_ADDRSTRLEN] = {0};
     inet_ntop(AF_INET, &sa->sin_addr, ip, sizeof(ip));
-    g_strlcpy(out, ip, outlen);
+    guint16 remote_port = ntohs(sa->sin_port);
+    if (listen_port > 0) {
+        g_snprintf(out, outlen, "%s:%u (local %d)", ip, remote_port, listen_port);
+    } else {
+        g_snprintf(out, outlen, "%s:%u", ip, remote_port);
+    }
 }
 
 static void relay_source_clear_stats(UvRelaySource *src, gboolean reset_totals) {
@@ -260,15 +265,18 @@ static void relay_source_clear_stats(UvRelaySource *src, gboolean reset_totals) 
     src->frame_block_accum_bytes = 0;
 }
 
-static bool relay_add_or_find(RelayController *rc, const struct sockaddr_in *from, socklen_t fromlen, int *out_idx) {
+static bool relay_add_or_find(RelayController *rc,
+                              const struct sockaddr_in *from,
+                              socklen_t fromlen,
+                              int listen_port,
+                              int *out_idx) {
     for (guint i = 0; i < rc->sources_count; i++) {
         UvRelaySource *slot = &rc->sources[i];
         if (!slot->in_use) continue;
         if (slot->addr.sin_family == from->sin_family &&
-            slot->addr.sin_addr.s_addr == from->sin_addr.s_addr) {
-            if (slot->addr.sin_port != from->sin_port) {
-                relay_source_clear_stats(slot, TRUE);
-            }
+            slot->listen_port == listen_port &&
+            slot->addr.sin_addr.s_addr == from->sin_addr.s_addr &&
+            slot->addr.sin_port == from->sin_port) {
             slot->addr = *from;
             slot->addrlen = fromlen;
             if (out_idx) *out_idx = (int)i;
@@ -281,6 +289,7 @@ static bool relay_add_or_find(RelayController *rc, const struct sockaddr_in *fro
     ns->addr = *from;
     ns->addrlen = fromlen;
     ns->in_use = TRUE;
+    ns->listen_port = listen_port;
     relay_source_clear_stats(ns, TRUE);
     if (out_idx) *out_idx = (int)rc->sources_count;
     rc->sources_count++;
@@ -680,7 +689,7 @@ static gpointer relay_thread_run(gpointer data) {
 
             g_mutex_lock(&rc->lock);
             int idx = -1;
-            bool is_new = relay_add_or_find(rc, &from, fromlen, &idx);
+            bool is_new = relay_add_or_find(rc, &from, fromlen, listener->port, &idx);
             UvRelaySource *src = NULL;
             if (idx >= 0 && (guint)idx < rc->sources_count) src = &rc->sources[idx];
             if (src) {
@@ -698,7 +707,7 @@ static gpointer relay_thread_run(gpointer data) {
             }
             if (is_new && src) {
                 char addr[64];
-                addr_to_str(&src->addr, addr, sizeof(addr));
+                addr_to_str(&src->addr, src->listen_port, addr, sizeof(addr));
                 uv_log_info("Relay: discovered source [%d] %s", idx, addr);
                 emit_added = TRUE;
                 emit_index = idx;
@@ -1030,7 +1039,7 @@ void relay_controller_snapshot(RelayController *rc, UvViewerStats *stats, int cl
         UvRelaySource *src = &rc->sources[i];
         if (!src->in_use) continue;
         UvSourceStats s = {0};
-        addr_to_str(&src->addr, s.address, sizeof(s.address));
+        addr_to_str(&src->addr, src->listen_port, s.address, sizeof(s.address));
         s.selected = (rc->selected_index == (int)i);
         s.rx_packets = src->rx_packets;
         s.rx_bytes = src->rx_bytes;

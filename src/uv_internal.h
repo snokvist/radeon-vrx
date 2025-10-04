@@ -21,6 +21,7 @@ typedef struct {
     struct sockaddr_in addr;
     socklen_t addrlen;
     bool in_use;
+    int listen_port;
 
     uint64_t rx_packets;
     uint64_t rx_bytes;

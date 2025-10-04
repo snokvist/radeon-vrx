@@ -2908,6 +2908,10 @@ static void on_app_shutdown(GApplication *app, gpointer user_data) {
         g_array_free(ctx->stats_history, TRUE);
         ctx->stats_history = NULL;
     }
+    if (ctx->session_ports) {
+        g_array_free(ctx->session_ports, TRUE);
+        ctx->session_ports = NULL;
+    }
     ctx->status_label = NULL;
     ctx->info_label = NULL;
     if (ctx->source_model) {
