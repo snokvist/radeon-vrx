@@ -61,6 +61,7 @@ typedef struct {
     UvRelaySource sources[UV_RELAY_MAX_SOURCES];
     guint sources_count;
     int selected_index;
+    gint64 last_select_us;
 
     GstAppSrc *appsrc;
 

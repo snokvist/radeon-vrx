@@ -16,6 +16,7 @@
 #define UV_FRAME_BLOCK_DEFAULT_SIZE_YELLOW_KB 256.0
 #define UV_FRAME_BLOCK_DEFAULT_SIZE_ORANGE_KB 512.0
 #define UV_FRAME_BLOCK_MISSING_SENTINEL (-1.0)
+#define UV_RELAY_SELECTION_DEBOUNCE_US G_GINT64_CONSTANT(1000000)
 
 typedef struct UvFrameBlockState {
     guint width;
@@ -532,14 +533,14 @@ static gpointer relay_thread_run(gpointer data) {
         return NULL;
     }
 
+    unsigned char *buf = NULL;
+    guint active_count = 0;
     struct pollfd *fds = g_new0(struct pollfd, port_count);
     uint16_t *local_ports = g_new0(uint16_t, port_count);
     if (!fds || !local_ports) {
         uv_log_error("Relay: failed to allocate poll structures");
         goto cleanup;
     }
-    unsigned char *buf = NULL;
-    guint active_count = 0;
 
     for (guint i = 0; i < port_count; i++) {
         int port = ports[i];
@@ -727,6 +728,7 @@ gboolean relay_controller_init(RelayController *rc, struct _UvViewer *viewer) {
         rc->extra_listen_ports[rc->extra_listen_port_count++] = port;
     }
     rc->selected_index = -1;
+    rc->last_select_us = 0;
     rc->viewer = viewer;
     rc->frame_block.enabled = FALSE;
     rc->frame_block.paused = FALSE;
@@ -783,27 +785,63 @@ void relay_controller_stop(RelayController *rc) {
 
 gboolean relay_controller_select(RelayController *rc, int index, GError **error) {
     g_return_val_if_fail(rc != NULL, FALSE);
-    gboolean valid = FALSE;
+    gboolean found = FALSE;
+    gboolean throttled = FALSE;
+    gboolean applied = FALSE;
+    gint64 wait_us = 0;
+    gint64 now_us = g_get_monotonic_time();
     UvRelaySource snapshot = {0};
+
     g_mutex_lock(&rc->lock);
     if (index >= 0 && (guint)index < rc->sources_count && rc->sources[index].in_use) {
-        rc->selected_index = index;
+        found = TRUE;
         UvRelaySource *selected_src = &rc->sources[index];
-        snapshot = *selected_src;
-        if (rc->frame_block.enabled) {
-            if (!selected_src->frame_block) {
-                selected_src->frame_block = frame_block_state_new(rc->frame_block.width, rc->frame_block.height);
-                frame_block_state_apply_lateness_thresholds(selected_src->frame_block, rc->frame_block.thresholds_ms);
-                frame_block_state_apply_size_thresholds(selected_src->frame_block, rc->frame_block.thresholds_kb);
+        gboolean change = (rc->selected_index != index);
+        if (change && rc->last_select_us > 0) {
+            gint64 elapsed = now_us - rc->last_select_us;
+            if (elapsed < UV_RELAY_SELECTION_DEBOUNCE_US) {
+                throttled = TRUE;
+                wait_us = UV_RELAY_SELECTION_DEBOUNCE_US - elapsed;
             }
-            frame_block_state_reset(selected_src->frame_block);
         }
-        selected_src->frame_block_accum_bytes = 0;
-        valid = TRUE;
+        if (!throttled) {
+            if (change) {
+                rc->selected_index = index;
+                rc->last_select_us = now_us;
+            }
+            if (rc->frame_block.enabled) {
+                if (!selected_src->frame_block) {
+                    selected_src->frame_block = frame_block_state_new(rc->frame_block.width, rc->frame_block.height);
+                    frame_block_state_apply_lateness_thresholds(selected_src->frame_block, rc->frame_block.thresholds_ms);
+                    frame_block_state_apply_size_thresholds(selected_src->frame_block, rc->frame_block.thresholds_kb);
+                }
+                frame_block_state_reset(selected_src->frame_block);
+            }
+            selected_src->frame_block_accum_bytes = 0;
+            snapshot = *selected_src;
+            applied = TRUE;
+        }
     }
     g_mutex_unlock(&rc->lock);
-    if (!valid) {
+
+    if (!found) {
         g_set_error(error, g_quark_from_static_string("uv-viewer"), 1, "Invalid source index %d", index);
+        return FALSE;
+    }
+    if (throttled) {
+        if (wait_us < 0) wait_us = 0;
+        int wait_ms = (int)((wait_us + 999) / 1000);
+        if (wait_ms <= 0) wait_ms = 1;
+        uv_log_warn("Relay: selection of source %d throttled (%d ms remaining)", index, wait_ms);
+        g_set_error(error,
+                    g_quark_from_static_string("uv-viewer"),
+                    3,
+                    "Selection throttled; wait %d ms",
+                    wait_ms);
+        return FALSE;
+    }
+    if (!applied) {
+        g_set_error(error, g_quark_from_static_string("uv-viewer"), 4, "Failed to apply source selection");
         return FALSE;
     }
     uv_internal_emit_event(rc->viewer, UV_VIEWER_EVENT_SOURCE_SELECTED, index, &snapshot, NULL);
@@ -812,33 +850,73 @@ gboolean relay_controller_select(RelayController *rc, int index, GError **error)
 
 gboolean relay_controller_select_next(RelayController *rc, GError **error) {
     g_return_val_if_fail(rc != NULL, FALSE);
-    gboolean success = FALSE;
+    gboolean have_sources = FALSE;
+    gboolean throttled = FALSE;
+    gboolean applied = FALSE;
+    gint64 wait_us = 0;
+    gint64 now_us = g_get_monotonic_time();
     int next_index = -1;
     UvRelaySource snapshot = {0};
+
     g_mutex_lock(&rc->lock);
     if (rc->sources_count > 0) {
-        if (rc->selected_index < 0) {
-            rc->selected_index = 0;
+        have_sources = TRUE;
+        int prev_index = rc->selected_index;
+        if (prev_index < 0) {
+            next_index = 0;
         } else {
-            rc->selected_index = (rc->selected_index + 1) % (int)rc->sources_count;
+            next_index = (prev_index + 1) % (int)rc->sources_count;
         }
-        next_index = rc->selected_index;
-        UvRelaySource *selected_src = &rc->sources[next_index];
-        snapshot = *selected_src;
-        if (rc->frame_block.enabled) {
-            if (!selected_src->frame_block) {
-                selected_src->frame_block = frame_block_state_new(rc->frame_block.width, rc->frame_block.height);
-                frame_block_state_apply_lateness_thresholds(selected_src->frame_block, rc->frame_block.thresholds_ms);
-                frame_block_state_apply_size_thresholds(selected_src->frame_block, rc->frame_block.thresholds_kb);
+        gboolean change = (next_index != prev_index);
+        if (change && rc->last_select_us > 0) {
+            gint64 elapsed = now_us - rc->last_select_us;
+            if (elapsed < UV_RELAY_SELECTION_DEBOUNCE_US) {
+                throttled = TRUE;
+                wait_us = UV_RELAY_SELECTION_DEBOUNCE_US - elapsed;
             }
-            frame_block_state_reset(selected_src->frame_block);
         }
-        selected_src->frame_block_accum_bytes = 0;
-        success = TRUE;
+        if (!throttled) {
+            if (change || rc->selected_index < 0) {
+                rc->selected_index = next_index;
+                rc->last_select_us = now_us;
+            }
+            if (rc->selected_index >= 0 && (guint)rc->selected_index < rc->sources_count) {
+                UvRelaySource *selected_src = &rc->sources[rc->selected_index];
+                if (rc->frame_block.enabled) {
+                    if (!selected_src->frame_block) {
+                        selected_src->frame_block = frame_block_state_new(rc->frame_block.width, rc->frame_block.height);
+                        frame_block_state_apply_lateness_thresholds(selected_src->frame_block, rc->frame_block.thresholds_ms);
+                        frame_block_state_apply_size_thresholds(selected_src->frame_block, rc->frame_block.thresholds_kb);
+                    }
+                    frame_block_state_reset(selected_src->frame_block);
+                }
+                selected_src->frame_block_accum_bytes = 0;
+                snapshot = *selected_src;
+                next_index = rc->selected_index;
+                applied = TRUE;
+            }
+        }
     }
     g_mutex_unlock(&rc->lock);
-    if (!success) {
+
+    if (!have_sources) {
         g_set_error(error, g_quark_from_static_string("uv-viewer"), 2, "No sources available");
+        return FALSE;
+    }
+    if (throttled) {
+        if (wait_us < 0) wait_us = 0;
+        int wait_ms = (int)((wait_us + 999) / 1000);
+        if (wait_ms <= 0) wait_ms = 1;
+        uv_log_warn("Relay: source cycling throttled (%d ms remaining)", wait_ms);
+        g_set_error(error,
+                    g_quark_from_static_string("uv-viewer"),
+                    3,
+                    "Selection throttled; wait %d ms",
+                    wait_ms);
+        return FALSE;
+    }
+    if (!applied) {
+        g_set_error(error, g_quark_from_static_string("uv-viewer"), 4, "Failed to select next source");
         return FALSE;
     }
     uv_internal_emit_event(rc->viewer, UV_VIEWER_EVENT_SOURCE_SELECTED, next_index, &snapshot, NULL);
