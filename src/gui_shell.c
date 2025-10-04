@@ -46,6 +46,7 @@ typedef struct {
     gboolean suppress_source_change;
     guint stats_refresh_interval_ms;
     GtkSpinButton *listen_port_spin;
+    GtkEntry *listen_extra_entry;
     GtkSpinButton *jitter_latency_spin;
     GtkCheckButton *sync_toggle_settings;
     GtkSpinButton *queue_max_buffers_spin;
@@ -935,6 +936,131 @@ static void update_status(GuiContext *ctx, const char *message) {
     gtk_label_set_text(ctx->status_label, message ? message : "");
 }
 
+static void format_listen_port_summary(const UvViewerConfig *cfg, char *out, size_t outlen) {
+    if (!out || outlen == 0) return;
+    if (!cfg) {
+        out[0] = '\0';
+        return;
+    }
+    gsize offset = 0;
+    if (cfg->listen_port > 0) {
+        offset = g_snprintf(out, outlen, "%d", cfg->listen_port);
+    }
+    for (guint i = 0; i < cfg->extra_listen_port_count; i++) {
+        int port = cfg->extra_listen_ports[i];
+        if (port <= 0) continue;
+        if (offset + 2 >= outlen) break;
+        if (offset > 0) {
+            out[offset++] = ',';
+            if (offset < outlen) out[offset++] = ' ';
+        }
+        offset += g_snprintf(out + offset, outlen - offset, "%d", port);
+        if (offset >= outlen) {
+            offset = outlen - 1;
+            break;
+        }
+    }
+    if (offset == 0 && outlen > 0) {
+        g_strlcpy(out, "(none)", outlen);
+    } else {
+        out[MIN(offset, outlen - 1)] = '\0';
+    }
+}
+
+static void format_extra_port_field(const UvViewerConfig *cfg, char *out, size_t outlen) {
+    if (!out || outlen == 0) return;
+    if (!cfg || cfg->extra_listen_port_count == 0) {
+        out[0] = '\0';
+        return;
+    }
+    gsize offset = 0;
+    for (guint i = 0; i < cfg->extra_listen_port_count; i++) {
+        int port = cfg->extra_listen_ports[i];
+        if (port <= 0) continue;
+        if (offset > 0) {
+            if (offset + 2 >= outlen) break;
+            out[offset++] = ',';
+            if (offset < outlen) out[offset++] = ' ';
+        }
+        offset += g_snprintf(out + offset, outlen - offset, "%d", port);
+        if (offset >= outlen) {
+            offset = outlen - 1;
+            break;
+        }
+    }
+    out[MIN(offset, outlen - 1)] = '\0';
+}
+
+static gboolean parse_extra_ports_text(const char *text,
+                                       int base_port,
+                                       UvViewerConfig *cfg,
+                                       char **error_message) {
+    if (!cfg) return FALSE;
+    cfg->extra_listen_port_count = 0;
+    for (guint i = 0; i < UV_VIEWER_MAX_EXTRA_LISTEN_PORTS; i++) {
+        cfg->extra_listen_ports[i] = 0;
+    }
+    if (!text || *text == '\0') return TRUE;
+
+    gchar **parts = g_strsplit_set(text, ",; ", -1);
+    if (!parts) return TRUE;
+
+    for (guint i = 0; parts[i] != NULL; i++) {
+        if (!parts[i]) continue;
+        char *token = g_strstrip(parts[i]);
+        if (!token || *token == '\0') continue;
+        char *endptr = NULL;
+        long value = strtol(token, &endptr, 10);
+        if (endptr == token || (endptr && *endptr != '\0')) {
+            if (error_message) {
+                *error_message = g_strdup_printf("Invalid port entry '%s'", parts[i]);
+            }
+            g_strfreev(parts);
+            return FALSE;
+        }
+        if (value <= 0 || value > 65535) {
+            if (error_message) {
+                *error_message = g_strdup_printf("Port out of range: %ld", value);
+            }
+            g_strfreev(parts);
+            return FALSE;
+        }
+        if ((int)value == base_port) {
+            continue;
+        }
+        gboolean duplicate = FALSE;
+        for (guint j = 0; j < cfg->extra_listen_port_count; j++) {
+            if (cfg->extra_listen_ports[j] == (int)value) {
+                duplicate = TRUE;
+                break;
+            }
+        }
+        if (duplicate) continue;
+        if (cfg->extra_listen_port_count >= UV_VIEWER_MAX_EXTRA_LISTEN_PORTS) {
+            if (error_message) {
+                *error_message = g_strdup_printf("Too many additional ports (max %u)",
+                                                UV_VIEWER_MAX_EXTRA_LISTEN_PORTS);
+            }
+            g_strfreev(parts);
+            return FALSE;
+        }
+        cfg->extra_listen_ports[cfg->extra_listen_port_count++] = (int)value;
+    }
+
+    g_strfreev(parts);
+    return TRUE;
+}
+
+static gboolean listen_port_config_equal(const UvViewerConfig *a, const UvViewerConfig *b) {
+    if (!a || !b) return FALSE;
+    if (a->listen_port != b->listen_port) return FALSE;
+    if (a->extra_listen_port_count != b->extra_listen_port_count) return FALSE;
+    for (guint i = 0; i < a->extra_listen_port_count; i++) {
+        if (a->extra_listen_ports[i] != b->extra_listen_ports[i]) return FALSE;
+    }
+    return TRUE;
+}
+
 static void update_info_label(GuiContext *ctx) {
     if (!ctx || !ctx->info_label) return;
     char info[160];
@@ -960,10 +1086,12 @@ static void update_info_label(GuiContext *ctx) {
     if (!decoder_pref) decoder_pref = "Auto";
     const char *sink_pref = video_sink_option_labels[video_sink_pref_to_index(cfg->video_sink_preference)];
     if (!sink_pref) sink_pref = "Auto";
+    char port_summary[96];
+    format_listen_port_summary(cfg, port_summary, sizeof(port_summary));
     g_snprintf(info, sizeof(info),
-               "Listening on %d | PT %d | Clock %d | %s | Jitter %ums | Queue buffers %u"
+               "Listening on %s | PT %d | Clock %d | %s | Jitter %ums | Queue buffers %u"
                " | drop=%s | lost=%s | bus-msg=%s | videorate=%s | decoder=%s | sink=%s | audio=%s",
-               cfg->listen_port,
+               port_summary,
                cfg->payload_type,
                cfg->clock_rate,
                cfg->sync_to_clock ? "sync" : "no-sync",
@@ -983,6 +1111,11 @@ static void sync_settings_controls(GuiContext *ctx) {
     if (!ctx) return;
     if (ctx->listen_port_spin) {
         gtk_spin_button_set_value(ctx->listen_port_spin, ctx->current_cfg.listen_port);
+    }
+    if (ctx->listen_extra_entry) {
+        char extras[96];
+        format_extra_port_field(&ctx->current_cfg, extras, sizeof(extras));
+        gtk_editable_set_text(GTK_EDITABLE(ctx->listen_extra_entry), extras);
     }
     if (ctx->jitter_latency_spin) {
         gtk_spin_button_set_value(ctx->jitter_latency_spin, ctx->current_cfg.jitter_latency_ms);
@@ -1619,7 +1752,7 @@ static void on_frame_block_color_toggled(GtkCheckButton *check, gpointer user_da
 static gboolean gui_restart_with_config(GuiContext *ctx, const UvViewerConfig *cfg) {
     if (!ctx || !ctx->viewer || !cfg) return FALSE;
 
-    if (cfg->listen_port == ctx->current_cfg.listen_port &&
+    if (listen_port_config_equal(cfg, &ctx->current_cfg) &&
         cfg->sync_to_clock == ctx->current_cfg.sync_to_clock &&
         cfg->jitter_latency_ms == ctx->current_cfg.jitter_latency_ms &&
         cfg->queue_max_buffers == ctx->current_cfg.queue_max_buffers &&
@@ -1714,6 +1847,15 @@ static void on_settings_apply_clicked(GtkButton *button, gpointer user_data) {
     if (ctx->listen_port_spin) {
         new_cfg.listen_port = gtk_spin_button_get_value_as_int(ctx->listen_port_spin);
         if (new_cfg.listen_port < 1) new_cfg.listen_port = 1;
+    }
+    if (ctx->listen_extra_entry) {
+        const char *extra_text = gtk_editable_get_text(GTK_EDITABLE(ctx->listen_extra_entry));
+        char *parse_error = NULL;
+        if (!parse_extra_ports_text(extra_text, new_cfg.listen_port, &new_cfg, &parse_error)) {
+            update_status(ctx, parse_error ? parse_error : "Invalid additional ports");
+            g_free(parse_error);
+            return;
+        }
     }
     if (ctx->jitter_latency_spin) {
         new_cfg.jitter_latency_ms = gtk_spin_button_get_value_as_int(ctx->jitter_latency_spin);
@@ -2015,59 +2157,68 @@ static GtkWidget *build_settings_page(GuiContext *ctx) {
     ctx->listen_port_spin = GTK_SPIN_BUTTON(gtk_spin_button_new_with_range(1, 65535, 1));
     gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(ctx->listen_port_spin), 1, 0, 1, 1);
 
+    GtkWidget *listen_extra_label = gtk_label_new("Additional Ports:");
+    gtk_label_set_xalign(GTK_LABEL(listen_extra_label), 0.0);
+    gtk_grid_attach(GTK_GRID(grid), listen_extra_label, 0, 1, 1, 1);
+
+    ctx->listen_extra_entry = GTK_ENTRY(gtk_entry_new());
+    gtk_widget_set_hexpand(GTK_WIDGET(ctx->listen_extra_entry), TRUE);
+    gtk_entry_set_placeholder_text(ctx->listen_extra_entry, "e.g. 5601, 5602");
+    gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(ctx->listen_extra_entry), 1, 1, 1, 1);
+
     GtkWidget *sync_label = gtk_label_new("Sync to clock:");
     gtk_label_set_xalign(GTK_LABEL(sync_label), 0.0);
-    gtk_grid_attach(GTK_GRID(grid), sync_label, 0, 1, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid), sync_label, 0, 2, 1, 1);
 
     ctx->sync_toggle_settings = GTK_CHECK_BUTTON(gtk_check_button_new());
-    gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(ctx->sync_toggle_settings), 1, 1, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(ctx->sync_toggle_settings), 1, 2, 1, 1);
 
     GtkWidget *jitter_label = gtk_label_new("Jitter Latency (ms):");
     gtk_label_set_xalign(GTK_LABEL(jitter_label), 0.0);
-    gtk_grid_attach(GTK_GRID(grid), jitter_label, 0, 2, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid), jitter_label, 0, 3, 1, 1);
 
     ctx->jitter_latency_spin = GTK_SPIN_BUTTON(gtk_spin_button_new_with_range(1, 500, 1));
-    gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(ctx->jitter_latency_spin), 1, 2, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(ctx->jitter_latency_spin), 1, 3, 1, 1);
 
     GtkWidget *queue_label = gtk_label_new("Max Queue Buffers:");
     gtk_label_set_xalign(GTK_LABEL(queue_label), 0.0);
-    gtk_grid_attach(GTK_GRID(grid), queue_label, 0, 3, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid), queue_label, 0, 4, 1, 1);
 
     ctx->queue_max_buffers_spin = GTK_SPIN_BUTTON(gtk_spin_button_new_with_range(0, 2000, 1));
-    gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(ctx->queue_max_buffers_spin), 1, 3, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(ctx->queue_max_buffers_spin), 1, 4, 1, 1);
 
     GtkWidget *stats_refresh_label = gtk_label_new("Stats Refresh (ms):");
     gtk_label_set_xalign(GTK_LABEL(stats_refresh_label), 0.0);
-    gtk_grid_attach(GTK_GRID(grid), stats_refresh_label, 0, 4, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid), stats_refresh_label, 0, 5, 1, 1);
 
     ctx->stats_refresh_spin = GTK_SPIN_BUTTON(gtk_spin_button_new_with_range(50, 5000, 10));
     gtk_spin_button_set_increments(ctx->stats_refresh_spin, 10, 100);
-    gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(ctx->stats_refresh_spin), 1, 4, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(ctx->stats_refresh_spin), 1, 5, 1, 1);
 
     GtkWidget *decoder_label = gtk_label_new("Decoder:");
     gtk_label_set_xalign(GTK_LABEL(decoder_label), 0.0);
-    gtk_grid_attach(GTK_GRID(grid), decoder_label, 0, 5, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid), decoder_label, 0, 6, 1, 1);
 
     ctx->decoder_dropdown = GTK_DROP_DOWN(gtk_drop_down_new_from_strings(decoder_option_labels));
     gtk_drop_down_set_selected(ctx->decoder_dropdown,
                                decoder_pref_to_index(ctx->current_cfg.decoder_preference));
-    gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(ctx->decoder_dropdown), 1, 5, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(ctx->decoder_dropdown), 1, 6, 1, 1);
 
     GtkWidget *sink_label = gtk_label_new("Video Sink:");
     gtk_label_set_xalign(GTK_LABEL(sink_label), 0.0);
-    gtk_grid_attach(GTK_GRID(grid), sink_label, 0, 6, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid), sink_label, 0, 7, 1, 1);
 
     ctx->sink_dropdown = GTK_DROP_DOWN(gtk_drop_down_new_from_strings(video_sink_option_labels));
     gtk_drop_down_set_selected(ctx->sink_dropdown,
                                video_sink_pref_to_index(ctx->current_cfg.video_sink_preference));
-    gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(ctx->sink_dropdown), 1, 6, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(ctx->sink_dropdown), 1, 7, 1, 1);
 
     GtkWidget *videorate_label = gtk_label_new("Videorate:");
     gtk_label_set_xalign(GTK_LABEL(videorate_label), 0.0);
-    gtk_grid_attach(GTK_GRID(grid), videorate_label, 0, 7, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid), videorate_label, 0, 8, 1, 1);
 
     GtkWidget *videorate_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
-    gtk_grid_attach(GTK_GRID(grid), videorate_box, 1, 7, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid), videorate_box, 1, 8, 1, 1);
 
     ctx->videorate_toggle = GTK_CHECK_BUTTON(gtk_check_button_new_with_label("Enable"));
     gtk_box_append(GTK_BOX(videorate_box), GTK_WIDGET(ctx->videorate_toggle));
@@ -2088,10 +2239,10 @@ static GtkWidget *build_settings_page(GuiContext *ctx) {
 
     GtkWidget *audio_label = gtk_label_new("Audio:");
     gtk_label_set_xalign(GTK_LABEL(audio_label), 0.0);
-    gtk_grid_attach(GTK_GRID(grid), audio_label, 0, 8, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid), audio_label, 0, 9, 1, 1);
 
     GtkWidget *audio_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
-    gtk_grid_attach(GTK_GRID(grid), audio_box, 1, 8, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid), audio_box, 1, 9, 1, 1);
 
     ctx->audio_toggle = GTK_CHECK_BUTTON(gtk_check_button_new_with_label("Enable"));
     gtk_box_append(GTK_BOX(audio_box), GTK_WIDGET(ctx->audio_toggle));
@@ -2112,13 +2263,13 @@ static GtkWidget *build_settings_page(GuiContext *ctx) {
     gtk_box_append(GTK_BOX(audio_box), GTK_WIDGET(ctx->audio_jitter_spin));
 
     ctx->jitter_drop_toggle = GTK_CHECK_BUTTON(gtk_check_button_new_with_label("Drop packets exceeding latency"));
-    gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(ctx->jitter_drop_toggle), 0, 9, 2, 1);
+    gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(ctx->jitter_drop_toggle), 0, 10, 2, 1);
 
     ctx->jitter_do_lost_toggle = GTK_CHECK_BUTTON(gtk_check_button_new_with_label("Emit lost packet notifications"));
-    gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(ctx->jitter_do_lost_toggle), 0, 10, 2, 1);
+    gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(ctx->jitter_do_lost_toggle), 0, 11, 2, 1);
 
     ctx->jitter_post_drop_toggle = GTK_CHECK_BUTTON(gtk_check_button_new_with_label("Post drop messages on bus"));
-    gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(ctx->jitter_post_drop_toggle), 0, 11, 2, 1);
+    gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(ctx->jitter_post_drop_toggle), 0, 12, 2, 1);
 
     GtkWidget *apply_button = gtk_button_new_with_label("Apply Settings");
     g_signal_connect(apply_button, "clicked", G_CALLBACK(on_settings_apply_clicked), ctx);
@@ -2740,6 +2891,7 @@ static void on_app_shutdown(GApplication *app, gpointer user_data) {
     ctx->sources_frame = NULL;
     ctx->sources_toggle = NULL;
     ctx->listen_port_spin = NULL;
+    ctx->listen_extra_entry = NULL;
     ctx->jitter_latency_spin = NULL;
     ctx->sync_toggle_settings = NULL;
     ctx->queue_max_buffers_spin = NULL;

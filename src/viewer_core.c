@@ -16,6 +16,10 @@ static void uv_viewer_init_struct(UvViewer *viewer, const UvViewerConfig *cfg) {
 void uv_viewer_config_init(UvViewerConfig *cfg) {
     if (!cfg) return;
     cfg->listen_port = 5600;
+    cfg->extra_listen_port_count = 0;
+    for (guint i = 0; i < UV_VIEWER_MAX_EXTRA_LISTEN_PORTS; i++) {
+        cfg->extra_listen_ports[i] = 0;
+    }
     cfg->payload_type = 97;
     cfg->clock_rate = 90000;
     cfg->sync_to_clock = FALSE;

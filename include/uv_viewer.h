@@ -9,6 +9,7 @@
 G_BEGIN_DECLS
 
 #define UV_VIEWER_ADDR_MAX 64
+#define UV_VIEWER_MAX_EXTRA_LISTEN_PORTS 8
 
 typedef struct _UvViewer UvViewer;
 
@@ -31,7 +32,9 @@ typedef enum {
 } UvVideoSinkPreference;
 
 typedef struct {
-    int listen_port;   // UDP port to bind (default: 5600)
+    int listen_port;   // Primary UDP port to bind (default: 5600)
+    guint extra_listen_port_count; // number of additional ports in extra_listen_ports
+    int extra_listen_ports[UV_VIEWER_MAX_EXTRA_LISTEN_PORTS];
     int payload_type;  // RTP payload type (default: 97)
     int clock_rate;    // RTP clock rate (default: 90000)
     bool sync_to_clock; // TRUE to let sink sync to clock

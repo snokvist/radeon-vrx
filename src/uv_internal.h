@@ -21,6 +21,7 @@ typedef struct {
     struct sockaddr_in addr;
     socklen_t addrlen;
     bool in_use;
+    uint16_t local_port;
 
     uint64_t rx_packets;
     uint64_t rx_bytes;
@@ -51,6 +52,8 @@ typedef struct {
 
 typedef struct {
     int listen_port;
+    guint extra_listen_port_count;
+    int extra_listen_ports[UV_VIEWER_MAX_EXTRA_LISTEN_PORTS];
     GThread *thread;
     volatile sig_atomic_t running;
     volatile sig_atomic_t push_enabled;

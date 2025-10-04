@@ -5,7 +5,7 @@
 #include <string.h>
 
 static void print_usage(const char *argv0) {
-    g_printerr("Usage: %s [--listen-port N] [--payload PT] [--clockrate Hz] [--sync|--no-sync]"
+    g_printerr("Usage: %s [--listen-port N] [--listen-extra-port N] [--payload PT] [--clockrate Hz] [--sync|--no-sync]"
                " [--videorate] [--no-videorate] [--videorate-fps NUM[/DEN]]"
                " [--audio] [--no-audio] [--audio-payload PT] [--audio-clockrate Hz]"
                " [--audio-jitter ms] [--decoder auto|intel|nvidia|vaapi|software]"
@@ -84,6 +84,30 @@ static gboolean parse_args(int argc, char **argv, UvViewerConfig *cfg) {
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--listen-port") && i + 1 < argc) {
             cfg->listen_port = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "--listen-extra-port") && i + 1 < argc) {
+            int port = atoi(argv[++i]);
+            if (port <= 0 || port > 65535) {
+                g_printerr("Invalid extra listen port: %d\n", port);
+                return FALSE;
+            }
+            if (port == cfg->listen_port) continue;
+            gboolean duplicate = FALSE;
+            for (guint j = 0; j < cfg->extra_listen_port_count; j++) {
+                if (cfg->extra_listen_ports[j] == port) {
+                    duplicate = TRUE;
+                    break;
+                }
+            }
+            if (duplicate) continue;
+            if (cfg->extra_listen_port_count >= UV_VIEWER_MAX_EXTRA_LISTEN_PORTS) {
+                g_printerr("Too many extra listen ports (max %u)\n",
+                           UV_VIEWER_MAX_EXTRA_LISTEN_PORTS);
+                return FALSE;
+            }
+            cfg->extra_listen_ports[cfg->extra_listen_port_count++] = port;
+        } else if (!strcmp(argv[i], "--listen-extra-port")) {
+            g_printerr("Missing argument for --listen-extra-port\n");
+            return FALSE;
         } else if (!strcmp(argv[i], "--payload") && i + 1 < argc) {
             cfg->payload_type = atoi(argv[++i]);
         } else if (!strcmp(argv[i], "--clockrate") && i + 1 < argc) {

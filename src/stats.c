@@ -9,10 +9,25 @@ static void qos_stats_free(gpointer data) {
     g_free(data);
 }
 
-static void addr_to_str(const struct sockaddr_in *sa, char *out, size_t outlen) {
+static void format_source_label(const struct sockaddr_in *sa,
+                                uint16_t local_port,
+                                char *out,
+                                size_t outlen) {
+    if (!sa || !out || outlen == 0) return;
     char ip[INET_ADDRSTRLEN] = {0};
     inet_ntop(AF_INET, &sa->sin_addr, ip, sizeof(ip));
-    g_strlcpy(out, ip, outlen);
+    guint remote_port = ntohs(sa->sin_port);
+    if (local_port > 0) {
+        if (remote_port > 0) {
+            g_snprintf(out, outlen, "%s:%u (local %u)", ip, remote_port, (guint)local_port);
+        } else {
+            g_snprintf(out, outlen, "%s (local %u)", ip, (guint)local_port);
+        }
+    } else if (remote_port > 0) {
+        g_snprintf(out, outlen, "%s:%u", ip, remote_port);
+    } else {
+        g_strlcpy(out, ip, outlen);
+    }
 }
 
 void uv_internal_decoder_stats_reset(DecoderStats *stats) {
@@ -130,7 +145,7 @@ void uv_internal_qos_db_snapshot(QoSDatabase *db, UvViewerStats *stats) {
 
 static void populate_source_snapshot(const UvRelaySource *src, int clock_rate, UvSourceStats *out) {
     if (!src || !out) return;
-    addr_to_str(&src->addr, out->address, sizeof(out->address));
+    format_source_label(&src->addr, src->local_port, out->address, sizeof(out->address));
     out->rx_packets = src->rx_packets;
     out->rx_bytes = src->rx_bytes;
     out->forwarded_packets = src->forwarded_packets;

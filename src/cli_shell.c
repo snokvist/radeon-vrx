@@ -248,6 +248,33 @@ static void install_signal_handlers(void) {
     sigaction(SIGTERM, &sa, NULL);
 }
 
+static void format_listen_ports(const UvViewerConfig *cfg, char *out, size_t outlen) {
+    if (!out || outlen == 0) return;
+    if (!cfg) {
+        out[0] = '\0';
+        return;
+    }
+    gsize offset = 0;
+    if (cfg->listen_port > 0) {
+        offset = g_snprintf(out, outlen, "%d", cfg->listen_port);
+    }
+    for (guint i = 0; i < cfg->extra_listen_port_count; i++) {
+        int port = cfg->extra_listen_ports[i];
+        if (port <= 0) continue;
+        if (offset + 2 >= outlen) break;
+        if (offset > 0) {
+            out[offset++] = ',';
+            if (offset < outlen) out[offset++] = ' ';
+        }
+        offset += g_snprintf(out + offset, outlen - offset, "%d", port);
+        if (offset >= outlen) {
+            offset = outlen - 1;
+            break;
+        }
+    }
+    out[MIN(offset, outlen - 1)] = '\0';
+}
+
 int uv_cli_run(UvViewer *viewer, const UvViewerConfig *cfg) {
     CliContext ctx = {
         .viewer = viewer,
@@ -259,8 +286,10 @@ int uv_cli_run(UvViewer *viewer, const UvViewerConfig *cfg) {
 
     uv_viewer_set_event_callback(viewer, cli_event_callback, &ctx);
 
-    g_print("Viewer: waiting for UDP on %d. Commands: l, n, s <i>, stats, q\n",
-            cfg->listen_port);
+    char port_summary[96];
+    format_listen_ports(cfg, port_summary, sizeof(port_summary));
+    g_print("Viewer: waiting for UDP on %s. Commands: l, n, s <i>, stats, q\n",
+            port_summary[0] ? port_summary : "(none)");
 
     char *line = NULL;
     size_t n = 0;

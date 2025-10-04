@@ -218,10 +218,25 @@ static void frame_block_state_record(UvFrameBlockState *state,
     }
 }
 
-static void addr_to_str(const struct sockaddr_in *sa, char *out, size_t outlen) {
+static void format_source_label(const struct sockaddr_in *sa,
+                                uint16_t local_port,
+                                char *out,
+                                size_t outlen) {
+    if (!sa || !out || outlen == 0) return;
     char ip[INET_ADDRSTRLEN] = {0};
     inet_ntop(AF_INET, &sa->sin_addr, ip, sizeof(ip));
-    g_strlcpy(out, ip, outlen);
+    guint remote_port = ntohs(sa->sin_port);
+    if (local_port > 0) {
+        if (remote_port > 0) {
+            g_snprintf(out, outlen, "%s:%u (local %u)", ip, remote_port, (guint)local_port);
+        } else {
+            g_snprintf(out, outlen, "%s (local %u)", ip, (guint)local_port);
+        }
+    } else if (remote_port > 0) {
+        g_snprintf(out, outlen, "%s:%u", ip, remote_port);
+    } else {
+        g_strlcpy(out, ip, outlen);
+    }
 }
 
 static void relay_source_clear_stats(UvRelaySource *src, gboolean reset_totals) {
@@ -255,17 +270,23 @@ static void relay_source_clear_stats(UvRelaySource *src, gboolean reset_totals) 
     src->frame_block_accum_bytes = 0;
 }
 
-static bool relay_add_or_find(RelayController *rc, const struct sockaddr_in *from, socklen_t fromlen, int *out_idx) {
+static bool relay_add_or_find(RelayController *rc,
+                              const struct sockaddr_in *from,
+                              socklen_t fromlen,
+                              uint16_t local_port,
+                              int *out_idx) {
     for (guint i = 0; i < rc->sources_count; i++) {
         UvRelaySource *slot = &rc->sources[i];
         if (!slot->in_use) continue;
         if (slot->addr.sin_family == from->sin_family &&
-            slot->addr.sin_addr.s_addr == from->sin_addr.s_addr) {
+            slot->addr.sin_addr.s_addr == from->sin_addr.s_addr &&
+            slot->local_port == local_port) {
             if (slot->addr.sin_port != from->sin_port) {
                 relay_source_clear_stats(slot, TRUE);
             }
             slot->addr = *from;
             slot->addrlen = fromlen;
+            slot->local_port = local_port;
             if (out_idx) *out_idx = (int)i;
             return FALSE;
         }
@@ -276,6 +297,7 @@ static bool relay_add_or_find(RelayController *rc, const struct sockaddr_in *fro
     ns->addr = *from;
     ns->addrlen = fromlen;
     ns->in_use = TRUE;
+    ns->local_port = local_port;
     relay_source_clear_stats(ns, TRUE);
     if (out_idx) *out_idx = (int)rc->sources_count;
     rc->sources_count++;
@@ -485,129 +507,198 @@ static gpointer relay_thread_run(gpointer data) {
     RelayController *rc = (RelayController *)data;
     UvViewer *viewer = rc->viewer;
 
-    int in_fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (in_fd < 0) {
-        uv_log_error("Relay: socket() failed: %s", g_strerror(errno));
+    int ports[1 + UV_VIEWER_MAX_EXTRA_LISTEN_PORTS] = {0};
+    guint port_count = 0;
+    if (rc->listen_port > 0) {
+        ports[port_count++] = rc->listen_port;
+    }
+    for (guint i = 0; i < rc->extra_listen_port_count && port_count < G_N_ELEMENTS(ports); i++) {
+        int port = rc->extra_listen_ports[i];
+        if (port <= 0) continue;
+        gboolean duplicate = FALSE;
+        for (guint j = 0; j < port_count; j++) {
+            if (ports[j] == port) {
+                duplicate = TRUE;
+                break;
+            }
+        }
+        if (!duplicate) {
+            ports[port_count++] = port;
+        }
+    }
+
+    if (port_count == 0) {
+        uv_log_error("Relay: no valid UDP listen ports configured");
         return NULL;
     }
 
-    int flags = fcntl(in_fd, F_GETFL, 0);
-    if (flags >= 0) fcntl(in_fd, F_SETFL, flags | O_NONBLOCK);
+    struct pollfd *fds = g_new0(struct pollfd, port_count);
+    uint16_t *local_ports = g_new0(uint16_t, port_count);
+    if (!fds || !local_ports) {
+        uv_log_error("Relay: failed to allocate poll structures");
+        goto cleanup;
+    }
+    unsigned char *buf = NULL;
+    guint active_count = 0;
 
-    int reuse = 1;
-    setsockopt(in_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+    for (guint i = 0; i < port_count; i++) {
+        int port = ports[i];
+        gboolean primary = (port == rc->listen_port);
 
-    int rcvbuf = 4 * 1024 * 1024; // allow bursty sources before poll loop catches up
-    setsockopt(in_fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+        int fd = socket(AF_INET, SOCK_DGRAM, 0);
+        if (fd < 0) {
+            uv_log_error("Relay: socket() failed for port %d: %s", port, g_strerror(errno));
+            if (primary) goto cleanup;
+            else continue;
+        }
 
-    struct sockaddr_in bind_addr = {
-        .sin_family = AF_INET,
-        .sin_port = htons((uint16_t)rc->listen_port),
-        .sin_addr.s_addr = htonl(INADDR_ANY)
-    };
-    if (bind(in_fd, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) < 0) {
-        uv_log_error("Relay: bind() failed on port %d: %s", rc->listen_port, g_strerror(errno));
-        close(in_fd);
-        return NULL;
+        int flags = fcntl(fd, F_GETFL, 0);
+        if (flags >= 0) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+
+        int reuse = 1;
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+
+        int rcvbuf = 4 * 1024 * 1024;
+        setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+
+        struct sockaddr_in bind_addr = {
+            .sin_family = AF_INET,
+            .sin_port = htons((uint16_t)port),
+            .sin_addr.s_addr = htonl(INADDR_ANY)
+        };
+        if (bind(fd, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) < 0) {
+            uv_log_error("Relay: bind() failed on port %d: %s", port, g_strerror(errno));
+            close(fd);
+            if (primary) goto cleanup;
+            else continue;
+        }
+
+        uv_log_info("Relay: listening on UDP port %d", port);
+
+        fds[active_count].fd = fd;
+        fds[active_count].events = POLLIN;
+        local_ports[active_count] = (uint16_t)port;
+        active_count++;
     }
 
-    uv_log_info("Relay: listening on UDP port %d", rc->listen_port);
-
-    unsigned char *buf = g_malloc0(UV_RELAY_BUF_SIZE);
-    if (!buf) {
-        close(in_fd);
-        return NULL;
+    if (active_count == 0) {
+        uv_log_error("Relay: failed to bind any UDP ports");
+        goto cleanup;
     }
 
-    struct pollfd fds[1];
-    fds[0].fd = in_fd;
-    fds[0].events = POLLIN;
+    buf = g_malloc0(UV_RELAY_BUF_SIZE);
+    if (!buf) goto cleanup;
 
     while (rc->running) {
-        int pr = poll(fds, 1, 200);
+        int pr = poll(fds, active_count, 200);
         if (pr < 0) {
             if (errno == EINTR) continue;
             uv_log_warn("Relay: poll() error: %s", g_strerror(errno));
             break;
         }
-        if (!(pr > 0 && (fds[0].revents & POLLIN))) continue;
+        if (pr == 0) continue;
 
-        struct sockaddr_in from = {0};
-        socklen_t fromlen = sizeof(from);
-        ssize_t r = recvfrom(in_fd, buf, UV_RELAY_BUF_SIZE, 0, (struct sockaddr *)&from, &fromlen);
-        if (r < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
-            uv_log_warn("Relay: recvfrom() error: %s", g_strerror(errno));
-            continue;
-        }
-
-        gboolean emit_added = FALSE;
-        gboolean emit_selected = FALSE;
-        int emit_index = -1;
-        UvRelaySource snapshot = {0};
-
-        g_mutex_lock(&rc->lock);
-        int idx = -1;
-        bool is_new = relay_add_or_find(rc, &from, fromlen, &idx);
-        UvRelaySource *src = NULL;
-        if (idx >= 0 && (guint)idx < rc->sources_count) src = &rc->sources[idx];
-        if (src) {
-            src->rx_packets++;
-            src->rx_bytes += (uint64_t)r;
-            src->last_seen_us = g_get_monotonic_time();
-            gboolean is_selected = (idx == rc->selected_index);
-            rtp_update_stats(rc,
-                             src,
-                             buf,
-                             (size_t)r,
-                             viewer->config.clock_rate,
-                             viewer->config.payload_type,
-                             is_selected);
-        }
-        if (is_new && src) {
-            char addr[64];
-            addr_to_str(&src->addr, addr, sizeof(addr));
-            uv_log_info("Relay: discovered source [%d] %s", idx, addr);
-            emit_added = TRUE;
-            emit_index = idx;
-            snapshot = *src;
-            if (rc->selected_index < 0) {
-                rc->selected_index = idx;
-                emit_selected = TRUE;
+        for (guint i = 0; i < active_count; i++) {
+            if (!(fds[i].revents & (POLLIN | POLLERR | POLLHUP | POLLNVAL))) continue;
+            if (fds[i].revents & (POLLERR | POLLHUP | POLLNVAL)) {
+                uv_log_warn("Relay: poll() socket event 0x%x on port %u", fds[i].revents, (unsigned)local_ports[i]);
             }
-        }
+            if (!(fds[i].revents & POLLIN)) continue;
 
-        gboolean push_now = rc->push_enabled && rc->selected_index >= 0 && idx == rc->selected_index;
-        int push_index = push_now ? idx : -1;
-        g_mutex_unlock(&rc->lock);
+            struct sockaddr_in from = {0};
+            socklen_t fromlen = sizeof(from);
+            ssize_t r = recvfrom(fds[i].fd,
+                                 buf,
+                                 UV_RELAY_BUF_SIZE,
+                                 0,
+                                 (struct sockaddr *)&from,
+                                 &fromlen);
+            if (r < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
+                uv_log_warn("Relay: recvfrom() error on port %u: %s",
+                            (unsigned)local_ports[i],
+                            g_strerror(errno));
+                continue;
+            }
 
-        if (emit_added) {
-            uv_internal_emit_event(viewer, UV_VIEWER_EVENT_SOURCE_ADDED, emit_index, &snapshot, NULL);
-        }
-        if (emit_selected) {
-            uv_internal_emit_event(viewer, UV_VIEWER_EVENT_SOURCE_SELECTED, rc->selected_index, &snapshot, NULL);
-        }
+            gboolean emit_added = FALSE;
+            gboolean emit_selected = FALSE;
+            int emit_index = -1;
+            UvRelaySource snapshot = {0};
 
-        if (push_index >= 0) {
-            GstFlowReturn push_ret = relay_push_buffer(rc, buf, (size_t)r);
-            if (push_ret != GST_FLOW_OK) {
-                uv_log_warn("Relay: appsrc push returned %s", gst_flow_get_name(push_ret));
-            } else {
-                g_mutex_lock(&rc->lock);
-                if (push_index >= 0 && (guint)push_index < rc->sources_count) {
-                    UvRelaySource *forward_src = &rc->sources[push_index];
-                    if (forward_src->in_use) {
-                        forward_src->forwarded_packets++;
-                        forward_src->forwarded_bytes += (uint64_t)r;
-                    }
+            g_mutex_lock(&rc->lock);
+            int idx = -1;
+            bool is_new = relay_add_or_find(rc, &from, fromlen, local_ports[i], &idx);
+            UvRelaySource *src = NULL;
+            if (idx >= 0 && (guint)idx < rc->sources_count) src = &rc->sources[idx];
+            if (src) {
+                src->rx_packets++;
+                src->rx_bytes += (uint64_t)r;
+                src->last_seen_us = g_get_monotonic_time();
+                gboolean is_selected = (idx == rc->selected_index);
+                rtp_update_stats(rc,
+                                 src,
+                                 buf,
+                                 (size_t)r,
+                                 viewer->config.clock_rate,
+                                 viewer->config.payload_type,
+                                 is_selected);
+            }
+            if (is_new && src) {
+                char addr[64];
+                format_source_label(&src->addr, src->local_port, addr, sizeof(addr));
+                uv_log_info("Relay: discovered source [%d] %s", idx, addr);
+                emit_added = TRUE;
+                emit_index = idx;
+                snapshot = *src;
+                if (rc->selected_index < 0) {
+                    rc->selected_index = idx;
+                    emit_selected = TRUE;
                 }
-                g_mutex_unlock(&rc->lock);
+            }
+
+            gboolean push_now = rc->push_enabled && rc->selected_index >= 0 && idx == rc->selected_index;
+            int push_index = push_now ? idx : -1;
+            g_mutex_unlock(&rc->lock);
+
+            if (emit_added) {
+                uv_internal_emit_event(viewer, UV_VIEWER_EVENT_SOURCE_ADDED, emit_index, &snapshot, NULL);
+            }
+            if (emit_selected) {
+                uv_internal_emit_event(viewer, UV_VIEWER_EVENT_SOURCE_SELECTED, rc->selected_index, &snapshot, NULL);
+            }
+
+            if (push_index >= 0) {
+                GstFlowReturn push_ret = relay_push_buffer(rc, buf, (size_t)r);
+                if (push_ret != GST_FLOW_OK) {
+                    uv_log_warn("Relay: appsrc push returned %s", gst_flow_get_name(push_ret));
+                } else {
+                    g_mutex_lock(&rc->lock);
+                    if (push_index >= 0 && (guint)push_index < rc->sources_count) {
+                        UvRelaySource *forward_src = &rc->sources[push_index];
+                        if (forward_src->in_use) {
+                            forward_src->forwarded_packets++;
+                            forward_src->forwarded_bytes += (uint64_t)r;
+                        }
+                    }
+                    g_mutex_unlock(&rc->lock);
+                }
             }
         }
     }
 
-    close(in_fd);
-    g_free(buf);
+cleanup:
+    if (buf) g_free(buf);
+    if (fds) {
+        for (guint i = 0; i < port_count; i++) {
+            if (i < active_count && fds[i].fd >= 0) {
+                close(fds[i].fd);
+                fds[i].fd = -1;
+            }
+        }
+        g_free(fds);
+    }
+    g_free(local_ports);
     rc->running = 0;
     return NULL;
 }
@@ -619,6 +710,22 @@ gboolean relay_controller_init(RelayController *rc, struct _UvViewer *viewer) {
     memset(rc, 0, sizeof(*rc));
     g_mutex_init(&rc->lock);
     rc->listen_port = viewer->config.listen_port;
+    rc->extra_listen_port_count = 0;
+    for (guint i = 0; i < viewer->config.extra_listen_port_count &&
+                    rc->extra_listen_port_count < UV_VIEWER_MAX_EXTRA_LISTEN_PORTS; i++) {
+        int port = viewer->config.extra_listen_ports[i];
+        if (port <= 0 || port > 65535) continue;
+        if (port == rc->listen_port) continue;
+        gboolean duplicate = FALSE;
+        for (guint j = 0; j < rc->extra_listen_port_count; j++) {
+            if (rc->extra_listen_ports[j] == port) {
+                duplicate = TRUE;
+                break;
+            }
+        }
+        if (duplicate) continue;
+        rc->extra_listen_ports[rc->extra_listen_port_count++] = port;
+    }
     rc->selected_index = -1;
     rc->viewer = viewer;
     rc->frame_block.enabled = FALSE;
@@ -762,7 +869,7 @@ void relay_controller_snapshot(RelayController *rc, UvViewerStats *stats, int cl
         UvRelaySource *src = &rc->sources[i];
         if (!src->in_use) continue;
         UvSourceStats s = {0};
-        addr_to_str(&src->addr, s.address, sizeof(s.address));
+        format_source_label(&src->addr, src->local_port, s.address, sizeof(s.address));
         s.selected = (rc->selected_index == (int)i);
         s.rx_packets = src->rx_packets;
         s.rx_bytes = src->rx_bytes;
