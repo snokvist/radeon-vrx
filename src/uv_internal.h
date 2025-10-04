@@ -51,6 +51,8 @@ typedef struct {
 
 typedef struct {
     int listen_port;
+    GArray *listen_ports;
+    gboolean listeners_dirty;
     GThread *thread;
     volatile sig_atomic_t running;
     volatile sig_atomic_t push_enabled;
@@ -198,6 +200,7 @@ void     relay_controller_stop(RelayController *rc);
 gboolean relay_controller_select(RelayController *rc, int index, GError **error);
 gboolean relay_controller_select_next(RelayController *rc, GError **error);
 int      relay_controller_selected(const RelayController *rc);
+gboolean relay_controller_add_listen_port(RelayController *rc, int port, gboolean validate_bind, GError **error);
 void     relay_controller_snapshot(RelayController *rc, UvViewerStats *stats, int clock_rate);
 void     relay_controller_set_appsrc(RelayController *rc, GstAppSrc *appsrc);
 void     relay_controller_set_push_enabled(RelayController *rc, gboolean enabled);

@@ -172,6 +172,7 @@ void uv_viewer_set_event_callback(UvViewer *viewer, UvViewerEventCallback cb, gp
 bool uv_viewer_select_source(UvViewer *viewer, int index, GError **error);
 bool uv_viewer_select_next_source(UvViewer *viewer, GError **error);
 int  uv_viewer_get_selected_source(const UvViewer *viewer);
+bool uv_viewer_add_listen_port(UvViewer *viewer, int port, GError **error);
 
 bool uv_viewer_update_pipeline(UvViewer *viewer, const UvPipelineOverrides *overrides, GError **error);
 

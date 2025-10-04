@@ -46,6 +46,11 @@ typedef struct UvFrameBlockState {
     gint64 last_frame_arrival_us;
 } UvFrameBlockState;
 
+typedef struct {
+    int port;
+    int fd;
+} RelayListenSocket;
+
 static void frame_block_state_reset(UvFrameBlockState *state);
 
 static UvFrameBlockState *frame_block_state_new(guint width, guint height) {
@@ -481,135 +486,307 @@ static GstFlowReturn relay_push_buffer(RelayController *rc, const unsigned char 
     return gst_app_src_push_buffer(rc->appsrc, gbuf);
 }
 
+static void relay_listener_close(RelayListenSocket *listener) {
+    if (!listener) return;
+    if (listener->fd >= 0) {
+        close(listener->fd);
+        listener->fd = -1;
+    }
+}
+
+static gboolean relay_listener_open(RelayListenSocket *listener) {
+    if (!listener) return FALSE;
+    listener->fd = -1;
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) {
+        uv_log_error("Relay: socket() failed: %s", g_strerror(errno));
+        return FALSE;
+    }
+
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags >= 0) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+
+    int reuse = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+
+    int rcvbuf = 4 * 1024 * 1024;
+    setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+
+    struct sockaddr_in bind_addr = {
+        .sin_family = AF_INET,
+        .sin_port = htons((uint16_t)listener->port),
+        .sin_addr.s_addr = htonl(INADDR_ANY)
+    };
+
+    if (bind(fd, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) < 0) {
+        uv_log_error("Relay: bind() failed on port %d: %s", listener->port, g_strerror(errno));
+        close(fd);
+        return FALSE;
+    }
+
+    listener->fd = fd;
+    uv_log_info("Relay: listening on UDP port %d", listener->port);
+    return TRUE;
+}
+
+static gboolean relay_listeners_match_ports(const GArray *listeners, const GArray *ports) {
+    if (!listeners || !ports) return FALSE;
+    if (listeners->len != ports->len) return FALSE;
+    for (guint i = 0; i < ports->len; i++) {
+        int port = g_array_index(ports, int, i);
+        const RelayListenSocket *listener = &g_array_index(listeners, RelayListenSocket, i);
+        if (listener->port != port) return FALSE;
+    }
+    return TRUE;
+}
+
+static void relay_listeners_close_all(GArray *listeners) {
+    if (!listeners) return;
+    for (guint i = 0; i < listeners->len; i++) {
+        RelayListenSocket *listener = &g_array_index(listeners, RelayListenSocket, i);
+        relay_listener_close(listener);
+    }
+    g_array_set_size(listeners, 0);
+}
+
 static gpointer relay_thread_run(gpointer data) {
     RelayController *rc = (RelayController *)data;
     UvViewer *viewer = rc->viewer;
 
-    int in_fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (in_fd < 0) {
-        uv_log_error("Relay: socket() failed: %s", g_strerror(errno));
-        return NULL;
-    }
-
-    int flags = fcntl(in_fd, F_GETFL, 0);
-    if (flags >= 0) fcntl(in_fd, F_SETFL, flags | O_NONBLOCK);
-
-    int reuse = 1;
-    setsockopt(in_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
-
-    int rcvbuf = 4 * 1024 * 1024; // allow bursty sources before poll loop catches up
-    setsockopt(in_fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
-
-    struct sockaddr_in bind_addr = {
-        .sin_family = AF_INET,
-        .sin_port = htons((uint16_t)rc->listen_port),
-        .sin_addr.s_addr = htonl(INADDR_ANY)
-    };
-    if (bind(in_fd, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) < 0) {
-        uv_log_error("Relay: bind() failed on port %d: %s", rc->listen_port, g_strerror(errno));
-        close(in_fd);
-        return NULL;
-    }
-
-    uv_log_info("Relay: listening on UDP port %d", rc->listen_port);
-
     unsigned char *buf = g_malloc0(UV_RELAY_BUF_SIZE);
     if (!buf) {
-        close(in_fd);
+        uv_log_error("Relay: failed to allocate receive buffer");
         return NULL;
     }
 
-    struct pollfd fds[1];
-    fds[0].fd = in_fd;
-    fds[0].events = POLLIN;
+    GArray *listeners = g_array_new(FALSE, FALSE, sizeof(RelayListenSocket));
+    struct pollfd *pollfds = NULL;
+    gsize pollfds_capacity = 0;
+    RelayListenSocket **listener_refs = NULL;
+    gsize listener_refs_capacity = 0;
 
     while (rc->running) {
-        int pr = poll(fds, 1, 200);
-        if (pr < 0) {
-            if (errno == EINTR) continue;
-            uv_log_warn("Relay: poll() error: %s", g_strerror(errno));
-            break;
+        GArray *ports_snapshot = g_array_new(FALSE, FALSE, sizeof(int));
+        g_mutex_lock(&rc->lock);
+        if (rc->listen_ports) {
+            for (guint i = 0; i < rc->listen_ports->len; i++) {
+                int port = g_array_index(rc->listen_ports, int, i);
+                g_array_append_val(ports_snapshot, port);
+            }
         }
-        if (!(pr > 0 && (fds[0].revents & POLLIN))) continue;
+        gboolean dirty = rc->listeners_dirty;
+        rc->listeners_dirty = FALSE;
+        g_mutex_unlock(&rc->lock);
 
-        struct sockaddr_in from = {0};
-        socklen_t fromlen = sizeof(from);
-        ssize_t r = recvfrom(in_fd, buf, UV_RELAY_BUF_SIZE, 0, (struct sockaddr *)&from, &fromlen);
-        if (r < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
-            uv_log_warn("Relay: recvfrom() error: %s", g_strerror(errno));
+        if (ports_snapshot->len == 0) {
+            g_array_free(ports_snapshot, TRUE);
+            g_usleep(100000);
             continue;
         }
 
-        gboolean emit_added = FALSE;
-        gboolean emit_selected = FALSE;
-        int emit_index = -1;
-        UvRelaySource snapshot = {0};
-
-        g_mutex_lock(&rc->lock);
-        int idx = -1;
-        bool is_new = relay_add_or_find(rc, &from, fromlen, &idx);
-        UvRelaySource *src = NULL;
-        if (idx >= 0 && (guint)idx < rc->sources_count) src = &rc->sources[idx];
-        if (src) {
-            src->rx_packets++;
-            src->rx_bytes += (uint64_t)r;
-            src->last_seen_us = g_get_monotonic_time();
-            gboolean is_selected = (idx == rc->selected_index);
-            rtp_update_stats(rc,
-                             src,
-                             buf,
-                             (size_t)r,
-                             viewer->config.clock_rate,
-                             viewer->config.payload_type,
-                             is_selected);
-        }
-        if (is_new && src) {
-            char addr[64];
-            addr_to_str(&src->addr, addr, sizeof(addr));
-            uv_log_info("Relay: discovered source [%d] %s", idx, addr);
-            emit_added = TRUE;
-            emit_index = idx;
-            snapshot = *src;
-            if (rc->selected_index < 0) {
-                rc->selected_index = idx;
-                emit_selected = TRUE;
+        if (dirty || !relay_listeners_match_ports(listeners, ports_snapshot)) {
+            relay_listeners_close_all(listeners);
+            guint opened = 0;
+            for (guint i = 0; i < ports_snapshot->len; i++) {
+                int port = g_array_index(ports_snapshot, int, i);
+                RelayListenSocket listener = {.port = port, .fd = -1};
+                if (relay_listener_open(&listener)) {
+                    opened++;
+                }
+                g_array_append_val(listeners, listener);
+            }
+            if (opened == 0) {
+                uv_log_error("Relay: failed to bind any UDP ports; relay thread exiting");
+                g_array_free(ports_snapshot, TRUE);
+                break;
             }
         }
 
-        gboolean push_now = rc->push_enabled && rc->selected_index >= 0 && idx == rc->selected_index;
-        int push_index = push_now ? idx : -1;
-        g_mutex_unlock(&rc->lock);
+        g_array_free(ports_snapshot, TRUE);
 
-        if (emit_added) {
-            uv_internal_emit_event(viewer, UV_VIEWER_EVENT_SOURCE_ADDED, emit_index, &snapshot, NULL);
-        }
-        if (emit_selected) {
-            uv_internal_emit_event(viewer, UV_VIEWER_EVENT_SOURCE_SELECTED, rc->selected_index, &snapshot, NULL);
+        guint active_count = 0;
+        for (guint i = 0; i < listeners->len; i++) {
+            RelayListenSocket *listener = &g_array_index(listeners, RelayListenSocket, i);
+            if (listener->fd >= 0) active_count++;
         }
 
-        if (push_index >= 0) {
-            GstFlowReturn push_ret = relay_push_buffer(rc, buf, (size_t)r);
-            if (push_ret != GST_FLOW_OK) {
-                uv_log_warn("Relay: appsrc push returned %s", gst_flow_get_name(push_ret));
-            } else {
+        if (active_count == 0) {
+            g_usleep(100000);
+            continue;
+        }
+
+        if (pollfds_capacity < active_count) {
+            pollfds = g_renew(struct pollfd, pollfds, active_count);
+            pollfds_capacity = active_count;
+        }
+        if (listener_refs_capacity < active_count) {
+            listener_refs = g_renew(RelayListenSocket *, listener_refs, active_count);
+            listener_refs_capacity = active_count;
+        }
+
+        guint poll_count = 0;
+        for (guint i = 0; i < listeners->len; i++) {
+            RelayListenSocket *listener = &g_array_index(listeners, RelayListenSocket, i);
+            if (listener->fd < 0) continue;
+            pollfds[poll_count].fd = listener->fd;
+            pollfds[poll_count].events = POLLIN;
+            pollfds[poll_count].revents = 0;
+            listener_refs[poll_count] = listener;
+            poll_count++;
+        }
+
+        if (poll_count == 0) {
+            g_usleep(100000);
+            continue;
+        }
+
+        int pr = poll(pollfds, poll_count, 200);
+        if (pr < 0) {
+            if (errno == EINTR) continue;
+            uv_log_warn("Relay: poll() error: %s", g_strerror(errno));
+            continue;
+        }
+        if (pr == 0) continue;
+
+        for (guint i = 0; i < poll_count; i++) {
+            struct pollfd *pfd = &pollfds[i];
+            RelayListenSocket *listener = listener_refs[i];
+            if (!listener || listener->fd < 0) continue;
+
+            if (pfd->revents & (POLLERR | POLLHUP | POLLNVAL)) {
+                uv_log_warn("Relay: socket error on port %d", listener->port);
+                relay_listener_close(listener);
                 g_mutex_lock(&rc->lock);
-                if (push_index >= 0 && (guint)push_index < rc->sources_count) {
-                    UvRelaySource *forward_src = &rc->sources[push_index];
-                    if (forward_src->in_use) {
-                        forward_src->forwarded_packets++;
-                        forward_src->forwarded_bytes += (uint64_t)r;
-                    }
-                }
+                rc->listeners_dirty = TRUE;
                 g_mutex_unlock(&rc->lock);
+                continue;
+            }
+
+            if (!(pfd->revents & POLLIN)) continue;
+
+            struct sockaddr_in from = {0};
+            socklen_t fromlen = sizeof(from);
+            ssize_t r = recvfrom(listener->fd, buf, UV_RELAY_BUF_SIZE, 0, (struct sockaddr *)&from, &fromlen);
+            if (r < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
+                uv_log_warn("Relay: recvfrom() error on port %d: %s", listener->port, g_strerror(errno));
+                continue;
+            }
+
+            gboolean emit_added = FALSE;
+            gboolean emit_selected = FALSE;
+            int emit_index = -1;
+            UvRelaySource snapshot = {0};
+
+            g_mutex_lock(&rc->lock);
+            int idx = -1;
+            bool is_new = relay_add_or_find(rc, &from, fromlen, &idx);
+            UvRelaySource *src = NULL;
+            if (idx >= 0 && (guint)idx < rc->sources_count) src = &rc->sources[idx];
+            if (src) {
+                src->rx_packets++;
+                src->rx_bytes += (uint64_t)r;
+                src->last_seen_us = g_get_monotonic_time();
+                gboolean is_selected = (idx == rc->selected_index);
+                rtp_update_stats(rc,
+                                 src,
+                                 buf,
+                                 (size_t)r,
+                                 viewer->config.clock_rate,
+                                 viewer->config.payload_type,
+                                 is_selected);
+            }
+            if (is_new && src) {
+                char addr[64];
+                addr_to_str(&src->addr, addr, sizeof(addr));
+                uv_log_info("Relay: discovered source [%d] %s", idx, addr);
+                emit_added = TRUE;
+                emit_index = idx;
+                snapshot = *src;
+                if (rc->selected_index < 0) {
+                    rc->selected_index = idx;
+                    emit_selected = TRUE;
+                }
+            }
+
+            gboolean push_now = rc->push_enabled && rc->selected_index >= 0 && idx == rc->selected_index;
+            int push_index = push_now ? idx : -1;
+            g_mutex_unlock(&rc->lock);
+
+            if (emit_added) {
+                uv_internal_emit_event(viewer, UV_VIEWER_EVENT_SOURCE_ADDED, emit_index, &snapshot, NULL);
+            }
+            if (emit_selected) {
+                uv_internal_emit_event(viewer, UV_VIEWER_EVENT_SOURCE_SELECTED, rc->selected_index, &snapshot, NULL);
+            }
+
+            if (push_index >= 0) {
+                GstFlowReturn push_ret = relay_push_buffer(rc, buf, (size_t)r);
+                if (push_ret != GST_FLOW_OK) {
+                    uv_log_warn("Relay: appsrc push returned %s", gst_flow_get_name(push_ret));
+                } else {
+                    g_mutex_lock(&rc->lock);
+                    if (push_index >= 0 && (guint)push_index < rc->sources_count) {
+                        UvRelaySource *forward_src = &rc->sources[push_index];
+                        if (forward_src->in_use) {
+                            forward_src->forwarded_packets++;
+                            forward_src->forwarded_bytes += (uint64_t)r;
+                        }
+                    }
+                    g_mutex_unlock(&rc->lock);
+                }
             }
         }
     }
 
-    close(in_fd);
+    relay_listeners_close_all(listeners);
+    g_array_free(listeners, TRUE);
+    g_free(pollfds);
+    g_free(listener_refs);
     g_free(buf);
     rc->running = 0;
     return NULL;
+}
+
+static gboolean relay_try_bind_port(int port, GError **error) {
+    if (error) *error = NULL;
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) {
+        if (error) {
+            g_set_error(error,
+                       g_quark_from_static_string("uv-viewer"),
+                       errno,
+                       "socket() failed for port %d: %s",
+                       port,
+                       g_strerror(errno));
+        }
+        return FALSE;
+    }
+
+    int reuse = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+
+    struct sockaddr_in bind_addr = {
+        .sin_family = AF_INET,
+        .sin_port = htons((uint16_t)port),
+        .sin_addr.s_addr = htonl(INADDR_ANY)
+    };
+
+    gboolean ok = TRUE;
+    if (bind(fd, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) < 0) {
+        if (error) {
+            g_set_error(error,
+                       g_quark_from_static_string("uv-viewer"),
+                       errno,
+                       "bind() failed for port %d: %s",
+                       port,
+                       g_strerror(errno));
+        }
+        ok = FALSE;
+    }
+
+    close(fd);
+    return ok;
 }
 
 gboolean relay_controller_init(RelayController *rc, struct _UvViewer *viewer) {
@@ -619,6 +796,8 @@ gboolean relay_controller_init(RelayController *rc, struct _UvViewer *viewer) {
     memset(rc, 0, sizeof(*rc));
     g_mutex_init(&rc->lock);
     rc->listen_port = viewer->config.listen_port;
+    rc->listen_ports = g_array_new(FALSE, FALSE, sizeof(int));
+    rc->listeners_dirty = FALSE;
     rc->selected_index = -1;
     rc->viewer = viewer;
     rc->frame_block.enabled = FALSE;
@@ -635,6 +814,11 @@ gboolean relay_controller_init(RelayController *rc, struct _UvViewer *viewer) {
     rc->frame_block.reset_requested = TRUE;
     rc->frame_block.thresholds_dirty_ms = TRUE;
     rc->frame_block.thresholds_dirty_kb = TRUE;
+    if (rc->listen_ports) {
+        int base_port = rc->listen_port;
+        g_array_append_val(rc->listen_ports, base_port);
+        rc->listeners_dirty = TRUE;
+    }
     return TRUE;
 }
 
@@ -649,8 +833,92 @@ void relay_controller_deinit(RelayController *rc) {
     }
     rc->sources_count = 0;
     rc->selected_index = -1;
+    if (rc->listen_ports) {
+        g_array_free(rc->listen_ports, TRUE);
+        rc->listen_ports = NULL;
+    }
     g_mutex_unlock(&rc->lock);
     g_mutex_clear(&rc->lock);
+}
+
+gboolean relay_controller_add_listen_port(RelayController *rc, int port, gboolean validate_bind, GError **error) {
+    if (error) *error = NULL;
+    g_return_val_if_fail(rc != NULL, FALSE);
+
+    if (port <= 0 || port > 65535) {
+        if (error) {
+            g_set_error(error,
+                       g_quark_from_static_string("uv-viewer"),
+                       1,
+                       "Invalid UDP port %d",
+                       port);
+        }
+        return FALSE;
+    }
+
+    gboolean exists = FALSE;
+    g_mutex_lock(&rc->lock);
+    if (!rc->listen_ports) {
+        rc->listen_ports = g_array_new(FALSE, FALSE, sizeof(int));
+    }
+    if (rc->listen_ports) {
+        for (guint i = 0; i < rc->listen_ports->len; i++) {
+            if (g_array_index(rc->listen_ports, int, i) == port) {
+                exists = TRUE;
+                break;
+            }
+        }
+    }
+    g_mutex_unlock(&rc->lock);
+
+    if (exists) {
+        if (error) {
+            g_set_error(error,
+                       g_quark_from_static_string("uv-viewer"),
+                       2,
+                       "Port %d is already active",
+                       port);
+        }
+        return FALSE;
+    }
+
+    if (validate_bind && !relay_try_bind_port(port, error)) {
+        return FALSE;
+    }
+
+    gboolean appended = FALSE;
+    g_mutex_lock(&rc->lock);
+    if (!rc->listen_ports) {
+        rc->listen_ports = g_array_new(FALSE, FALSE, sizeof(int));
+    }
+    if (rc->listen_ports) {
+        for (guint i = 0; i < rc->listen_ports->len; i++) {
+            if (g_array_index(rc->listen_ports, int, i) == port) {
+                exists = TRUE;
+                break;
+            }
+        }
+        if (!exists) {
+            g_array_append_val(rc->listen_ports, port);
+            rc->listeners_dirty = TRUE;
+            appended = TRUE;
+        }
+    }
+    g_mutex_unlock(&rc->lock);
+
+    if (!appended) {
+        if (error) {
+            g_set_error(error,
+                       g_quark_from_static_string("uv-viewer"),
+                       3,
+                       "Port %d is already active",
+                       port);
+        }
+        return FALSE;
+    }
+
+    uv_log_info("Relay: scheduled listen port %d", port);
+    return TRUE;
 }
 
 gboolean relay_controller_start(RelayController *rc) {

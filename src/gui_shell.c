@@ -16,6 +16,7 @@
 #define FRAME_BLOCK_DEFAULT_SIZE_YELLOW_KB  32.0
 #define FRAME_BLOCK_DEFAULT_SIZE_ORANGE_KB  64.0
 #define FRAME_BLOCK_MISSING_SENTINEL (-1.0)
+#define SOURCE_CHANGE_DEBOUNCE_MS 200u
 
 typedef enum {
     STATS_METRIC_RATE = 0,
@@ -46,6 +47,8 @@ typedef struct {
     gboolean suppress_source_change;
     guint stats_refresh_interval_ms;
     GtkSpinButton *listen_port_spin;
+    GtkEntry *extra_port_entry;
+    GtkLabel *extra_ports_label;
     GtkSpinButton *jitter_latency_spin;
     GtkCheckButton *sync_toggle_settings;
     GtkSpinButton *queue_max_buffers_spin;
@@ -69,6 +72,8 @@ typedef struct {
     double stats_range_seconds;
     GArray *stats_history;
     guint stats_timeout_id;
+    guint source_change_debounce_id;
+    int pending_source_index;
     GstElement *bound_sink;
     gulong sink_paintable_handler;
     gboolean paintable_bound;
@@ -114,6 +119,7 @@ typedef struct {
     guint frame_block_real_samples;
     gboolean audio_runtime_enabled;
     gboolean audio_active;
+    GArray *session_ports;
 } GuiContext;
 
 typedef struct {
@@ -172,6 +178,11 @@ static void on_frame_block_color_toggled(GtkCheckButton *check, gpointer user_da
 static void on_videorate_toggled(GtkCheckButton *button, gpointer user_data);
 static void on_audio_toggled(GtkCheckButton *button, gpointer user_data);
 static void on_source_dropdown_changed(GObject *dropdown, GParamSpec *pspec, gpointer user_data);
+static void on_add_listen_port_clicked(GtkButton *button, gpointer user_data);
+static gboolean perform_debounced_source_change(gpointer user_data);
+static void update_extra_ports_display(GuiContext *ctx);
+static gboolean session_port_exists(const GuiContext *ctx, int port);
+static void apply_session_ports(GuiContext *ctx);
 
 static const char *decoder_option_labels[] = {
     "Auto",
@@ -935,9 +946,33 @@ static void update_status(GuiContext *ctx, const char *message) {
     gtk_label_set_text(ctx->status_label, message ? message : "");
 }
 
+static gboolean session_port_exists(const GuiContext *ctx, int port) {
+    if (!ctx || !ctx->session_ports) return FALSE;
+    for (guint i = 0; i < ctx->session_ports->len; i++) {
+        int existing = g_array_index(ctx->session_ports, int, i);
+        if (existing == port) return TRUE;
+    }
+    return FALSE;
+}
+
+static void update_extra_ports_display(GuiContext *ctx) {
+    if (!ctx || !ctx->extra_ports_label) return;
+    if (!ctx->session_ports || ctx->session_ports->len == 0) {
+        gtk_label_set_text(ctx->extra_ports_label, "None");
+        return;
+    }
+    GString *desc = g_string_new(NULL);
+    for (guint i = 0; i < ctx->session_ports->len; i++) {
+        if (i > 0) g_string_append(desc, ", ");
+        int port = g_array_index(ctx->session_ports, int, i);
+        g_string_append_printf(desc, "%d", port);
+    }
+    gtk_label_set_text(ctx->extra_ports_label, desc->str);
+    g_string_free(desc, TRUE);
+}
+
 static void update_info_label(GuiContext *ctx) {
     if (!ctx || !ctx->info_label) return;
-    char info[160];
     UvViewerConfig *cfg = &ctx->current_cfg;
     guint vr_den = cfg->videorate_fps_denominator ? cfg->videorate_fps_denominator : 1;
     char videorate_info[24];
@@ -960,23 +995,39 @@ static void update_info_label(GuiContext *ctx) {
     if (!decoder_pref) decoder_pref = "Auto";
     const char *sink_pref = video_sink_option_labels[video_sink_pref_to_index(cfg->video_sink_preference)];
     if (!sink_pref) sink_pref = "Auto";
-    g_snprintf(info, sizeof(info),
-               "Listening on %d | PT %d | Clock %d | %s | Jitter %ums | Queue buffers %u"
-               " | drop=%s | lost=%s | bus-msg=%s | videorate=%s | decoder=%s | sink=%s | audio=%s",
-               cfg->listen_port,
-               cfg->payload_type,
-               cfg->clock_rate,
-               cfg->sync_to_clock ? "sync" : "no-sync",
-               cfg->jitter_latency_ms,
-               cfg->queue_max_buffers,
-               cfg->jitter_drop_on_latency ? "on" : "off",
-               cfg->jitter_do_lost ? "on" : "off",
-               cfg->jitter_post_drop_messages ? "on" : "off",
-               videorate_info,
-               decoder_pref,
-               sink_pref,
-               audio_state);
-    gtk_label_set_text(ctx->info_label, info);
+
+    GString *ports_desc = g_string_new(NULL);
+    g_string_append_printf(ports_desc, "%d", cfg->listen_port);
+    if (ctx->session_ports && ctx->session_ports->len > 0) {
+        g_string_append(ports_desc, " (extras: ");
+        for (guint i = 0; i < ctx->session_ports->len; i++) {
+            if (i > 0) g_string_append(ports_desc, ", ");
+            int port = g_array_index(ctx->session_ports, int, i);
+            g_string_append_printf(ports_desc, "%d", port);
+        }
+        g_string_append_c(ports_desc, ')');
+    }
+
+    GString *info = g_string_new(NULL);
+    g_string_append_printf(info,
+                           "Listening on %s | PT %d | Clock %d | %s | Jitter %ums | Queue buffers %u"
+                           " | drop=%s | lost=%s | bus-msg=%s | videorate=%s | decoder=%s | sink=%s | audio=%s",
+                           ports_desc->str,
+                           cfg->payload_type,
+                           cfg->clock_rate,
+                           cfg->sync_to_clock ? "sync" : "no-sync",
+                           cfg->jitter_latency_ms,
+                           cfg->queue_max_buffers,
+                           cfg->jitter_drop_on_latency ? "on" : "off",
+                           cfg->jitter_do_lost ? "on" : "off",
+                           cfg->jitter_post_drop_messages ? "on" : "off",
+                           videorate_info,
+                           decoder_pref,
+                           sink_pref,
+                           audio_state);
+    gtk_label_set_text(ctx->info_label, info->str);
+    g_string_free(info, TRUE);
+    g_string_free(ports_desc, TRUE);
 }
 
 static void sync_settings_controls(GuiContext *ctx) {
@@ -1039,6 +1090,7 @@ static void sync_settings_controls(GuiContext *ctx) {
     check_set(ctx->jitter_do_lost_toggle, ctx->current_cfg.jitter_do_lost ? TRUE : FALSE);
     check_set(ctx->jitter_post_drop_toggle, ctx->current_cfg.jitter_post_drop_messages ? TRUE : FALSE);
     update_info_label(ctx);
+    update_extra_ports_display(ctx);
 }
 
 static gboolean bind_sink_paintable(GuiContext *ctx, GstElement *sink) {
@@ -1616,6 +1668,23 @@ static void on_frame_block_color_toggled(GtkCheckButton *check, gpointer user_da
     if (ctx->frame_block_area) gtk_widget_queue_draw(GTK_WIDGET(ctx->frame_block_area));
 }
 
+static void apply_session_ports(GuiContext *ctx) {
+    if (!ctx || !ctx->viewer) return;
+    if (!ctx->session_ports || ctx->session_ports->len == 0) {
+        update_extra_ports_display(ctx);
+        return;
+    }
+    for (guint i = 0; i < ctx->session_ports->len; i++) {
+        int port = g_array_index(ctx->session_ports, int, i);
+        GError *error = NULL;
+        if (!uv_viewer_add_listen_port(ctx->viewer, port, &error)) {
+            update_status(ctx, error ? error->message : "Failed to restore listen port");
+            if (error) g_error_free(error);
+        }
+    }
+    update_extra_ports_display(ctx);
+}
+
 static gboolean gui_restart_with_config(GuiContext *ctx, const UvViewerConfig *cfg) {
     if (!ctx || !ctx->viewer || !cfg) return FALSE;
 
@@ -1684,6 +1753,7 @@ static gboolean gui_restart_with_config(GuiContext *ctx, const UvViewerConfig *c
     if (ctx->cfg_slot) {
         *ctx->cfg_slot = *cfg;
     }
+    apply_session_ports(ctx);
     ctx->audio_runtime_enabled = cfg->audio_enabled;
     ctx->audio_active = FALSE;
     if (ctx->stats_history) {
@@ -1802,6 +1872,29 @@ static void on_audio_toggled(GtkCheckButton *button, gpointer user_data) {
     }
 }
 
+static gboolean perform_debounced_source_change(gpointer user_data) {
+    GuiContext *ctx = user_data;
+    if (!ctx) return G_SOURCE_REMOVE;
+    ctx->source_change_debounce_id = 0;
+    int pending = ctx->pending_source_index;
+    ctx->pending_source_index = -1;
+    if (pending < 0 || !ctx->viewer) return G_SOURCE_REMOVE;
+
+    GError *error = NULL;
+    if (!uv_viewer_select_source(ctx->viewer, pending, &error)) {
+        update_status(ctx, error ? error->message : "Failed to select source");
+    } else {
+        char msg[128];
+        g_snprintf(msg, sizeof(msg), "Selected source %d", pending);
+        update_status(ctx, msg);
+        refresh_stats(ctx);
+    }
+    if (error) {
+        g_error_free(error);
+    }
+    return G_SOURCE_REMOVE;
+}
+
 static void on_source_dropdown_changed(GObject *dropdown, GParamSpec *pspec, gpointer user_data) {
     (void)pspec;
     GuiContext *ctx = user_data;
@@ -1810,19 +1903,76 @@ static void on_source_dropdown_changed(GObject *dropdown, GParamSpec *pspec, gpo
 
     guint selected = gtk_drop_down_get_selected(GTK_DROP_DOWN(dropdown));
     if (selected == GTK_INVALID_LIST_POSITION) return;
+    if (ctx->source_change_debounce_id) {
+        g_source_remove(ctx->source_change_debounce_id);
+        ctx->source_change_debounce_id = 0;
+    }
+    ctx->pending_source_index = (int)selected;
+    ctx->source_change_debounce_id = g_timeout_add(SOURCE_CHANGE_DEBOUNCE_MS,
+                                                   perform_debounced_source_change,
+                                                   ctx);
+}
+
+static void on_add_listen_port_clicked(GtkButton *button, gpointer user_data) {
+    (void)button;
+    GuiContext *ctx = user_data;
+    if (!ctx || !ctx->viewer || !ctx->extra_port_entry) return;
+
+    const char *text = gtk_editable_get_text(GTK_EDITABLE(ctx->extra_port_entry));
+    char *copy = text ? g_strdup(text) : NULL;
+    if (copy) {
+        g_strstrip(copy);
+    }
+    if (!copy || *copy == '\0') {
+        update_status(ctx, "Enter a UDP port number");
+        g_free(copy);
+        return;
+    }
+
+    char *endptr = NULL;
+    long port_long = strtol(copy, &endptr, 10);
+    if (endptr == copy || (endptr && *endptr != '\0')) {
+        update_status(ctx, "Invalid port format");
+        g_free(copy);
+        return;
+    }
+    g_free(copy);
+
+    if (port_long <= 0 || port_long > 65535) {
+        update_status(ctx, "Port must be between 1 and 65535");
+        return;
+    }
+
+    int port = (int)port_long;
+    if (port == ctx->current_cfg.listen_port) {
+        update_status(ctx, "Port is already the primary listener");
+        return;
+    }
+    if (session_port_exists(ctx, port)) {
+        update_status(ctx, "Port already added for this session");
+        return;
+    }
 
     GError *error = NULL;
-    if (!uv_viewer_select_source(ctx->viewer, (int)selected, &error)) {
-        update_status(ctx, error ? error->message : "Failed to select source");
-    } else {
-        char msg[128];
-        g_snprintf(msg, sizeof(msg), "Selected source %u", selected);
-        update_status(ctx, msg);
-        refresh_stats(ctx);
+    if (!uv_viewer_add_listen_port(ctx->viewer, port, &error)) {
+        update_status(ctx, error ? error->message : "Failed to add listen port");
+        if (error) g_error_free(error);
+        return;
     }
-    if (error) {
-        g_error_free(error);
+
+    if (!ctx->session_ports) {
+        ctx->session_ports = g_array_new(FALSE, FALSE, sizeof(int));
     }
+    if (ctx->session_ports) {
+        g_array_append_val(ctx->session_ports, port);
+    }
+    update_extra_ports_display(ctx);
+    update_info_label(ctx);
+
+    char msg[128];
+    g_snprintf(msg, sizeof(msg), "Listening on additional port %d", port);
+    update_status(ctx, msg);
+    gtk_editable_set_text(GTK_EDITABLE(ctx->extra_port_entry), "");
 }
 
 static gboolean on_window_close_request(GtkWindow *window, gpointer user_data) {
@@ -2119,6 +2269,30 @@ static GtkWidget *build_settings_page(GuiContext *ctx) {
 
     ctx->jitter_post_drop_toggle = GTK_CHECK_BUTTON(gtk_check_button_new_with_label("Post drop messages on bus"));
     gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(ctx->jitter_post_drop_toggle), 0, 11, 2, 1);
+
+    GtkWidget *extra_add_label = gtk_label_new("Add Extra Port:");
+    gtk_label_set_xalign(GTK_LABEL(extra_add_label), 0.0);
+    gtk_grid_attach(GTK_GRID(grid), extra_add_label, 0, 12, 1, 1);
+
+    GtkWidget *extra_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    gtk_grid_attach(GTK_GRID(grid), extra_box, 1, 12, 1, 1);
+
+    ctx->extra_port_entry = GTK_ENTRY(gtk_entry_new());
+    gtk_entry_set_placeholder_text(ctx->extra_port_entry, "e.g. 5601");
+    gtk_widget_set_hexpand(GTK_WIDGET(ctx->extra_port_entry), TRUE);
+    gtk_box_append(GTK_BOX(extra_box), GTK_WIDGET(ctx->extra_port_entry));
+
+    GtkWidget *extra_add_button = gtk_button_new_with_label("Add");
+    g_signal_connect(extra_add_button, "clicked", G_CALLBACK(on_add_listen_port_clicked), ctx);
+    gtk_box_append(GTK_BOX(extra_box), extra_add_button);
+
+    GtkWidget *extra_active_label = gtk_label_new("Active Extra Ports:");
+    gtk_label_set_xalign(GTK_LABEL(extra_active_label), 0.0);
+    gtk_grid_attach(GTK_GRID(grid), extra_active_label, 0, 13, 1, 1);
+
+    ctx->extra_ports_label = GTK_LABEL(gtk_label_new("None"));
+    gtk_label_set_xalign(ctx->extra_ports_label, 0.0);
+    gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(ctx->extra_ports_label), 1, 13, 1, 1);
 
     GtkWidget *apply_button = gtk_button_new_with_label("Apply Settings");
     g_signal_connect(apply_button, "clicked", G_CALLBACK(on_settings_apply_clicked), ctx);
@@ -2721,6 +2895,11 @@ static void on_app_shutdown(GApplication *app, gpointer user_data) {
         }
         ctx->stats_timeout_id = 0;
     }
+    if (ctx->source_change_debounce_id) {
+        g_source_remove(ctx->source_change_debounce_id);
+        ctx->source_change_debounce_id = 0;
+    }
+    ctx->pending_source_index = -1;
     if (ctx->viewer) {
         uv_viewer_set_event_callback(ctx->viewer, NULL, NULL);
     }
@@ -2740,6 +2919,8 @@ static void on_app_shutdown(GApplication *app, gpointer user_data) {
     ctx->sources_frame = NULL;
     ctx->sources_toggle = NULL;
     ctx->listen_port_spin = NULL;
+    ctx->extra_port_entry = NULL;
+    ctx->extra_ports_label = NULL;
     ctx->jitter_latency_spin = NULL;
     ctx->sync_toggle_settings = NULL;
     ctx->queue_max_buffers_spin = NULL;
@@ -2822,6 +3003,9 @@ int uv_gui_run(UvViewer **viewer, UvViewerConfig *cfg, const char *program_name)
     ctx->known_source_count = 0;
     ctx->suppress_source_change = FALSE;
     ctx->stats_refresh_interval_ms = 200;
+    ctx->session_ports = g_array_new(FALSE, FALSE, sizeof(int));
+    ctx->source_change_debounce_id = 0;
+    ctx->pending_source_index = -1;
     for (guint i = 0; i < FRAME_BLOCK_COLOR_COUNT; i++) {
         ctx->frame_block_colors_visible[i] = TRUE;
     }

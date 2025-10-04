@@ -131,6 +131,11 @@ int uv_viewer_get_selected_source(const UvViewer *viewer) {
     return relay_controller_selected(&viewer->relay);
 }
 
+bool uv_viewer_add_listen_port(UvViewer *viewer, int port, GError **error) {
+    if (!viewer) return FALSE;
+    return relay_controller_add_listen_port(&viewer->relay, port, TRUE, error);
+}
+
 bool uv_viewer_update_pipeline(UvViewer *viewer, const UvPipelineOverrides *overrides, GError **error) {
     if (!viewer) return FALSE;
     return pipeline_controller_update(&viewer->pipeline, overrides, error);
