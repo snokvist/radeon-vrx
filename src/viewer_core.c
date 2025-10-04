@@ -13,6 +13,95 @@ static void uv_viewer_init_struct(UvViewer *viewer, const UvViewerConfig *cfg) {
     uv_internal_qos_db_init(&viewer->qos);
 }
 
+static gboolean viewer_rebuild_pipeline(UvViewer *viewer, GError **error) {
+    g_return_val_if_fail(viewer != NULL, FALSE);
+
+    pipeline_controller_deinit(&viewer->pipeline);
+    relay_controller_set_appsrc(&viewer->relay, NULL);
+
+    uv_internal_decoder_stats_reset(&viewer->decoder);
+    uv_internal_qos_db_clear(&viewer->qos);
+
+    if (!pipeline_controller_init(&viewer->pipeline, viewer, NULL)) {
+        if (error) {
+            g_set_error(error,
+                        g_quark_from_static_string("uv-viewer"),
+                        40,
+                        "Failed to initialize playback pipeline");
+        }
+        return FALSE;
+    }
+
+    GError *start_error = NULL;
+    gboolean started = pipeline_controller_start(&viewer->pipeline, &start_error);
+    if (!started) {
+        if (error) {
+            if (start_error) {
+                *error = start_error;
+                start_error = NULL;
+            } else {
+                g_set_error(error,
+                            g_quark_from_static_string("uv-viewer"),
+                            41,
+                            "Failed to restart playback pipeline");
+            }
+        } else if (start_error) {
+            g_error_free(start_error);
+            start_error = NULL;
+        }
+        pipeline_controller_deinit(&viewer->pipeline);
+        relay_controller_set_appsrc(&viewer->relay, NULL);
+        return FALSE;
+    }
+
+    if (start_error) {
+        g_error_free(start_error);
+    }
+
+    relay_controller_set_appsrc(&viewer->relay, pipeline_controller_get_appsrc(&viewer->pipeline));
+    return TRUE;
+}
+
+static gboolean viewer_select_common(UvViewer *viewer, gboolean advance, int index, GError **error) {
+    if (!viewer) return FALSE;
+
+    gboolean running = FALSE;
+    g_mutex_lock(&viewer->state_lock);
+    running = viewer->started;
+    g_mutex_unlock(&viewer->state_lock);
+
+    gboolean disabled_push = FALSE;
+    if (running) {
+        relay_controller_set_push_enabled(&viewer->relay, FALSE);
+        disabled_push = TRUE;
+    }
+
+    gboolean ok = advance ? relay_controller_select_next(&viewer->relay, error)
+                          : relay_controller_select(&viewer->relay, index, error);
+    if (!ok) {
+        if (disabled_push) {
+            relay_controller_set_push_enabled(&viewer->relay, TRUE);
+        }
+        return FALSE;
+    }
+
+    if (!running) {
+        return TRUE;
+    }
+
+    if (!viewer_rebuild_pipeline(viewer, error)) {
+        g_mutex_lock(&viewer->state_lock);
+        viewer->started = FALSE;
+        g_mutex_unlock(&viewer->state_lock);
+        return FALSE;
+    }
+
+    g_mutex_lock(&viewer->state_lock);
+    viewer->started = TRUE;
+    g_mutex_unlock(&viewer->state_lock);
+    return TRUE;
+}
+
 void uv_viewer_config_init(UvViewerConfig *cfg) {
     if (!cfg) return;
     cfg->listen_port = 5600;
@@ -117,13 +206,11 @@ void uv_viewer_set_event_callback(UvViewer *viewer, UvViewerEventCallback cb, gp
 }
 
 bool uv_viewer_select_source(UvViewer *viewer, int index, GError **error) {
-    if (!viewer) return FALSE;
-    return relay_controller_select(&viewer->relay, index, error);
+    return viewer_select_common(viewer, FALSE, index, error);
 }
 
 bool uv_viewer_select_next_source(UvViewer *viewer, GError **error) {
-    if (!viewer) return FALSE;
-    return relay_controller_select_next(&viewer->relay, error);
+    return viewer_select_common(viewer, TRUE, -1, error);
 }
 
 int uv_viewer_get_selected_source(const UvViewer *viewer) {
