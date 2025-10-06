@@ -1155,15 +1155,54 @@ static gboolean stats_history_push_frame_block_updates(GuiContext *ctx,
     if (prev_capacity != capacity) treat_all_new = TRUE;
     if (next_index < prev_next_index) treat_all_new = TRUE;
     if (filled < prev_filled) treat_all_new = TRUE;
+    if (!treat_all_new && filled == capacity && prev_filled == capacity && next_index == prev_next_index) {
+        treat_all_new = TRUE;
+    }
 
-    guint start = treat_all_new ? 0u : MIN(prev_next_index, filled);
-    guint end = treat_all_new ? filled : MIN(next_index, filled);
-    if (fb->lateness_ms->len < end) end = fb->lateness_ms->len;
-    if (fb->frame_size_kb->len < end) end = fb->frame_size_kb->len;
-    if (end <= start) return FALSE;
+    guint array_limit = MIN(fb->lateness_ms->len, fb->frame_size_kb->len);
+    if (array_limit == 0) return FALSE;
+
+    gboolean iterate_ring = FALSE;
+    guint oldest_index = 0;
+    guint start_index = 0;
+    guint total_count = 0;
+
+    if (treat_all_new) {
+        total_count = MIN(filled, array_limit);
+        if (total_count == 0) return FALSE;
+
+        if (filled == capacity && capacity > 0) {
+            iterate_ring = TRUE;
+            oldest_index = next_index % capacity;
+        } else {
+            oldest_index = 0;
+        }
+    } else {
+        start_index = MIN(prev_next_index, filled);
+        guint end_index = MIN(next_index, filled);
+        if (end_index > array_limit) end_index = array_limit;
+        if (start_index > end_index) start_index = end_index;
+        total_count = end_index - start_index;
+        if (total_count == 0) return FALSE;
+    }
 
     guint appendable = 0;
-    for (guint idx = start; idx < end; idx++) {
+    for (guint offset = 0; offset < total_count; offset++) {
+        guint idx;
+        if (treat_all_new) {
+            if (iterate_ring) {
+                idx = (oldest_index + offset) % capacity;
+            } else {
+                idx = offset;
+            }
+        } else {
+            idx = start_index + offset;
+        }
+
+        if (idx >= fb->lateness_ms->len || idx >= fb->frame_size_kb->len) {
+            continue;
+        }
+
         double lateness = g_array_index(fb->lateness_ms, double, idx);
         double size = g_array_index(fb->frame_size_kb, double, idx);
         gboolean missing = (lateness == FRAME_BLOCK_MISSING_SENTINEL) || (size == FRAME_BLOCK_MISSING_SENTINEL);
@@ -1195,7 +1234,22 @@ static gboolean stats_history_push_frame_block_updates(GuiContext *ctx,
     gboolean appended_any = FALSE;
     guint emitted_index = 0;
 
-    for (guint idx = start; idx < end; idx++) {
+    for (guint offset = 0; offset < total_count; offset++) {
+        guint idx;
+        if (treat_all_new) {
+            if (iterate_ring) {
+                idx = (oldest_index + offset) % capacity;
+            } else {
+                idx = offset;
+            }
+        } else {
+            idx = start_index + offset;
+        }
+
+        if (idx >= fb->lateness_ms->len || idx >= fb->frame_size_kb->len) {
+            continue;
+        }
+
         double lateness = g_array_index(fb->lateness_ms, double, idx);
         double size = g_array_index(fb->frame_size_kb, double, idx);
         gboolean missing = (lateness == FRAME_BLOCK_MISSING_SENTINEL) || (size == FRAME_BLOCK_MISSING_SENTINEL);
