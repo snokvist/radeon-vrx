@@ -162,6 +162,7 @@ static void stats_range_changed(GObject *dropdown, GParamSpec *pspec, gpointer u
 static void stats_chart_draw(GtkDrawingArea *area, cairo_t *cr, int width, int height, gpointer user_data);
 static void frame_block_draw(GtkDrawingArea *area, cairo_t *cr, int width, int height, gpointer user_data);
 static void frame_overlay_draw(GtkDrawingArea *area, cairo_t *cr, int width, int height, gpointer user_data);
+static void stats_history_push(GuiContext *ctx, const StatsSample *sample);
 static gboolean stats_history_push_frame_block_updates(GuiContext *ctx,
                                                        const UvFrameBlockStats *fb,
                                                        guint prev_next_index,
