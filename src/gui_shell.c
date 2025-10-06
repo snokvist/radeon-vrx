@@ -67,6 +67,7 @@ typedef struct {
     GtkLabel *stats_live_labels[STATS_METRIC_COUNT];
     GtkLabel *stats_max_labels[STATS_METRIC_COUNT];
     double stats_range_seconds;
+    double stats_last_refresh_time;
     GArray *stats_history;
     guint stats_timeout_id;
     GstElement *bound_sink;
@@ -161,6 +162,14 @@ static void stats_range_changed(GObject *dropdown, GParamSpec *pspec, gpointer u
 static void stats_chart_draw(GtkDrawingArea *area, cairo_t *cr, int width, int height, gpointer user_data);
 static void frame_block_draw(GtkDrawingArea *area, cairo_t *cr, int width, int height, gpointer user_data);
 static void frame_overlay_draw(GtkDrawingArea *area, cairo_t *cr, int width, int height, gpointer user_data);
+static gboolean stats_history_push_frame_block_updates(GuiContext *ctx,
+                                                       const UvFrameBlockStats *fb,
+                                                       guint prev_next_index,
+                                                       guint prev_filled,
+                                                       guint prev_capacity,
+                                                       double prev_refresh_time,
+                                                       double now,
+                                                       const StatsSample *latest_metrics);
 static void on_frame_block_enable_toggled(GtkToggleButton *button, gpointer user_data);
 static void on_frame_block_pause_toggled(GtkToggleButton *button, gpointer user_data);
 static void on_frame_block_mode_changed(GObject *dropdown, GParamSpec *pspec, gpointer user_data);
@@ -1121,6 +1130,123 @@ static double stats_metric_value(const StatsSample *sample, StatsMetric metric) 
     }
 }
 
+static gboolean stats_history_push_frame_block_updates(GuiContext *ctx,
+                                                       const UvFrameBlockStats *fb,
+                                                       guint prev_next_index,
+                                                       guint prev_filled,
+                                                       guint prev_capacity,
+                                                       double prev_refresh_time,
+                                                       double now,
+                                                       const StatsSample *latest_metrics) {
+    if (!ctx || !fb || !fb->lateness_ms || !fb->frame_size_kb) return FALSE;
+
+    guint width = fb->width ? fb->width : FRAME_BLOCK_DEFAULT_WIDTH;
+    guint height = fb->height ? fb->height : FRAME_BLOCK_DEFAULT_HEIGHT;
+    guint capacity = width * height;
+    if (capacity == 0) return FALSE;
+
+    guint filled = fb->filled;
+    if (filled > capacity) filled = capacity;
+    guint next_index = fb->next_index;
+    if (next_index > capacity) next_index = capacity;
+
+    gboolean treat_all_new = FALSE;
+    if (prev_capacity != capacity) treat_all_new = TRUE;
+    if (next_index < prev_next_index) treat_all_new = TRUE;
+    if (filled < prev_filled) treat_all_new = TRUE;
+
+    guint start = treat_all_new ? 0u : MIN(prev_next_index, filled);
+    guint end = treat_all_new ? filled : MIN(next_index, filled);
+    if (fb->lateness_ms->len < end) end = fb->lateness_ms->len;
+    if (fb->frame_size_kb->len < end) end = fb->frame_size_kb->len;
+    if (end <= start) return FALSE;
+
+    guint appendable = 0;
+    for (guint idx = start; idx < end; idx++) {
+        double lateness = g_array_index(fb->lateness_ms, double, idx);
+        double size = g_array_index(fb->frame_size_kb, double, idx);
+        gboolean missing = (lateness == FRAME_BLOCK_MISSING_SENTINEL) || (size == FRAME_BLOCK_MISSING_SENTINEL);
+        gboolean valid = isfinite(lateness) && isfinite(size) && lateness >= 0.0 && size >= 0.0;
+        if (missing || valid) appendable++;
+    }
+    if (appendable == 0) return FALSE;
+
+    double last_ts = 0.0;
+    if (ctx->stats_history && ctx->stats_history->len > 0) {
+        StatsSample *existing = (StatsSample *)ctx->stats_history->data;
+        last_ts = existing[ctx->stats_history->len - 1].timestamp;
+    }
+
+    double base_time = (prev_refresh_time > 0.0) ? prev_refresh_time : now;
+    if (base_time < last_ts) base_time = last_ts;
+    double span = now - base_time;
+    if (span < 0.0) span = 0.0;
+    double min_span = (double)appendable * 0.001;
+    if (span < min_span) {
+        base_time = now - min_span;
+        if (base_time < last_ts) base_time = last_ts;
+        span = now - base_time;
+        if (span < 0.0) span = 0.0;
+    }
+    double step = (appendable > 0 && span > 0.0) ? (span / (double)appendable) : 0.0;
+    double current_ts = base_time;
+    double last_output_ts = last_ts;
+    gboolean appended_any = FALSE;
+    guint emitted_index = 0;
+
+    for (guint idx = start; idx < end; idx++) {
+        double lateness = g_array_index(fb->lateness_ms, double, idx);
+        double size = g_array_index(fb->frame_size_kb, double, idx);
+        gboolean missing = (lateness == FRAME_BLOCK_MISSING_SENTINEL) || (size == FRAME_BLOCK_MISSING_SENTINEL);
+        gboolean valid = isfinite(lateness) && isfinite(size) && lateness >= 0.0 && size >= 0.0;
+        if (!missing && !valid) {
+            continue;
+        }
+
+        if (appendable > 0) {
+            current_ts += step;
+        }
+        if (current_ts <= last_output_ts) current_ts = last_output_ts + 1e-6;
+        last_output_ts = current_ts;
+        emitted_index++;
+
+        StatsSample sample = {0};
+        sample.timestamp = current_ts;
+        sample.rate_bps = NAN;
+        sample.lost_packets = NAN;
+        sample.dup_packets = NAN;
+        sample.reorder_packets = NAN;
+        sample.jitter_ms = NAN;
+        sample.fps_current = NAN;
+
+        if (valid) {
+            sample.frame_valid = TRUE;
+            sample.frame_missing = FALSE;
+            sample.frame_lateness_ms = lateness;
+            sample.frame_size_kb = size;
+        } else {
+            sample.frame_valid = FALSE;
+            sample.frame_missing = TRUE;
+            sample.frame_lateness_ms = NAN;
+            sample.frame_size_kb = NAN;
+        }
+
+        if (emitted_index == appendable && latest_metrics) {
+            sample.rate_bps = latest_metrics->rate_bps;
+            sample.lost_packets = latest_metrics->lost_packets;
+            sample.dup_packets = latest_metrics->dup_packets;
+            sample.reorder_packets = latest_metrics->reorder_packets;
+            sample.jitter_ms = latest_metrics->jitter_ms;
+            sample.fps_current = latest_metrics->fps_current;
+        }
+
+        stats_history_push(ctx, &sample);
+        appended_any = TRUE;
+    }
+
+    return appended_any;
+}
+
 static void stats_history_push(GuiContext *ctx, const StatsSample *sample) {
     if (!ctx) return;
     if (!ctx->stats_history) {
@@ -1154,6 +1280,11 @@ static void refresh_stats(GuiContext *ctx) {
     if (!ctx->paintable_bound) {
         ensure_video_paintable(ctx);
     }
+
+    guint prev_block_next = ctx->frame_block_next_index;
+    guint prev_block_filled = ctx->frame_block_filled;
+    guint prev_block_capacity = frame_block_capacity_for(ctx);
+    double prev_refresh_time = ctx->stats_last_refresh_time;
 
     UvViewerStats stats = {0};
     uv_viewer_stats_init(&stats);
@@ -1251,32 +1382,49 @@ static void refresh_stats(GuiContext *ctx) {
         update_status(ctx, "");
     }
 
+    double refresh_now = g_get_monotonic_time() / 1e6;
+
     if (selected_source) {
-        StatsSample sample = {0};
-        sample.timestamp = g_get_monotonic_time() / 1e6;
-        sample.rate_bps = selected_source->inbound_bitrate_bps;
-        sample.lost_packets = (double)selected_source->rtp_lost_packets;
-        sample.dup_packets = (double)selected_source->rtp_duplicate_packets;
-        sample.reorder_packets = (double)selected_source->rtp_reordered_packets;
-        sample.jitter_ms = selected_source->rfc3550_jitter_ms;
-        sample.fps_current = stats.decoder.instantaneous_fps;
-        double latest_lateness = NAN;
-        double latest_size = NAN;
-        gboolean latest_missing = FALSE;
-        gboolean frame_metrics_valid = FALSE;
+        StatsSample metrics = {0};
+        metrics.timestamp = refresh_now;
+        metrics.rate_bps = selected_source->inbound_bitrate_bps;
+        metrics.lost_packets = (double)selected_source->rtp_lost_packets;
+        metrics.dup_packets = (double)selected_source->rtp_duplicate_packets;
+        metrics.reorder_packets = (double)selected_source->rtp_reordered_packets;
+        metrics.jitter_ms = selected_source->rfc3550_jitter_ms;
+        metrics.fps_current = stats.decoder.instantaneous_fps;
+
+        gboolean appended = FALSE;
         if (stats.frame_block_valid) {
-            frame_metrics_valid = frame_block_stats_latest(&stats.frame_block,
-                                                          &latest_lateness,
-                                                          &latest_size,
-                                                          &latest_missing);
+            appended = stats_history_push_frame_block_updates(ctx,
+                                                              &stats.frame_block,
+                                                              prev_block_next,
+                                                              prev_block_filled,
+                                                              prev_block_capacity,
+                                                              prev_refresh_time,
+                                                              refresh_now,
+                                                              &metrics);
         }
 
-        sample.frame_valid = frame_metrics_valid;
-        sample.frame_missing = latest_missing;
-        sample.frame_lateness_ms = frame_metrics_valid ? latest_lateness : NAN;
-        sample.frame_size_kb = frame_metrics_valid ? latest_size : NAN;
+        if (!appended) {
+            double latest_lateness = NAN;
+            double latest_size = NAN;
+            gboolean latest_missing = FALSE;
+            gboolean frame_metrics_valid = FALSE;
+            if (stats.frame_block_valid) {
+                frame_metrics_valid = frame_block_stats_latest(&stats.frame_block,
+                                                              &latest_lateness,
+                                                              &latest_size,
+                                                              &latest_missing);
+            }
 
-        stats_history_push(ctx, &sample);
+            StatsSample sample = metrics;
+            sample.frame_valid = frame_metrics_valid;
+            sample.frame_missing = latest_missing;
+            sample.frame_lateness_ms = frame_metrics_valid ? latest_lateness : NAN;
+            sample.frame_size_kb = frame_metrics_valid ? latest_size : NAN;
+            stats_history_push(ctx, &sample);
+        }
 
         for (int i = 0; i < STATS_METRIC_COUNT; i++) {
             if (ctx->stats_charts[i]) {
@@ -1375,6 +1523,8 @@ static void refresh_stats(GuiContext *ctx) {
         gtk_widget_queue_draw(GTK_WIDGET(ctx->frame_block_area));
     }
     frame_block_queue_overlay_draws(ctx);
+
+    ctx->stats_last_refresh_time = refresh_now;
 
     uv_viewer_stats_clear(&stats);
 }
@@ -2804,6 +2954,7 @@ int uv_gui_run(UvViewer **viewer, UvViewerConfig *cfg, const char *program_name)
     ctx->cfg_slot = cfg;
     ctx->current_cfg = *cfg;
     ctx->stats_range_seconds = 300.0;
+    ctx->stats_last_refresh_time = 0.0;
     ctx->audio_runtime_enabled = cfg->audio_enabled;
     ctx->audio_active = FALSE;
     ctx->frame_block_thresholds_ms[0] = FRAME_BLOCK_DEFAULT_GREEN_MS;
