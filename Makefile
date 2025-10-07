@@ -22,7 +22,7 @@ TARGET := udp-h265-viewer
 all: $(TARGET)
 
 $(TARGET): $(OBJS)
-	$(CC) $(CFLAGS) -o $@ $^ $(GST_LIBS) $(GTK_LIBS)
+	$(CC) $(CFLAGS) -o $@ $^ $(GST_LIBS) $(GTK_LIBS) -lm
 
 %.o: %.c
 	$(CC) $(CFLAGS) $(INCLUDES) $(GST_FLAGS) $(GTK_FLAGS) -c $< -o $@
