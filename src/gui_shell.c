@@ -1100,6 +1100,12 @@ static void frame_distribution_draw(GtkDrawingArea *area, cairo_t *cr, int width
     double stddev = sqrt(variance);
 
     const guint bin_count = 15u;
+    const guint overflow_bins = 2u;
+    guint interior_bin_count = (bin_count > overflow_bins) ? (bin_count - overflow_bins) : bin_count;
+    if (interior_bin_count == 0u) {
+        interior_bin_count = bin_count;
+    }
+
     double span = stddev > 1e-6 ? stddev * 6.0 : 0.0;
     if (span <= 0.0) {
         span = max_val - min_val;
@@ -1110,11 +1116,14 @@ static void frame_distribution_draw(GtkDrawingArea *area, cairo_t *cr, int width
     if (span <= 0.0) {
         span = 1.0;
     }
-    double bin_width = span / (double)bin_count;
+    double bin_width = span / (double)interior_bin_count;
     if (bin_width <= 0.0) {
         bin_width = 1.0;
     }
-    double start = mean - bin_width * ((double)bin_count / 2.0);
+
+    double interior_start = mean - bin_width * ((double)interior_bin_count / 2.0);
+    double interior_end = interior_start + bin_width * (double)interior_bin_count;
+    double display_start = interior_start - bin_width;
 
     guint bins[15] = {0};
     double bin_sums[15] = {0.0};
@@ -1122,9 +1131,19 @@ static void frame_distribution_draw(GtkDrawingArea *area, cairo_t *cr, int width
     for (guint i = 0; i < values->len; i++) {
         double v = g_array_index(values, double, i);
         if (!isfinite(v) || v < 0.0) continue;
-        int idx = (int)floor((v - start) / bin_width);
-        if (idx < 0) idx = 0;
-        if (idx >= (int)bin_count) idx = (int)bin_count - 1;
+        guint idx;
+        if (v < interior_start) {
+            idx = 0u;
+        } else if (v >= interior_end) {
+            idx = bin_count - 1u;
+        } else {
+            double offset = v - interior_start;
+            guint interior_index = (guint)floor(offset / bin_width);
+            if (interior_index >= interior_bin_count) {
+                interior_index = interior_bin_count - 1u;
+            }
+            idx = interior_index + 1u;
+        }
         bins[idx]++;
         bin_sums[idx] += v;
         if (bins[idx] > max_bin_count) {
@@ -1239,7 +1258,8 @@ static void frame_distribution_draw(GtkDrawingArea *area, cairo_t *cr, int width
         }
     }
 
-    double mean_ratio = (mean - start) / (bin_width * bin_count);
+    double full_span = bin_width * (double)bin_count;
+    double mean_ratio = (mean - display_start) / full_span;
     if (mean_ratio < 0.0) mean_ratio = 0.0;
     if (mean_ratio > 1.0) mean_ratio = 1.0;
     double mean_x = plot_left + mean_ratio * plot_width;
@@ -1253,11 +1273,11 @@ static void frame_distribution_draw(GtkDrawingArea *area, cairo_t *cr, int width
     cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
     cairo_set_font_size(cr, 11.0);
 
-    double left_value = start;
-    double right_value = start + bin_width * bin_count;
+    double left_value = interior_start;
+    double right_value = interior_end;
     char tick_text[64];
 
-    g_snprintf(tick_text, sizeof(tick_text), "%.2f %s", left_value, unit);
+    g_snprintf(tick_text, sizeof(tick_text), "< %.2f %s", left_value, unit);
     cairo_move_to(cr, plot_left, plot_bottom + 16.0);
     cairo_show_text(cr, tick_text);
 
@@ -1268,7 +1288,7 @@ static void frame_distribution_draw(GtkDrawingArea *area, cairo_t *cr, int width
     cairo_move_to(cr, mid_x, plot_bottom + 32.0);
     cairo_show_text(cr, tick_text);
 
-    g_snprintf(tick_text, sizeof(tick_text), "%.2f %s", right_value, unit);
+    g_snprintf(tick_text, sizeof(tick_text), "> %.2f %s", right_value, unit);
     cairo_text_extents(cr, tick_text, &ext);
     double right_x = plot_right - ext.width - ext.x_bearing;
     cairo_move_to(cr, right_x, plot_bottom + 16.0);
@@ -3249,7 +3269,7 @@ int uv_gui_run(UvViewer **viewer, UvViewerConfig *cfg, const char *program_name)
     ctx->current_cfg = *cfg;
     ctx->stats_range_seconds = 300.0;
     ctx->frame_overlay_range_seconds = 60.0;
-    ctx->frame_overlay_show_values = TRUE;
+    ctx->frame_overlay_show_values = FALSE;
     ctx->frame_overlay_needs_refresh = FALSE;
     ctx->audio_runtime_enabled = cfg->audio_enabled;
     ctx->audio_active = FALSE;
