@@ -2359,6 +2359,7 @@ static GtkWidget *build_monitor_page(GuiContext *ctx) {
     gtk_box_append(GTK_BOX(dropdown_row), dropdown_label);
 
     ctx->source_model = gtk_string_list_new(NULL);
+    g_object_ref(ctx->source_model);
     GtkWidget *dropdown = gtk_drop_down_new(G_LIST_MODEL(ctx->source_model), NULL);
     gtk_widget_set_hexpand(dropdown, TRUE);
     ctx->source_dropdown = GTK_DROP_DOWN(dropdown);
