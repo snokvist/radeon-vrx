@@ -81,6 +81,7 @@ typedef struct {
     GtkLabel *frame_overlay_max_labels[2];
     GtkLabel *frame_distribution_stats_label;
     GtkDropDown *frame_overlay_range_dropdown;
+    GtkCheckButton *frame_overlay_values_toggle;
     GtkToggleButton *frame_block_enable_toggle;
     GtkToggleButton *frame_block_pause_toggle;
     GtkDropDown *frame_block_mode_dropdown;
@@ -118,6 +119,8 @@ typedef struct {
     gboolean audio_runtime_enabled;
     gboolean audio_active;
     double frame_overlay_range_seconds;
+    gboolean frame_overlay_show_values;
+    gboolean frame_overlay_needs_refresh;
 } GuiContext;
 
 typedef struct {
@@ -167,6 +170,7 @@ static gboolean ensure_video_paintable(GuiContext *ctx);
 static void restart_stats_timer(GuiContext *ctx);
 static void set_stats_refresh_interval(GuiContext *ctx, guint interval_ms);
 static void frame_block_queue_overlay_draws(GuiContext *ctx);
+static void frame_block_queue_overlay_draws_force(GuiContext *ctx);
 static void stats_range_changed(GObject *dropdown, GParamSpec *pspec, gpointer user_data);
 static void stats_chart_draw(GtkDrawingArea *area, cairo_t *cr, int width, int height, gpointer user_data);
 static void frame_block_draw(GtkDrawingArea *area, cairo_t *cr, int width, int height, gpointer user_data);
@@ -181,6 +185,7 @@ static void on_frame_block_reset_clicked(GtkButton *button, gpointer user_data);
 static void on_frame_block_threshold_changed(GtkSpinButton *spin, gpointer user_data);
 static void on_frame_block_color_toggled(GtkCheckButton *check, gpointer user_data);
 static void on_frame_overlay_range_changed(GObject *dropdown, GParamSpec *pspec, gpointer user_data);
+static void on_frame_overlay_values_toggled(GtkToggleButton *button, gpointer user_data);
 static void on_videorate_toggled(GtkCheckButton *button, gpointer user_data);
 static void on_audio_toggled(GtkCheckButton *button, gpointer user_data);
 static void on_source_dropdown_changed(GObject *dropdown, GParamSpec *pspec, gpointer user_data);
@@ -429,8 +434,15 @@ static void frame_block_update_summary(GuiContext *ctx) {
     g_string_free(summary, TRUE);
 }
 
-static void frame_block_queue_overlay_draws(GuiContext *ctx) {
+static void frame_block_queue_overlay_draws_internal(GuiContext *ctx, gboolean force) {
     if (!ctx) return;
+    if (ctx->frame_block_paused && !force) {
+        ctx->frame_overlay_needs_refresh = TRUE;
+        return;
+    }
+
+    ctx->frame_overlay_needs_refresh = FALSE;
+
     if (ctx->frame_overlay_lateness) {
         gtk_widget_queue_draw(GTK_WIDGET(ctx->frame_overlay_lateness));
     }
@@ -440,6 +452,14 @@ static void frame_block_queue_overlay_draws(GuiContext *ctx) {
     if (ctx->frame_distribution_area) {
         gtk_widget_queue_draw(GTK_WIDGET(ctx->frame_distribution_area));
     }
+}
+
+static void frame_block_queue_overlay_draws(GuiContext *ctx) {
+    frame_block_queue_overlay_draws_internal(ctx, FALSE);
+}
+
+static void frame_block_queue_overlay_draws_force(GuiContext *ctx) {
+    frame_block_queue_overlay_draws_internal(ctx, TRUE);
 }
 
 static gboolean frame_block_stats_latest(const UvFrameBlockStats *fb,
@@ -582,6 +602,21 @@ static void frame_block_sync_controls(GuiContext *ctx, const UvFrameBlockStats *
         }
         frame_block_update_metric_toggle_label(ctx);
         gtk_widget_set_sensitive(GTK_WIDGET(ctx->frame_block_metric_toggle), TRUE);
+    }
+
+    if (ctx->frame_overlay_values_toggle) {
+        gboolean desired = ctx->frame_overlay_show_values;
+        gboolean current = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(ctx->frame_overlay_values_toggle));
+        if (current != desired) {
+            g_signal_handlers_block_by_func(ctx->frame_overlay_values_toggle,
+                                            G_CALLBACK(on_frame_overlay_values_toggled),
+                                            ctx);
+            gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ctx->frame_overlay_values_toggle), desired);
+            g_signal_handlers_unblock_by_func(ctx->frame_overlay_values_toggle,
+                                              G_CALLBACK(on_frame_overlay_values_toggled),
+                                              ctx);
+        }
+        gtk_widget_set_sensitive(GTK_WIDGET(ctx->frame_overlay_values_toggle), TRUE);
     }
 
     if (ctx->frame_block_reset_button) {
@@ -752,6 +787,7 @@ static void frame_overlay_draw(GtkDrawingArea *area, cairo_t *cr, int width, int
 
     GtkLabel *live_label = GTK_LABEL(g_object_get_data(G_OBJECT(area), "overlay-live-label"));
     GtkLabel *max_label = GTK_LABEL(g_object_get_data(G_OBJECT(area), "overlay-max-label"));
+    gboolean show_values = ctx->frame_overlay_show_values;
     const char *default_live = "Live: --";
     const char *default_max = "Max: --";
 
@@ -918,35 +954,37 @@ static void frame_overlay_draw(GtkDrawingArea *area, cairo_t *cr, int width, int
             cairo_fill(cr);
         }
 
-        cairo_set_source_rgb(cr, 0.92, 0.92, 0.96);
-        cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
-        cairo_set_font_size(cr, 9.5);
-        for (guint i = 0; i < points->len; i++) {
-            FrameOverlayPoint *pt = &g_array_index(points, FrameOverlayPoint, i);
-            char value_text[64];
-            if (metric == FRAME_OVERLAY_METRIC_SIZE) {
-                g_snprintf(value_text, sizeof(value_text), "%.2f KB", pt->value);
-            } else {
-                g_snprintf(value_text, sizeof(value_text), "%.2f ms", pt->value);
-            }
-            cairo_text_extents_t ext;
-            cairo_text_extents(cr, value_text, &ext);
-            double text_x = pt->x + 4.0;
-            if (text_x + ext.width > plot_right) {
-                text_x = plot_right - ext.width - 2.0;
-            }
-            if (text_x < plot_left) {
-                text_x = plot_left + 2.0;
-            }
-            double text_y = pt->y - 4.0;
-            if (text_y - ext.height < plot_top) {
-                text_y = pt->y + ext.height + 6.0;
-                if (text_y > plot_bottom - 2.0) {
-                    text_y = plot_bottom - 2.0;
+        if (show_values) {
+            cairo_set_source_rgb(cr, 0.92, 0.92, 0.96);
+            cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
+            cairo_set_font_size(cr, 9.5);
+            for (guint i = 0; i < points->len; i++) {
+                FrameOverlayPoint *pt = &g_array_index(points, FrameOverlayPoint, i);
+                char value_text[64];
+                if (metric == FRAME_OVERLAY_METRIC_SIZE) {
+                    g_snprintf(value_text, sizeof(value_text), "%.2f KB", pt->value);
+                } else {
+                    g_snprintf(value_text, sizeof(value_text), "%.2f ms", pt->value);
                 }
+                cairo_text_extents_t ext;
+                cairo_text_extents(cr, value_text, &ext);
+                double text_x = pt->x + 4.0;
+                if (text_x + ext.width > plot_right) {
+                    text_x = plot_right - ext.width - 2.0;
+                }
+                if (text_x < plot_left) {
+                    text_x = plot_left + 2.0;
+                }
+                double text_y = pt->y - 4.0;
+                if (text_y - ext.height < plot_top) {
+                    text_y = pt->y + ext.height + 6.0;
+                    if (text_y > plot_bottom - 2.0) {
+                        text_y = plot_bottom - 2.0;
+                    }
+                }
+                cairo_move_to(cr, text_x, text_y);
+                cairo_show_text(cr, value_text);
             }
-            cairo_move_to(cr, text_x, text_y);
-            cairo_show_text(cr, value_text);
         }
     }
 
@@ -1079,6 +1117,7 @@ static void frame_distribution_draw(GtkDrawingArea *area, cairo_t *cr, int width
     double start = mean - bin_width * ((double)bin_count / 2.0);
 
     guint bins[15] = {0};
+    double bin_sums[15] = {0.0};
     guint max_bin_count = 0;
     for (guint i = 0; i < values->len; i++) {
         double v = g_array_index(values, double, i);
@@ -1087,9 +1126,15 @@ static void frame_distribution_draw(GtkDrawingArea *area, cairo_t *cr, int width
         if (idx < 0) idx = 0;
         if (idx >= (int)bin_count) idx = (int)bin_count - 1;
         bins[idx]++;
+        bin_sums[idx] += v;
         if (bins[idx] > max_bin_count) {
             max_bin_count = bins[idx];
         }
+    }
+
+    double bin_means[15];
+    for (guint i = 0; i < bin_count; i++) {
+        bin_means[i] = (bins[i] > 0) ? (bin_sums[i] / (double)bins[i]) : NAN;
     }
 
     if (max_bin_count == 0) {
@@ -1169,6 +1214,27 @@ static void frame_distribution_draw(GtkDrawingArea *area, cairo_t *cr, int width
             }
             cairo_move_to(cr, cx, cy);
             cairo_show_text(cr, count_label);
+
+            double mean_val = bin_means[i];
+            if (isfinite(mean_val)) {
+                cairo_set_source_rgb(cr, 0.78, 0.90, 1.0);
+                cairo_set_font_size(cr, 9.0);
+                char mean_label[48];
+                g_snprintf(mean_label, sizeof(mean_label), "μ %.2f %s", mean_val, unit);
+                cairo_text_extents_t mean_ext;
+                cairo_text_extents(cr, mean_label, &mean_ext);
+                double mean_x = x + (bar_width - mean_ext.width) / 2.0 - mean_ext.x_bearing;
+                double mean_y = cy - 12.0;
+                if (mean_y < plot_top + 8.0) {
+                    mean_y = cy + mean_ext.height + 6.0;
+                    if (mean_y > plot_bottom - 4.0) {
+                        mean_y = plot_bottom - 4.0;
+                    }
+                }
+                cairo_move_to(cr, mean_x, mean_y);
+                cairo_show_text(cr, mean_label);
+            }
+
             cairo_set_source_rgb(cr, 0.35, 0.70, 1.0);
         }
     }
@@ -1760,6 +1826,7 @@ static void on_frame_block_enable_toggled(GtkToggleButton *button, gpointer user
     memset(ctx->frame_block_color_counts_kb, 0, sizeof(ctx->frame_block_color_counts_kb));
     if (!enabled) {
         ctx->frame_block_paused = FALSE;
+        ctx->frame_overlay_needs_refresh = FALSE;
     }
 
     if (ctx->viewer) {
@@ -1772,7 +1839,7 @@ static void on_frame_block_enable_toggled(GtkToggleButton *button, gpointer user
     frame_block_sync_controls(ctx, NULL);
     frame_block_update_summary(ctx);
     if (ctx->frame_block_area) gtk_widget_queue_draw(GTK_WIDGET(ctx->frame_block_area));
-    frame_block_queue_overlay_draws(ctx);
+    frame_block_queue_overlay_draws_force(ctx);
 }
 
 static void on_frame_block_pause_toggled(GtkToggleButton *button, gpointer user_data) {
@@ -1784,6 +1851,9 @@ static void on_frame_block_pause_toggled(GtkToggleButton *button, gpointer user_
         uv_viewer_frame_block_pause(ctx->viewer, paused);
     }
     frame_block_update_summary(ctx);
+    if (!paused && ctx->frame_overlay_needs_refresh) {
+        frame_block_queue_overlay_draws_force(ctx);
+    }
 }
 
 static void on_frame_block_mode_changed(GObject *dropdown, GParamSpec *pspec, gpointer user_data) {
@@ -1796,6 +1866,7 @@ static void on_frame_block_mode_changed(GObject *dropdown, GParamSpec *pspec, gp
         uv_viewer_frame_block_configure(ctx->viewer, TRUE, snapshot_mode);
     }
     frame_block_update_summary(ctx);
+    frame_block_queue_overlay_draws_force(ctx);
 }
 
 static void on_frame_block_width_changed(GObject *dropdown, GParamSpec *pspec, gpointer user_data) {
@@ -1831,7 +1902,7 @@ static void on_frame_block_width_changed(GObject *dropdown, GParamSpec *pspec, g
         uv_viewer_frame_block_set_width(ctx->viewer, new_width);
     }
     if (ctx->frame_block_area) gtk_widget_queue_draw(GTK_WIDGET(ctx->frame_block_area));
-    frame_block_queue_overlay_draws(ctx);
+    frame_block_queue_overlay_draws_force(ctx);
 }
 
 static void on_frame_block_metric_toggled(GtkToggleButton *button, gpointer user_data) {
@@ -1847,7 +1918,7 @@ static void on_frame_block_metric_toggled(GtkToggleButton *button, gpointer user
     frame_block_sync_controls(ctx, NULL);
     frame_block_update_summary(ctx);
     if (ctx->frame_block_area) gtk_widget_queue_draw(GTK_WIDGET(ctx->frame_block_area));
-    frame_block_queue_overlay_draws(ctx);
+    frame_block_queue_overlay_draws_force(ctx);
 }
 
 static void on_frame_block_reset_clicked(GtkButton *button, gpointer user_data) {
@@ -1874,7 +1945,7 @@ static void on_frame_block_reset_clicked(GtkButton *button, gpointer user_data) 
     frame_block_sync_controls(ctx, NULL);
     frame_block_update_summary(ctx);
     if (ctx->frame_block_area) gtk_widget_queue_draw(GTK_WIDGET(ctx->frame_block_area));
-    frame_block_queue_overlay_draws(ctx);
+    frame_block_queue_overlay_draws_force(ctx);
 }
 
 static void on_frame_block_threshold_changed(GtkSpinButton *spin, gpointer user_data) {
@@ -1912,8 +1983,20 @@ static void on_frame_overlay_range_changed(GObject *dropdown, GParamSpec *pspec,
 
     if (ctx->frame_overlay_range_seconds != new_range) {
         ctx->frame_overlay_range_seconds = new_range;
-        frame_block_queue_overlay_draws(ctx);
+        frame_block_queue_overlay_draws_force(ctx);
     }
+}
+
+static void on_frame_overlay_values_toggled(GtkToggleButton *button, gpointer user_data) {
+    GuiContext *ctx = user_data;
+    if (!ctx || !GTK_IS_TOGGLE_BUTTON(button)) return;
+
+    gboolean show_values = gtk_toggle_button_get_active(button);
+    if (ctx->frame_overlay_show_values != show_values) {
+        ctx->frame_overlay_show_values = show_values;
+    }
+
+    frame_block_queue_overlay_draws_force(ctx);
 }
 
 static gboolean gui_restart_with_config(GuiContext *ctx, const UvViewerConfig *cfg) {
@@ -2535,6 +2618,7 @@ static GtkWidget *build_frame_block_page(GuiContext *ctx) {
     ctx->frame_distribution_stats_label = NULL;
     ctx->frame_distribution_area = NULL;
     ctx->frame_overlay_range_dropdown = NULL;
+    ctx->frame_overlay_values_toggle = NULL;
 
     GtkWidget *controls = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
     gtk_box_append(GTK_BOX(content), controls);
@@ -2584,6 +2668,11 @@ static GtkWidget *build_frame_block_page(GuiContext *ctx) {
     g_signal_connect(ctx->frame_overlay_range_dropdown, "notify::selected", G_CALLBACK(on_frame_overlay_range_changed), ctx);
     gtk_box_append(GTK_BOX(range_box), GTK_WIDGET(ctx->frame_overlay_range_dropdown));
     gtk_box_append(GTK_BOX(controls), range_box);
+
+    ctx->frame_overlay_values_toggle = GTK_CHECK_BUTTON(gtk_check_button_new_with_label("Show Values"));
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ctx->frame_overlay_values_toggle), ctx->frame_overlay_show_values);
+    g_signal_connect(ctx->frame_overlay_values_toggle, "toggled", G_CALLBACK(on_frame_overlay_values_toggled), ctx);
+    gtk_box_append(GTK_BOX(controls), GTK_WIDGET(ctx->frame_overlay_values_toggle));
 
     ctx->frame_block_pause_toggle = GTK_TOGGLE_BUTTON(gtk_toggle_button_new_with_label("Pause"));
     gtk_widget_set_sensitive(GTK_WIDGET(ctx->frame_block_pause_toggle), FALSE);
@@ -3135,6 +3224,7 @@ static void on_app_shutdown(GApplication *app, gpointer user_data) {
     ctx->frame_block_width_dropdown = NULL;
     ctx->frame_block_metric_toggle = NULL;
     ctx->frame_overlay_range_dropdown = NULL;
+    ctx->frame_overlay_values_toggle = NULL;
     ctx->frame_block_summary_label = NULL;
     ctx->frame_block_reset_button = NULL;
     for (int i = 0; i < 3; i++) {
@@ -3159,6 +3249,8 @@ int uv_gui_run(UvViewer **viewer, UvViewerConfig *cfg, const char *program_name)
     ctx->current_cfg = *cfg;
     ctx->stats_range_seconds = 300.0;
     ctx->frame_overlay_range_seconds = 60.0;
+    ctx->frame_overlay_show_values = TRUE;
+    ctx->frame_overlay_needs_refresh = FALSE;
     ctx->audio_runtime_enabled = cfg->audio_enabled;
     ctx->audio_active = FALSE;
     ctx->frame_block_thresholds_ms[0] = FRAME_BLOCK_DEFAULT_GREEN_MS;
