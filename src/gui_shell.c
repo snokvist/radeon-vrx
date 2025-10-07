@@ -185,7 +185,7 @@ static void on_frame_block_reset_clicked(GtkButton *button, gpointer user_data);
 static void on_frame_block_threshold_changed(GtkSpinButton *spin, gpointer user_data);
 static void on_frame_block_color_toggled(GtkCheckButton *check, gpointer user_data);
 static void on_frame_overlay_range_changed(GObject *dropdown, GParamSpec *pspec, gpointer user_data);
-static void on_frame_overlay_values_toggled(GtkToggleButton *button, gpointer user_data);
+static void on_frame_overlay_values_toggled(GtkCheckButton *button, gpointer user_data);
 static void on_videorate_toggled(GtkCheckButton *button, gpointer user_data);
 static void on_audio_toggled(GtkCheckButton *button, gpointer user_data);
 static void on_source_dropdown_changed(GObject *dropdown, GParamSpec *pspec, gpointer user_data);
@@ -606,12 +606,12 @@ static void frame_block_sync_controls(GuiContext *ctx, const UvFrameBlockStats *
 
     if (ctx->frame_overlay_values_toggle) {
         gboolean desired = ctx->frame_overlay_show_values;
-        gboolean current = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(ctx->frame_overlay_values_toggle));
+        gboolean current = gtk_check_button_get_active(ctx->frame_overlay_values_toggle);
         if (current != desired) {
             g_signal_handlers_block_by_func(ctx->frame_overlay_values_toggle,
                                             G_CALLBACK(on_frame_overlay_values_toggled),
                                             ctx);
-            gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ctx->frame_overlay_values_toggle), desired);
+            gtk_check_button_set_active(ctx->frame_overlay_values_toggle, desired);
             g_signal_handlers_unblock_by_func(ctx->frame_overlay_values_toggle,
                                               G_CALLBACK(on_frame_overlay_values_toggled),
                                               ctx);
@@ -1987,11 +1987,11 @@ static void on_frame_overlay_range_changed(GObject *dropdown, GParamSpec *pspec,
     }
 }
 
-static void on_frame_overlay_values_toggled(GtkToggleButton *button, gpointer user_data) {
+static void on_frame_overlay_values_toggled(GtkCheckButton *button, gpointer user_data) {
     GuiContext *ctx = user_data;
-    if (!ctx || !GTK_IS_TOGGLE_BUTTON(button)) return;
+    if (!ctx || !GTK_IS_CHECK_BUTTON(button)) return;
 
-    gboolean show_values = gtk_toggle_button_get_active(button);
+    gboolean show_values = gtk_check_button_get_active(button);
     if (ctx->frame_overlay_show_values != show_values) {
         ctx->frame_overlay_show_values = show_values;
     }
@@ -2670,7 +2670,7 @@ static GtkWidget *build_frame_block_page(GuiContext *ctx) {
     gtk_box_append(GTK_BOX(controls), range_box);
 
     ctx->frame_overlay_values_toggle = GTK_CHECK_BUTTON(gtk_check_button_new_with_label("Show Values"));
-    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ctx->frame_overlay_values_toggle), ctx->frame_overlay_show_values);
+    gtk_check_button_set_active(ctx->frame_overlay_values_toggle, ctx->frame_overlay_show_values);
     g_signal_connect(ctx->frame_overlay_values_toggle, "toggled", G_CALLBACK(on_frame_overlay_values_toggled), ctx);
     gtk_box_append(GTK_BOX(controls), GTK_WIDGET(ctx->frame_overlay_values_toggle));
 
