@@ -626,7 +626,7 @@ static void frame_block_sync_controls(GuiContext *ctx, const UvFrameBlockStats *
     const double *thresholds = (ctx->frame_block_view == FRAME_BLOCK_VIEW_SIZE)
         ? ctx->frame_block_thresholds_kb
         : ctx->frame_block_thresholds_ms;
-    double step = (ctx->frame_block_view == FRAME_BLOCK_VIEW_SIZE) ? 10.0 : 0.5;
+    double step = (ctx->frame_block_view == FRAME_BLOCK_VIEW_SIZE) ? 2.0 : 0.5;
     guint digits = (ctx->frame_block_view == FRAME_BLOCK_VIEW_SIZE) ? 1u : 1u;
     const char *unit = (ctx->frame_block_view == FRAME_BLOCK_VIEW_SIZE) ? "KB" : "ms";
 
@@ -636,8 +636,16 @@ static void frame_block_sync_controls(GuiContext *ctx, const UvFrameBlockStats *
         g_signal_handlers_block_by_func(spin, G_CALLBACK(on_frame_block_threshold_changed), ctx);
         gtk_spin_button_set_digits(spin, digits);
         gtk_spin_button_set_increments(spin, step, step * 5.0);
-        gtk_spin_button_set_range(spin, 0.0, ctx->frame_block_view == FRAME_BLOCK_VIEW_SIZE ? 100000.0 : 1000.0);
-        gtk_spin_button_set_value(spin, thresholds[i]);
+        gtk_spin_button_set_range(spin, 0.0,
+                                  ctx->frame_block_view == FRAME_BLOCK_VIEW_SIZE ? 100000.0 : 1000.0);
+
+        if (!gtk_widget_has_focus(GTK_WIDGET(spin))) {
+            double current = gtk_spin_button_get_value(spin);
+            if (fabs(current - thresholds[i]) > 0.0001) {
+                gtk_spin_button_set_value(spin, thresholds[i]);
+            }
+        }
+
         g_signal_handlers_unblock_by_func(spin, G_CALLBACK(on_frame_block_threshold_changed), ctx);
 
         GtkLabel *label = ctx->frame_block_threshold_labels[i];
