@@ -1565,24 +1565,37 @@ static void refresh_stats(GuiContext *ctx) {
     } else {
         if (ctx->source_model) {
             guint existing = g_list_model_get_n_items(G_LIST_MODEL(ctx->source_model));
+            gboolean old_suppress = ctx->suppress_source_change;
+            ctx->suppress_source_change = TRUE;
+
             if (existing > 0) {
                 gtk_string_list_splice(ctx->source_model, 0, existing, NULL);
             }
+
             for (guint i = 0; i < source_count; i++) {
                 UvSourceStats *src = &g_array_index(stats.sources, UvSourceStats, i);
                 char label[128];
                 g_snprintf(label, sizeof(label), "%u: %s", i, src->address);
                 gtk_string_list_append(ctx->source_model, label);
+
+                if (!selected_source && src->selected) {
+                    selected_index = i;
+                    selected_source = src;
+                }
             }
+
             ctx->known_source_count = source_count;
+            ctx->suppress_source_change = old_suppress;
         }
 
-        for (guint i = 0; i < source_count; i++) {
-            UvSourceStats *src = &g_array_index(stats.sources, UvSourceStats, i);
-            if (src->selected) {
-                selected_index = i;
-                selected_source = src;
-                break;
+        if (!selected_source) {
+            for (guint i = 0; i < source_count; i++) {
+                UvSourceStats *src = &g_array_index(stats.sources, UvSourceStats, i);
+                if (src->selected) {
+                    selected_index = i;
+                    selected_source = src;
+                    break;
+                }
             }
         }
 
