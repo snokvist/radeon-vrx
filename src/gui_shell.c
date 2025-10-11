@@ -46,6 +46,8 @@ typedef struct {
     gboolean suppress_source_change;
     gboolean pending_source_valid;
     guint pending_source_index;
+    gboolean active_source_valid;
+    guint active_source_index;
     guint stats_refresh_interval_ms;
     GtkSpinButton *listen_port_spin;
     GtkSpinButton *jitter_latency_spin;
@@ -1564,37 +1566,37 @@ static void refresh_stats(GuiContext *ctx) {
         }
         ctx->pending_source_valid = FALSE;
         ctx->pending_source_index = GTK_INVALID_LIST_POSITION;
+        ctx->active_source_valid = FALSE;
+        ctx->active_source_index = GTK_INVALID_LIST_POSITION;
         if (ctx->source_detail_label) {
             gtk_label_set_text(ctx->source_detail_label, "No sources discovered yet.");
         }
     } else {
+        guint existing_items = 0;
         if (ctx->source_model) {
-            guint existing = g_list_model_get_n_items(G_LIST_MODEL(ctx->source_model));
-            gboolean old_suppress = ctx->suppress_source_change;
-            ctx->suppress_source_change = TRUE;
+            existing_items = g_list_model_get_n_items(G_LIST_MODEL(ctx->source_model));
+        }
 
-            if (existing > 0) {
-                gtk_string_list_splice(ctx->source_model, 0, existing, NULL);
+        char **labels = NULL;
+        if (ctx->source_model && source_count > 0) {
+            labels = g_new0(char *, source_count + 1);
+        }
+
+        for (guint i = 0; i < source_count; i++) {
+            UvSourceStats *src = &g_array_index(stats.sources, UvSourceStats, i);
+
+            if (labels) {
+                labels[i] = g_strdup_printf("%u: %s", i, src->address);
             }
 
-            for (guint i = 0; i < source_count; i++) {
-                UvSourceStats *src = &g_array_index(stats.sources, UvSourceStats, i);
-                char label[128];
-                g_snprintf(label, sizeof(label), "%u: %s", i, src->address);
-                gtk_string_list_append(ctx->source_model, label);
-
-                if (ctx->pending_source_valid && ctx->pending_source_index == i) {
-                    pending_source = src;
-                }
-
-                if (!viewer_selected_source && src->selected) {
-                    viewer_selected_index = i;
-                    viewer_selected_source = src;
-                }
+            if (ctx->pending_source_valid && ctx->pending_source_index == i) {
+                pending_source = src;
             }
 
-            ctx->known_source_count = source_count;
-            ctx->suppress_source_change = old_suppress;
+            if (!viewer_selected_source && src->selected) {
+                viewer_selected_index = i;
+                viewer_selected_source = src;
+            }
         }
 
         if (!viewer_selected_source) {
@@ -1606,6 +1608,37 @@ static void refresh_stats(GuiContext *ctx) {
                     break;
                 }
             }
+        }
+
+        if (labels) {
+            labels[source_count] = NULL;
+        }
+
+        if (ctx->source_model) {
+            gboolean list_changed = (existing_items != source_count);
+
+            if (!list_changed) {
+                for (guint i = 0; i < source_count; i++) {
+                    GObject *item = g_list_model_get_item(G_LIST_MODEL(ctx->source_model), i);
+                    const char *current = gtk_string_object_get_string(GTK_STRING_OBJECT(item));
+                    if (g_strcmp0(current, labels[i]) != 0) {
+                        list_changed = TRUE;
+                    }
+                    g_object_unref(item);
+                    if (list_changed) {
+                        break;
+                    }
+                }
+            }
+
+            if (list_changed) {
+                gboolean old_suppress = ctx->suppress_source_change;
+                ctx->suppress_source_change = TRUE;
+                gtk_string_list_splice(ctx->source_model, 0, existing_items, (const char * const *)labels);
+                ctx->suppress_source_change = old_suppress;
+            }
+
+            ctx->known_source_count = source_count;
         }
 
         if (ctx->source_dropdown) {
@@ -1688,6 +1721,18 @@ static void refresh_stats(GuiContext *ctx) {
             char msg[96];
             g_snprintf(msg, sizeof(msg), "Switching to source %u...", ctx->pending_source_index);
             update_status(ctx, msg);
+        }
+
+        if (viewer_selected_source) {
+            ctx->active_source_valid = TRUE;
+            ctx->active_source_index = viewer_selected_index;
+        } else if (!ctx->pending_source_valid) {
+            ctx->active_source_valid = FALSE;
+            ctx->active_source_index = GTK_INVALID_LIST_POSITION;
+        }
+
+        if (labels) {
+            g_strfreev(labels);
         }
     }
 
@@ -2320,6 +2365,15 @@ static void on_source_dropdown_changed(GObject *dropdown, GParamSpec *pspec, gpo
     guint selected = gtk_drop_down_get_selected(GTK_DROP_DOWN(dropdown));
     if (selected == GTK_INVALID_LIST_POSITION) return;
 
+    if (ctx->pending_source_valid && ctx->pending_source_index == selected) {
+        return;
+    }
+
+    if (!ctx->pending_source_valid && ctx->active_source_valid &&
+        ctx->active_source_index == selected) {
+        return;
+    }
+
     ctx->pending_source_index = selected;
     ctx->pending_source_valid = TRUE;
 
@@ -2377,6 +2431,13 @@ static gboolean dispatch_ui_event(gpointer user_data) {
         case UV_VIEWER_EVENT_SOURCE_SELECTED: {
             ctx->pending_source_valid = FALSE;
             ctx->pending_source_index = GTK_INVALID_LIST_POSITION;
+            if (event->source_index >= 0) {
+                ctx->active_source_valid = TRUE;
+                ctx->active_source_index = (guint)event->source_index;
+            } else {
+                ctx->active_source_valid = FALSE;
+                ctx->active_source_index = GTK_INVALID_LIST_POSITION;
+            }
             char msg[256];
             g_snprintf(msg, sizeof(msg), "Selected [%d] %s",
                        event->source_index, event->address ? event->address : "");
@@ -2390,6 +2451,11 @@ static gboolean dispatch_ui_event(gpointer user_data) {
                 (guint)event->source_index == ctx->pending_source_index) {
                 ctx->pending_source_valid = FALSE;
                 ctx->pending_source_index = GTK_INVALID_LIST_POSITION;
+            }
+            if (event->source_index >= 0 && ctx->active_source_valid &&
+                (guint)event->source_index == ctx->active_source_index) {
+                ctx->active_source_valid = FALSE;
+                ctx->active_source_index = GTK_INVALID_LIST_POSITION;
             }
             char msg[256];
             g_snprintf(msg, sizeof(msg), "Source removed [%d]",
@@ -3410,6 +3476,8 @@ int uv_gui_run(UvViewer **viewer, UvViewerConfig *cfg, const char *program_name)
     ctx->suppress_source_change = FALSE;
     ctx->pending_source_valid = FALSE;
     ctx->pending_source_index = GTK_INVALID_LIST_POSITION;
+    ctx->active_source_valid = FALSE;
+    ctx->active_source_index = GTK_INVALID_LIST_POSITION;
     ctx->stats_refresh_interval_ms = 200;
     for (guint i = 0; i < FRAME_BLOCK_COLOR_COUNT; i++) {
         ctx->frame_block_colors_visible[i] = TRUE;
