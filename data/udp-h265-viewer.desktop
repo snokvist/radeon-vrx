@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=UDP H.265 Viewer
+Comment=Monitor UDP RTP/H.265 video feeds with telemetry
+Exec=udp-h265-viewer
+Icon=applications-multimedia
+Terminal=false
+Categories=AudioVideo;Video;Network;
+StartupNotify=true

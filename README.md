@@ -38,6 +38,14 @@ make
 
 The resulting `udp-h265-viewer` binary is placed at the repository root. Re-run `make` after pulling updates or modifying the source. Use `make clean && make` when headers or compiler flags change to guarantee a full rebuild.
 
+To integrate the viewer into your desktop environment, install the binary and the accompanying GNOME application shortcut:
+
+```bash
+sudo make install
+```
+
+By default the binary is installed to `/usr/local/bin` and the desktop entry is registered under `/usr/local/share/applications/udp-h265-viewer.desktop`. Override `PREFIX` (and/or use `DESTDIR`) if you want to install into a different prefix such as a staging directory or your user-local tree.
+
 > **Insert Screenshot 3:** _Terminal capture of a successful build in progress._
 
 ## Running the Viewer
