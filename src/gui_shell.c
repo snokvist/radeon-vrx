@@ -160,7 +160,7 @@ typedef struct {
 #define FRAME_OVERLAY_METRIC_LATENESS 0u
 #define FRAME_OVERLAY_METRIC_SIZE     1u
 
-static const guint FRAME_BLOCK_WIDTH_OPTIONS[] = {30u, 60u, 90u, 120u};
+static const guint FRAME_BLOCK_WIDTH_OPTIONS[] = {30u, 60u, 90u, 100u, 120u};
 #define FRAME_BLOCK_WIDTH_OPTION_COUNT (G_N_ELEMENTS(FRAME_BLOCK_WIDTH_OPTIONS))
 
 static GtkWidget *build_monitor_page(GuiContext *ctx);
@@ -2839,7 +2839,7 @@ static GtkWidget *build_frame_block_page(GuiContext *ctx) {
     g_signal_connect(ctx->frame_block_mode_dropdown, "notify::selected", G_CALLBACK(on_frame_block_mode_changed), ctx);
     gtk_box_append(GTK_BOX(controls), GTK_WIDGET(ctx->frame_block_mode_dropdown));
 
-    const char *width_labels[] = {"30", "60", "90", "120", NULL};
+    const char *width_labels[] = {"30", "60", "90", "100", "120", NULL};
     GtkWidget *width_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
     GtkWidget *width_label = gtk_label_new("Row width");
     gtk_widget_set_valign(width_label, GTK_ALIGN_CENTER);
