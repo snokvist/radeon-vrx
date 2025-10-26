@@ -16,6 +16,7 @@
 #define UV_FRAME_BLOCK_DEFAULT_SIZE_YELLOW_KB 256.0
 #define UV_FRAME_BLOCK_DEFAULT_SIZE_ORANGE_KB 512.0
 #define UV_FRAME_BLOCK_MISSING_SENTINEL (-1.0)
+#define UV_FRAME_BLOCK_REBASE_MISSING_THRESHOLD 3u
 
 typedef struct UvFrameBlockState {
     guint width;
@@ -40,6 +41,8 @@ typedef struct UvFrameBlockState {
     gboolean have_expected_period;
     guint real_samples;
     guint missing_frames;
+    guint consecutive_missing_estimates;
+    guint last_missing_estimate;
     guint color_counts_lateness[UV_FRAME_BLOCK_COLOR_BUCKETS];
     guint color_counts_size[UV_FRAME_BLOCK_COLOR_BUCKETS];
     uint32_t last_frame_ts;
@@ -85,6 +88,8 @@ static void frame_block_state_reset(UvFrameBlockState *state) {
     state->have_expected_period = FALSE;
     state->real_samples = 0;
     state->missing_frames = 0;
+    state->consecutive_missing_estimates = 0;
+    state->last_missing_estimate = 0;
     memset(state->color_counts_lateness, 0, sizeof(state->color_counts_lateness));
     memset(state->color_counts_size, 0, sizeof(state->color_counts_size));
     state->last_frame_ts = 0;
@@ -385,6 +390,27 @@ static void frame_block_process_packet(RelayController *rc,
     state->have_baseline = TRUE;
 
     if (rc->frame_block.paused) return;
+
+    if (missing > 0) {
+        if (state->last_missing_estimate == missing) {
+            state->consecutive_missing_estimates++;
+        } else {
+            state->last_missing_estimate = missing;
+            state->consecutive_missing_estimates = 1;
+        }
+
+        if (state->consecutive_missing_estimates >= UV_FRAME_BLOCK_REBASE_MISSING_THRESHOLD && expected_ms > 0.0) {
+            missing = 0;
+            normalized_expected_ms = expected_ms;
+            state->expected_frame_ms = expected_ms;
+            state->have_expected_period = TRUE;
+            state->consecutive_missing_estimates = 0;
+            state->last_missing_estimate = 0;
+        }
+    } else {
+        state->consecutive_missing_estimates = 0;
+        state->last_missing_estimate = 0;
+    }
 
     if (missing > 0) {
         for (guint m = 0; m < missing; m++) {
