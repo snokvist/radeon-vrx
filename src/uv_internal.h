@@ -14,6 +14,8 @@ G_BEGIN_DECLS
 #define UV_RELAY_BUF_SIZE 65536
 #define UV_RTP_WIN_SIZE 4096
 #define UV_RTP_SLOT_EMPTY 0xffffffffu
+#define UV_SOURCE_FRAME_FPS_WINDOW_SAMPLES 512u
+#define UV_DECODER_FPS_WINDOW_SAMPLES 512u
 
 struct UvFrameBlockState;
 
@@ -40,9 +42,13 @@ typedef struct {
     uint64_t rtp_duplicate_packets;
     uint64_t rtp_reordered_packets;
     uint32_t rtp_seq_slot[UV_RTP_WIN_SIZE];
+    uint64_t rtp_marker_frames;
+    gint64   frame_times_us[UV_SOURCE_FRAME_FPS_WINDOW_SAMPLES];
+    guint    frame_times_head;
+    guint    frame_times_count;
 
     bool     jitter_initialized;
-   uint32_t jitter_prev_transit;
+    uint32_t jitter_prev_transit;
     double   jitter_value;
 
     struct UvFrameBlockState *frame_block;
@@ -81,10 +87,11 @@ typedef struct {
 typedef struct {
     guint64 frames_total;
     gint64 first_frame_us;
-    guint64 prev_frames;
     gint64 prev_timestamp_us;
-    gint64 prev_snapshot_us;
     double last_snapshot_fps;
+    gint64 frame_times_us[UV_DECODER_FPS_WINDOW_SAMPLES];
+    guint frame_times_head;
+    guint frame_times_count;
     GMutex lock;
 } DecoderStats;
 

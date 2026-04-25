@@ -1,0 +1,11 @@
+# Build artifacts
+*.o
+*.d
+
+# Built binary
+/udp-h265-viewer
+
+# Editor / OS noise
+*.swp
+*~
+.DS_Store

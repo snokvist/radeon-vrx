@@ -65,6 +65,8 @@ typedef struct {
     uint64_t rtp_lost_packets;
     uint64_t rtp_duplicate_packets;
     uint64_t rtp_reordered_packets;
+    uint64_t rtp_marker_frames;
+    double rtp_marker_fps;
     double rfc3550_jitter_ms;
     double seconds_since_last_seen;
 } UvSourceStats;

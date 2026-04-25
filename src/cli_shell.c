@@ -101,7 +101,8 @@ static void print_stats(UvViewer *viewer, int clock_rate) {
                     " rate=%s last_seen=%.1fs"
                     " | rtp_unique=%" G_GUINT64_FORMAT " expected=%" G_GUINT64_FORMAT
                     " lost=%" G_GUINT64_FORMAT " dup=%" G_GUINT64_FORMAT
-                    " reorder=%" G_GUINT64_FORMAT " jitter=%.2fms\n",
+                    " reorder=%" G_GUINT64_FORMAT " marker_frames=%" G_GUINT64_FORMAT
+                    " input_fps=%.2f jitter=%.2fms\n",
                     i,
                     s->selected ? "*" : "",
                     s->address,
@@ -116,6 +117,8 @@ static void print_stats(UvViewer *viewer, int clock_rate) {
                     s->rtp_lost_packets,
                     s->rtp_duplicate_packets,
                     s->rtp_reordered_packets,
+                    s->rtp_marker_frames,
+                    s->rtp_marker_fps,
                     jitter_ms);
         }
     }
