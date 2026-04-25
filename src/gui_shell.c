@@ -23,7 +23,8 @@ typedef enum {
     STATS_METRIC_DUP,
     STATS_METRIC_REORDER,
     STATS_METRIC_JITTER,
-    STATS_METRIC_FPS,
+    STATS_METRIC_INPUT_FPS,
+    STATS_METRIC_DECODER_FPS,
     STATS_METRIC_COUNT
 } StatsMetric;
 
@@ -142,7 +143,8 @@ typedef struct {
     double dup_packets;
     double reorder_packets;
     double jitter_ms;
-    double fps_current;
+    double input_fps;
+    double decoder_fps_current;
     double frame_lateness_ms;
     double frame_size_kb;
     gboolean frame_valid;
@@ -1495,7 +1497,8 @@ static double stats_metric_value(const StatsSample *sample, StatsMetric metric) 
         case STATS_METRIC_DUP:     return sample->dup_packets;
         case STATS_METRIC_REORDER: return sample->reorder_packets;
         case STATS_METRIC_JITTER:  return sample->jitter_ms;
-        case STATS_METRIC_FPS:     return sample->fps_current;
+        case STATS_METRIC_INPUT_FPS: return sample->input_fps;
+        case STATS_METRIC_DECODER_FPS: return sample->decoder_fps_current;
         default:                   return 0.0;
     }
 }
@@ -1685,11 +1688,11 @@ static void refresh_stats(GuiContext *ctx) {
             if (detail_source) {
                 char rate_buf[64];
                 format_bitrate(detail_source->inbound_bitrate_bps, rate_buf, sizeof(rate_buf));
-                char detail[256];
+                char detail[320];
                 g_snprintf(detail, sizeof(detail),
                            "%u: %s\nrx=%" G_GUINT64_FORMAT "/%" G_GUINT64_FORMAT
                            " fwd=%" G_GUINT64_FORMAT "/%" G_GUINT64_FORMAT
-                           " rate=%s jitter=%.2fms last_seen=%.1fs",
+                           " rate=%s input_fps=%.2f jitter=%.2fms last_seen=%.1fs",
                            detail_index,
                            detail_source->address,
                            detail_source->rx_packets,
@@ -1697,6 +1700,7 @@ static void refresh_stats(GuiContext *ctx) {
                            detail_source->forwarded_packets,
                            detail_source->forwarded_bytes,
                            rate_buf,
+                           detail_source->rtp_marker_fps,
                            detail_source->rfc3550_jitter_ms,
                            detail_source->seconds_since_last_seen >= 0.0 ? detail_source->seconds_since_last_seen : 0.0);
                 if (waiting_for_switch) {
@@ -1744,7 +1748,8 @@ static void refresh_stats(GuiContext *ctx) {
         sample.dup_packets = (double)viewer_selected_source->rtp_duplicate_packets;
         sample.reorder_packets = (double)viewer_selected_source->rtp_reordered_packets;
         sample.jitter_ms = viewer_selected_source->rfc3550_jitter_ms;
-        sample.fps_current = stats.decoder.instantaneous_fps;
+        sample.input_fps = viewer_selected_source->rtp_marker_fps;
+        sample.decoder_fps_current = stats.decoder.instantaneous_fps;
         double latest_lateness = NAN;
         double latest_size = NAN;
         gboolean latest_missing = FALSE;
@@ -2763,6 +2768,7 @@ static GtkWidget *build_stats_page(GuiContext *ctx) {
         "RTP Duplicate Packets",
         "RTP Reordered Packets",
         "RTP Jitter (ms)",
+        "Input Frame FPS",
         "Decoder FPS (current)"
     };
 

@@ -20,10 +20,11 @@ void uv_internal_decoder_stats_reset(DecoderStats *stats) {
     g_mutex_lock(&stats->lock);
     stats->frames_total = 0;
     stats->first_frame_us = 0;
-    stats->prev_frames = 0;
     stats->prev_timestamp_us = 0;
-    stats->prev_snapshot_us = 0;
     stats->last_snapshot_fps = 0.0;
+    memset(stats->frame_times_us, 0, sizeof(stats->frame_times_us));
+    stats->frame_times_head = 0;
+    stats->frame_times_count = 0;
     g_mutex_unlock(&stats->lock);
 }
 
@@ -33,6 +34,11 @@ void uv_internal_decoder_stats_push_frame(DecoderStats *stats, gint64 now_us) {
     stats->frames_total++;
     if (stats->first_frame_us == 0) stats->first_frame_us = now_us;
     stats->prev_timestamp_us = now_us;
+    stats->frame_times_us[stats->frame_times_head] = now_us;
+    stats->frame_times_head = (stats->frame_times_head + 1u) % UV_DECODER_FPS_WINDOW_SAMPLES;
+    if (stats->frame_times_count < UV_DECODER_FPS_WINDOW_SAMPLES) {
+        stats->frame_times_count++;
+    }
     g_mutex_unlock(&stats->lock);
 }
 
@@ -144,6 +150,7 @@ static void populate_source_snapshot(const UvRelaySource *src, int clock_rate, U
     }
     out->rtp_duplicate_packets = src->rtp_duplicate_packets;
     out->rtp_reordered_packets = src->rtp_reordered_packets;
+    out->rtp_marker_frames = src->rtp_marker_frames;
     if (src->jitter_value > 0.0) {
         out->rfc3550_jitter_ms = (src->jitter_value * 1000.0) / (double)MAX(clock_rate, 1);
     }

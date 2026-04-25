@@ -248,6 +248,10 @@ static void relay_source_clear_stats(UvRelaySource *src, gboolean reset_totals) 
     src->rtp_unique_packets = 0;
     src->rtp_duplicate_packets = 0;
     src->rtp_reordered_packets = 0;
+    src->rtp_marker_frames = 0;
+    src->frame_times_head = 0;
+    src->frame_times_count = 0;
+    memset(src->frame_times_us, 0, sizeof(src->frame_times_us));
     for (guint i = 0; i < UV_RTP_WIN_SIZE; ++i) {
         src->rtp_seq_slot[i] = UV_RTP_SLOT_EMPTY;
     }
@@ -305,6 +309,39 @@ static inline uint32_t rtp_now_ts_from_us(int clock_rate, gint64 us) {
 
 static inline uint32_t rtp_now_ts(int clock_rate) {
     return rtp_now_ts_from_us(clock_rate, g_get_monotonic_time());
+}
+
+static void source_record_marker_frame(UvRelaySource *src, gint64 arrival_us) {
+    if (!src || arrival_us <= 0) return;
+
+    src->rtp_marker_frames++;
+    src->frame_times_us[src->frame_times_head] = arrival_us;
+    src->frame_times_head = (src->frame_times_head + 1u) % UV_SOURCE_FRAME_FPS_WINDOW_SAMPLES;
+    if (src->frame_times_count < UV_SOURCE_FRAME_FPS_WINDOW_SAMPLES) {
+        src->frame_times_count++;
+    }
+}
+
+static double source_marker_window_fps(const UvRelaySource *src, gint64 now_us) {
+    if (!src || src->frame_times_count < 2 || now_us <= 0) return 0.0;
+
+    const gint64 window_start_us = now_us - G_USEC_PER_SEC;
+    const guint capacity = UV_SOURCE_FRAME_FPS_WINDOW_SAMPLES;
+    const guint oldest = (src->frame_times_head + capacity - src->frame_times_count) % capacity;
+    guint count = 0;
+    gint64 first_us = 0;
+    gint64 last_us = 0;
+
+    for (guint i = 0; i < src->frame_times_count; i++) {
+        gint64 ts = src->frame_times_us[(oldest + i) % capacity];
+        if (ts < window_start_us || ts > now_us) continue;
+        if (count == 0) first_us = ts;
+        last_us = ts;
+        count++;
+    }
+
+    if (count < 2 || last_us <= first_us) return 0.0;
+    return ((double)(count - 1u) * (double)G_USEC_PER_SEC) / (double)(last_us - first_us);
 }
 
 static void frame_block_process_packet(RelayController *rc,
@@ -450,10 +487,6 @@ static inline void rtp_update_stats(RelayController *rc,
 
     gboolean marker = (p[1] & 0x80) != 0;
 
-    if (rc->frame_block.enabled && is_selected) {
-        s->frame_block_accum_bytes += (uint64_t)len;
-    }
-
     uint16_t seq = (uint16_t)((p[2] << 8) | p[3]);
     uint32_t ts  = (uint32_t)((p[4] << 24) | (p[5] << 16) | (p[6] << 8) | p[7]);
 
@@ -465,13 +498,19 @@ static inline void rtp_update_stats(RelayController *rc,
     }
 
     guint idx = ext % UV_RTP_WIN_SIZE;
+    gboolean unique_packet = FALSE;
     if (s->rtp_seq_slot[idx] == ext) {
         s->rtp_duplicate_packets++;
     } else {
         if (ext < s->rtp_max_ext_seq) s->rtp_reordered_packets++;
         s->rtp_seq_slot[idx] = ext;
         s->rtp_unique_packets++;
+        unique_packet = TRUE;
         if (ext > s->rtp_max_ext_seq) s->rtp_max_ext_seq = ext;
+    }
+
+    if (unique_packet && rc->frame_block.enabled && is_selected) {
+        s->frame_block_accum_bytes += (uint64_t)len;
     }
 
     gint64 arrival_us = g_get_monotonic_time();
@@ -487,8 +526,9 @@ static inline void rtp_update_stats(RelayController *rc,
         s->jitter_prev_transit = transit;
     }
 
-    if (marker) {
+    if (marker && unique_packet) {
         uint64_t frame_size_bytes = s->frame_block_accum_bytes;
+        source_record_marker_frame(s, arrival_us);
         frame_block_process_packet(rc, s, ts, marker, arrival_us, clock_rate, is_selected, frame_size_bytes);
         s->frame_block_accum_bytes = 0;
     }
@@ -803,6 +843,8 @@ void relay_controller_snapshot(RelayController *rc, UvViewerStats *stats, int cl
         }
         s.rtp_duplicate_packets = src->rtp_duplicate_packets;
         s.rtp_reordered_packets = src->rtp_reordered_packets;
+        s.rtp_marker_frames = src->rtp_marker_frames;
+        s.rtp_marker_fps = source_marker_window_fps(src, now_us);
         if (src->jitter_value > 0.0) {
             s.rfc3550_jitter_ms = (src->jitter_value * 1000.0) / (double)MAX(clock_rate, 1);
         }
