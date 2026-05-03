@@ -161,12 +161,73 @@ static gboolean bus_cb(GstBus *bus, GstMessage *msg, gpointer user_data) {
     return TRUE;
 }
 
+static gboolean sink_bounce_idle(gpointer user_data) {
+    PipelineController *pc = (PipelineController *)user_data;
+    if (!pc) return G_SOURCE_REMOVE;
+
+    GstElement *sink = pc->sink;
+    if (sink) {
+        uv_log_info("Bouncing video sink (READY -> PLAYING) to recover after caps change");
+        gst_element_set_state(sink, GST_STATE_READY);
+        gst_element_sync_state_with_parent(sink);
+    }
+    g_atomic_int_set(&pc->sink_bounce_pending, 0);
+    return G_SOURCE_REMOVE;
+}
+
+static void schedule_sink_bounce(PipelineController *pc) {
+    if (!pc || !pc->loop_context) return;
+    if (!g_atomic_int_compare_and_exchange(&pc->sink_bounce_pending, 0, 1)) return;
+    GSource *src = g_idle_source_new();
+    g_source_set_priority(src, G_PRIORITY_DEFAULT);
+    g_source_set_callback(src, sink_bounce_idle, pc, NULL);
+    g_source_attach(src, pc->loop_context);
+    g_source_unref(src);
+}
+
+static void handle_decoder_caps_event(PipelineController *pc, GstEvent *event) {
+    GstCaps *caps = NULL;
+    gst_event_parse_caps(event, &caps);
+    if (!caps || gst_caps_is_empty(caps) || !gst_caps_is_fixed(caps)) return;
+
+    const GstStructure *s = gst_caps_get_structure(caps, 0);
+    if (!s) return;
+
+    gint width = 0, height = 0;
+    gst_structure_get_int(s, "width", &width);
+    gst_structure_get_int(s, "height", &height);
+    if (width <= 0 || height <= 0) return;
+
+    gint old_w = pc->last_video_width;
+    gint old_h = pc->last_video_height;
+    pc->last_video_width = width;
+    pc->last_video_height = height;
+
+    if (old_w == 0 || old_h == 0) {
+        return; /* first negotiation, nothing to recover from */
+    }
+    if (old_w == width && old_h == height) {
+        return;
+    }
+
+    uv_log_info("Decoder output caps changed: %dx%d -> %dx%d (scheduling sink bounce)",
+                old_w, old_h, width, height);
+    schedule_sink_bounce(pc);
+}
+
 static GstPadProbeReturn dec_src_probe(GstPad *pad, GstPadProbeInfo *info, gpointer user_data) {
     (void)pad;
     PipelineController *pc = (PipelineController *)user_data;
-    if (GST_PAD_PROBE_INFO_TYPE(info) & GST_PAD_PROBE_TYPE_BUFFER) {
+    GstPadProbeType ptype = GST_PAD_PROBE_INFO_TYPE(info);
+
+    if (ptype & GST_PAD_PROBE_TYPE_BUFFER) {
         gint64 now_us = g_get_monotonic_time();
         uv_internal_decoder_stats_push_frame(&pc->viewer->decoder, now_us);
+    } else if (ptype & GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM) {
+        GstEvent *event = GST_PAD_PROBE_INFO_EVENT(info);
+        if (event && GST_EVENT_TYPE(event) == GST_EVENT_CAPS) {
+            handle_decoder_caps_event(pc, event);
+        }
     }
     return GST_PAD_PROBE_OK;
 }
@@ -692,7 +753,9 @@ static gboolean build_pipeline(PipelineController *pc, GError **error) {
 
     GstPad *dec_src = gst_element_get_static_pad(pc->decoder, "src");
     if (dec_src) {
-        pc->decoder_probe_id = gst_pad_add_probe(dec_src, GST_PAD_PROBE_TYPE_BUFFER,
+        pc->decoder_probe_id = gst_pad_add_probe(dec_src,
+                                                 GST_PAD_PROBE_TYPE_BUFFER |
+                                                 GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM,
                                                  dec_src_probe, pc, NULL);
         gst_object_unref(dec_src);
     }

@@ -162,6 +162,9 @@ typedef struct {
     GMainContext *loop_context;
     guint bus_watch_id;
     gulong decoder_probe_id;
+    gint last_video_width;
+    gint last_video_height;
+    gint sink_bounce_pending;
     gboolean sink_is_fakesink;
     GPtrArray *sink_factories;
     guint sink_factory_index;

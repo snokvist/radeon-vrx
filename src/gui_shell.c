@@ -1910,6 +1910,21 @@ static void update_sources_toggle_label(GuiContext *ctx, gboolean hidden) {
 static void on_refresh_button_clicked(GtkButton *button, gpointer user_data) {
     (void)button;
     GuiContext *ctx = user_data;
+    if (!ctx || !ctx->viewer) return;
+
+    /* Drop the GTK paintable binding before tearing the sink down so we
+     * don't keep a dangling ref or signal handler on the old element. */
+    detach_bound_sink(ctx);
+
+    GError *error = NULL;
+    if (!uv_viewer_restart_pipeline(ctx->viewer, &error)) {
+        uv_log_error("Pipeline restart failed: %s",
+                     error && error->message ? error->message : "unknown");
+        if (error) g_error_free(error);
+    }
+
+    /* Re-bind the paintable to the freshly built sink and update stats. */
+    ensure_video_paintable(ctx);
     refresh_stats(ctx);
 }
 
@@ -2564,7 +2579,10 @@ static GtkWidget *build_monitor_page(GuiContext *ctx) {
     GtkWidget *button_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
     gtk_box_append(GTK_BOX(page), button_box);
 
-    GtkWidget *refresh_button = gtk_button_new_with_label("Refresh");
+    GtkWidget *refresh_button = gtk_button_new_with_label("Restart Pipeline");
+    gtk_widget_set_tooltip_text(refresh_button,
+                                "Tear down and rebuild the GStreamer pipeline. "
+                                "Useful when a mid-stream resolution / SPS change leaves the picture frozen.");
     g_signal_connect(refresh_button, "clicked", G_CALLBACK(on_refresh_button_clicked), ctx);
     gtk_box_append(GTK_BOX(button_box), refresh_button);
 

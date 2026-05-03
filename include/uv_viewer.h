@@ -168,6 +168,7 @@ void uv_viewer_free(UvViewer *viewer);
 
 bool uv_viewer_start(UvViewer *viewer, GError **error);
 void uv_viewer_stop(UvViewer *viewer);
+bool uv_viewer_restart_pipeline(UvViewer *viewer, GError **error);
 
 void uv_viewer_set_event_callback(UvViewer *viewer, UvViewerEventCallback cb, gpointer user_data);
 
