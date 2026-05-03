@@ -121,8 +121,11 @@ bool uv_viewer_restart_pipeline(UvViewer *viewer, GError **error) {
         return uv_viewer_start(viewer, error);
     }
 
-    /* Stop pushing into the dying appsrc and drop our reference. */
-    relay_controller_set_push_enabled(&viewer->relay, FALSE);
+    /* Stop the relay thread first — relay_push_buffer reads rc->appsrc
+     * outside the lock, so an in-flight push could otherwise dereference
+     * the appsrc element we are about to free. Joining the recv thread
+     * guarantees no concurrent access for the rest of the rebuild. */
+    relay_controller_stop(&viewer->relay);
     relay_controller_set_appsrc(&viewer->relay, NULL);
 
     /* Tear the pipeline all the way down so build_pipeline runs again. */
@@ -134,6 +137,9 @@ bool uv_viewer_restart_pipeline(UvViewer *viewer, GError **error) {
     uv_internal_qos_db_clear(&viewer->qos);
 
     if (!pipeline_controller_init(&viewer->pipeline, viewer, error)) {
+        /* Try to keep the relay alive so source discovery can continue
+         * even when the pipeline failed to come back. */
+        relay_controller_start(&viewer->relay);
         g_mutex_lock(&viewer->state_lock);
         viewer->started = FALSE;
         g_mutex_unlock(&viewer->state_lock);
@@ -141,6 +147,7 @@ bool uv_viewer_restart_pipeline(UvViewer *viewer, GError **error) {
     }
 
     if (!pipeline_controller_start(&viewer->pipeline, error)) {
+        relay_controller_start(&viewer->relay);
         g_mutex_lock(&viewer->state_lock);
         viewer->started = FALSE;
         g_mutex_unlock(&viewer->state_lock);
@@ -148,6 +155,14 @@ bool uv_viewer_restart_pipeline(UvViewer *viewer, GError **error) {
     }
 
     relay_controller_set_appsrc(&viewer->relay, pipeline_controller_get_appsrc(&viewer->pipeline));
+    if (!relay_controller_start(&viewer->relay)) {
+        g_set_error(error, g_quark_from_static_string("uv-viewer"), 100,
+                    "Failed to restart relay thread");
+        g_mutex_lock(&viewer->state_lock);
+        viewer->started = FALSE;
+        g_mutex_unlock(&viewer->state_lock);
+        return FALSE;
+    }
     /* The new appsrc's need-data callback will re-enable push when ready. */
 
     uv_log_info("Pipeline restarted");
