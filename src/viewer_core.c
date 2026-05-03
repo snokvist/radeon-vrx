@@ -110,6 +110,50 @@ void uv_viewer_stop(UvViewer *viewer) {
     pipeline_controller_stop(&viewer->pipeline);
 }
 
+bool uv_viewer_restart_pipeline(UvViewer *viewer, GError **error) {
+    if (!viewer) return FALSE;
+
+    g_mutex_lock(&viewer->state_lock);
+    gboolean was_started = viewer->started;
+    g_mutex_unlock(&viewer->state_lock);
+
+    if (!was_started) {
+        return uv_viewer_start(viewer, error);
+    }
+
+    /* Stop pushing into the dying appsrc and drop our reference. */
+    relay_controller_set_push_enabled(&viewer->relay, FALSE);
+    relay_controller_set_appsrc(&viewer->relay, NULL);
+
+    /* Tear the pipeline all the way down so build_pipeline runs again. */
+    pipeline_controller_deinit(&viewer->pipeline);
+
+    /* Reset decoder + QoS stats so they reflect the new element instances,
+     * not the ones we just freed (paths often match by name and would alias). */
+    uv_internal_decoder_stats_reset(&viewer->decoder);
+    uv_internal_qos_db_clear(&viewer->qos);
+
+    if (!pipeline_controller_init(&viewer->pipeline, viewer, error)) {
+        g_mutex_lock(&viewer->state_lock);
+        viewer->started = FALSE;
+        g_mutex_unlock(&viewer->state_lock);
+        return FALSE;
+    }
+
+    if (!pipeline_controller_start(&viewer->pipeline, error)) {
+        g_mutex_lock(&viewer->state_lock);
+        viewer->started = FALSE;
+        g_mutex_unlock(&viewer->state_lock);
+        return FALSE;
+    }
+
+    relay_controller_set_appsrc(&viewer->relay, pipeline_controller_get_appsrc(&viewer->pipeline));
+    /* The new appsrc's need-data callback will re-enable push when ready. */
+
+    uv_log_info("Pipeline restarted");
+    return TRUE;
+}
+
 void uv_viewer_set_event_callback(UvViewer *viewer, UvViewerEventCallback cb, gpointer user_data) {
     if (!viewer) return;
     viewer->event_cb = cb;
