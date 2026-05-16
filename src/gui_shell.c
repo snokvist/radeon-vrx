@@ -130,6 +130,10 @@ typedef struct {
     GtkButton *idr_button;
     GtkSpinButton *idr_port_spin;
     gint idr_inflight;
+
+    GtkLabel *stats_source_label;
+    GtkToggleButton *stats_pause_toggle;
+    gboolean stats_paused;
 } GuiContext;
 
 typedef struct {
@@ -143,9 +147,12 @@ typedef struct {
 typedef struct {
     double timestamp;
     double rate_bps;
-    double lost_packets;
+    double lost_packets;      // cumulative count (kept for delta arithmetic)
     double dup_packets;
     double reorder_packets;
+    double lost_pps;          // per-second rate vs. previous sample (charted)
+    double dup_pps;
+    double reorder_pps;
     double jitter_ms;
     double input_fps;
     double decoder_fps_current;
@@ -202,6 +209,9 @@ static void on_source_dropdown_changed(GObject *dropdown, GParamSpec *pspec, gpo
 static void on_idr_button_clicked(GtkButton *button, gpointer user_data);
 static void update_idr_button_sensitivity(GuiContext *ctx);
 static void install_app_css(void);
+static double nice_axis_max(double v);
+static void update_frame_overlay_labels(GuiContext *ctx);
+static void update_stats_metric_labels(GuiContext *ctx);
 
 static const char *decoder_option_labels[] = {
     "Auto",
@@ -455,6 +465,8 @@ static void frame_block_queue_overlay_draws_internal(GuiContext *ctx, gboolean f
     }
 
     ctx->frame_overlay_needs_refresh = FALSE;
+
+    update_frame_overlay_labels(ctx);
 
     if (ctx->frame_overlay_lateness) {
         gtk_widget_queue_draw(GTK_WIDGET(ctx->frame_overlay_lateness));
@@ -806,11 +818,7 @@ static void frame_overlay_draw(GtkDrawingArea *area, cairo_t *cr, int width, int
         }
     }
 
-    GtkLabel *live_label = GTK_LABEL(g_object_get_data(G_OBJECT(area), "overlay-live-label"));
-    GtkLabel *max_label = GTK_LABEL(g_object_get_data(G_OBJECT(area), "overlay-max-label"));
     gboolean show_values = ctx->frame_overlay_show_values;
-    const char *default_live = "Live: --";
-    const char *default_max = "Max: --";
 
     cairo_save(cr);
     cairo_set_source_rgb(cr, 0.10, 0.10, 0.12);
@@ -823,8 +831,6 @@ static void frame_overlay_draw(GtkDrawingArea *area, cairo_t *cr, int width, int
     GArray *points = NULL;
 
     if (!ctx->stats_history || ctx->stats_history->len == 0) {
-        if (live_label) gtk_label_set_text(live_label, default_live);
-        if (max_label) gtk_label_set_text(max_label, default_max);
         cairo_set_source_rgb(cr, 0.7, 0.7, 0.7);
         cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
         cairo_set_font_size(cr, 12.0);
@@ -864,8 +870,6 @@ static void frame_overlay_draw(GtkDrawingArea *area, cairo_t *cr, int width, int
     }
 
     if (!any_value) {
-        if (live_label) gtk_label_set_text(live_label, default_live);
-        if (max_label) gtk_label_set_text(max_label, default_max);
         cairo_set_source_rgb(cr, 0.7, 0.7, 0.7);
         cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
         cairo_set_font_size(cr, 12.0);
@@ -880,7 +884,7 @@ static void frame_overlay_draw(GtkDrawingArea *area, cairo_t *cr, int width, int
     }
 
     double axis_min = 0.0;
-    double axis_max = peak_value;
+    double axis_max = nice_axis_max(peak_value > 0.0 ? peak_value : 1.0);
     if (!isfinite(axis_max) || axis_max <= axis_min) {
         axis_max = axis_min + 1.0;
     }
@@ -1007,39 +1011,6 @@ static void frame_overlay_draw(GtkDrawingArea *area, cairo_t *cr, int width, int
                 cairo_show_text(cr, value_text);
             }
         }
-    }
-
-    double latest_value = NAN;
-    for (guint i = len; i > start_index; i--) {
-        double value = 0.0;
-        if (frame_overlay_sample_value(&samples[i - 1], metric, &value, NULL)) {
-            latest_value = value;
-            break;
-        }
-    }
-
-    if (!isfinite(latest_value)) {
-        if (live_label) gtk_label_set_text(live_label, default_live);
-    } else if (metric == FRAME_OVERLAY_METRIC_SIZE) {
-        char latest_text[64];
-        g_snprintf(latest_text, sizeof(latest_text), "Live: %.2f KB", latest_value);
-        if (live_label) gtk_label_set_text(live_label, latest_text);
-    } else {
-        char latest_text[64];
-        g_snprintf(latest_text, sizeof(latest_text), "Live: %.2f ms", latest_value);
-        if (live_label) gtk_label_set_text(live_label, latest_text);
-    }
-
-    if (isfinite(peak_value)) {
-        char max_text[64];
-        if (metric == FRAME_OVERLAY_METRIC_SIZE) {
-            g_snprintf(max_text, sizeof(max_text), "Max: %.2f KB", peak_value);
-        } else {
-            g_snprintf(max_text, sizeof(max_text), "Max: %.2f ms", peak_value);
-        }
-        if (max_label) gtk_label_set_text(max_label, max_text);
-    } else if (max_label) {
-        gtk_label_set_text(max_label, default_max);
     }
 
     if (missing_seen) {
@@ -1514,6 +1485,10 @@ static void install_app_css(void) {
         "}"
         "frame.uv-video > border {"
         "  border-radius: 8px;"
+        "}"
+        ".numeric {"
+        "  font-feature-settings: \"tnum\";"
+        "  font-variant-numeric: tabular-nums;"
         "}";
 #if GTK_CHECK_VERSION(4, 12, 0)
     gtk_css_provider_load_from_string(provider, css);
@@ -1712,13 +1687,175 @@ static gboolean ensure_video_paintable(GuiContext *ctx) {
 static double stats_metric_value(const StatsSample *sample, StatsMetric metric) {
     switch (metric) {
         case STATS_METRIC_RATE:    return sample->rate_bps;
-        case STATS_METRIC_LOST:    return sample->lost_packets;
-        case STATS_METRIC_DUP:     return sample->dup_packets;
-        case STATS_METRIC_REORDER: return sample->reorder_packets;
+        case STATS_METRIC_LOST:    return sample->lost_pps;
+        case STATS_METRIC_DUP:     return sample->dup_pps;
+        case STATS_METRIC_REORDER: return sample->reorder_pps;
         case STATS_METRIC_JITTER:  return sample->jitter_ms;
         case STATS_METRIC_INPUT_FPS: return sample->input_fps;
         case STATS_METRIC_DECODER_FPS: return sample->decoder_fps_current;
         default:                   return 0.0;
+    }
+}
+
+static const char *stats_metric_unit(StatsMetric metric) {
+    switch (metric) {
+        case STATS_METRIC_RATE:        return "Mbps";
+        case STATS_METRIC_LOST:
+        case STATS_METRIC_DUP:
+        case STATS_METRIC_REORDER:     return "pps";
+        case STATS_METRIC_JITTER:      return "ms";
+        case STATS_METRIC_INPUT_FPS:
+        case STATS_METRIC_DECODER_FPS: return "fps";
+        default:                       return "";
+    }
+}
+
+/* Round axis_max up to the next "nice" 1/2/5 * 10^k boundary so y-axis ticks
+ * stop wobbling on every redraw when the live max creeps up slowly. */
+static double nice_axis_max(double v) {
+    if (!isfinite(v) || v <= 0.0) return 1.0;
+    double exp10 = pow(10.0, floor(log10(v)));
+    double frac = v / exp10;
+    double nice;
+    if (frac <= 1.0)      nice = 1.0;
+    else if (frac <= 2.0) nice = 2.0;
+    else if (frac <= 5.0) nice = 5.0;
+    else                  nice = 10.0;
+    return nice * exp10;
+}
+
+static void format_metric_value(StatsMetric metric, double value, char *out, size_t outlen) {
+    const char *unit = stats_metric_unit(metric);
+    if (!isfinite(value)) {
+        g_strlcpy(out, "--", outlen);
+        return;
+    }
+    if (metric == STATS_METRIC_RATE) {
+        g_snprintf(out, outlen, "%.2f %s", value / 1e6, unit);
+    } else if (metric == STATS_METRIC_LOST || metric == STATS_METRIC_DUP || metric == STATS_METRIC_REORDER) {
+        if (value < 10.0) {
+            g_snprintf(out, outlen, "%.2f %s", value, unit);
+        } else {
+            g_snprintf(out, outlen, "%.0f %s", value, unit);
+        }
+    } else {
+        g_snprintf(out, outlen, "%.2f %s", value, unit);
+    }
+}
+
+static void update_frame_overlay_labels(GuiContext *ctx) {
+    if (!ctx) return;
+    const char *units[2] = {"ms", "KB"};
+    for (int m = 0; m < 2; m++) {
+        GtkLabel *live_label = ctx->frame_overlay_live_labels[m];
+        GtkLabel *max_label  = ctx->frame_overlay_max_labels[m];
+        if (!ctx->stats_history || ctx->stats_history->len == 0) {
+            if (live_label) gtk_label_set_text(live_label, "Live: --");
+            if (max_label)  gtk_label_set_text(max_label, "Max: --");
+            continue;
+        }
+
+        double range = ctx->frame_overlay_range_seconds > 0.0
+                     ? ctx->frame_overlay_range_seconds : 60.0;
+        if (range < 1.0) range = 1.0;
+        double now = g_get_monotonic_time() / 1e6;
+        double start_time = now - range;
+
+        StatsSample *samples = (StatsSample *)ctx->stats_history->data;
+        guint len = ctx->stats_history->len;
+        guint start_index = 0;
+        while (start_index < len && samples[start_index].timestamp < start_time) {
+            start_index++;
+        }
+        if (start_index == len) start_index = len > 0 ? len - 1 : 0;
+
+        double latest = NAN;
+        double peak = -G_MAXDOUBLE;
+        for (guint i = start_index; i < len; i++) {
+            double v = 0.0;
+            if (frame_overlay_sample_value(&samples[i], (guint)m, &v, NULL)) {
+                if (v > peak) peak = v;
+            }
+        }
+        for (gint i = (gint)len - 1; i >= (gint)start_index; i--) {
+            double v = 0.0;
+            if (frame_overlay_sample_value(&samples[i], (guint)m, &v, NULL)) {
+                latest = v; break;
+            }
+        }
+
+        char buf[80];
+        if (live_label) {
+            if (isfinite(latest)) {
+                g_snprintf(buf, sizeof(buf), "Live: %.2f %s", latest, units[m]);
+            } else {
+                g_strlcpy(buf, "Live: --", sizeof(buf));
+            }
+            gtk_label_set_text(live_label, buf);
+        }
+        if (max_label) {
+            if (peak == -G_MAXDOUBLE) {
+                g_strlcpy(buf, "Max: --", sizeof(buf));
+            } else {
+                g_snprintf(buf, sizeof(buf), "Max: %.2f %s", peak, units[m]);
+            }
+            gtk_label_set_text(max_label, buf);
+        }
+    }
+}
+
+static void update_stats_metric_labels(GuiContext *ctx) {
+    if (!ctx) return;
+    if (!ctx->stats_history || ctx->stats_history->len == 0) {
+        for (int i = 0; i < STATS_METRIC_COUNT; i++) {
+            if (ctx->stats_live_labels[i]) gtk_label_set_text(ctx->stats_live_labels[i], "Live: --");
+            if (ctx->stats_max_labels[i])  gtk_label_set_text(ctx->stats_max_labels[i],  "Max: --");
+        }
+        return;
+    }
+
+    double range = MAX(ctx->stats_range_seconds, 60.0);
+    double now = g_get_monotonic_time() / 1e6;
+    double start_time = now - range;
+
+    StatsSample *samples = (StatsSample *)ctx->stats_history->data;
+    guint len = ctx->stats_history->len;
+    guint start_index = 0;
+    while (start_index < len && samples[start_index].timestamp < start_time) {
+        start_index++;
+    }
+    if (start_index == len) {
+        start_index = len > 0 ? len - 1 : 0;
+    }
+
+    for (int m = 0; m < STATS_METRIC_COUNT; m++) {
+        StatsMetric metric = (StatsMetric)m;
+        double latest = NAN;
+        double max_val = -G_MAXDOUBLE;
+        for (guint i = start_index; i < len; i++) {
+            double v = stats_metric_value(&samples[i], metric);
+            if (!isfinite(v)) continue;
+            if (v > max_val) max_val = v;
+        }
+        for (gint i = (gint)len - 1; i >= (gint)start_index; i--) {
+            double v = stats_metric_value(&samples[i], metric);
+            if (isfinite(v)) { latest = v; break; }
+        }
+
+        char buf[80];
+        if (ctx->stats_live_labels[m]) {
+            char value_text[64];
+            format_metric_value(metric, latest, value_text, sizeof(value_text));
+            g_snprintf(buf, sizeof(buf), "Live: %s", value_text);
+            gtk_label_set_text(ctx->stats_live_labels[m], buf);
+        }
+        if (ctx->stats_max_labels[m]) {
+            char value_text[64];
+            format_metric_value(metric, (max_val == -G_MAXDOUBLE) ? NAN : max_val,
+                                value_text, sizeof(value_text));
+            g_snprintf(buf, sizeof(buf), "Max: %s", value_text);
+            gtk_label_set_text(ctx->stats_max_labels[m], buf);
+        }
     }
 }
 
@@ -1962,13 +2099,45 @@ static void refresh_stats(GuiContext *ctx) {
         }
     }
 
-    if (viewer_selected_source) {
+    if (viewer_selected_source && ctx->stats_source_label) {
+        char rate_buf[48];
+        format_bitrate(viewer_selected_source->inbound_bitrate_bps, rate_buf, sizeof(rate_buf));
+        char banner[224];
+        g_snprintf(banner, sizeof(banner),
+                   "Source %s  •  %s  •  jitter %.2f ms  •  input %.1f fps  •  decoder %.1f fps  •  lost %" G_GUINT64_FORMAT,
+                   viewer_selected_source->address,
+                   rate_buf,
+                   viewer_selected_source->rfc3550_jitter_ms,
+                   viewer_selected_source->rtp_marker_fps,
+                   stats.decoder.instantaneous_fps,
+                   viewer_selected_source->rtp_lost_packets);
+        gtk_label_set_text(ctx->stats_source_label, banner);
+    } else if (ctx->stats_source_label) {
+        gtk_label_set_text(ctx->stats_source_label, "No source locked.");
+    }
+
+    if (viewer_selected_source && !ctx->stats_paused) {
         StatsSample sample = {0};
         sample.timestamp = g_get_monotonic_time() / 1e6;
         sample.rate_bps = viewer_selected_source->inbound_bitrate_bps;
         sample.lost_packets = (double)viewer_selected_source->rtp_lost_packets;
         sample.dup_packets = (double)viewer_selected_source->rtp_duplicate_packets;
         sample.reorder_packets = (double)viewer_selected_source->rtp_reordered_packets;
+        if (ctx->stats_history && ctx->stats_history->len > 0) {
+            const StatsSample *prev = &g_array_index(ctx->stats_history, StatsSample,
+                                                    ctx->stats_history->len - 1);
+            double dt = sample.timestamp - prev->timestamp;
+            if (dt > 1e-3) {
+                double dl = sample.lost_packets - prev->lost_packets;
+                double dd = sample.dup_packets - prev->dup_packets;
+                double dr = sample.reorder_packets - prev->reorder_packets;
+                /* Counter resets (source switch / restart) read as huge negatives;
+                 * clamp so the chart doesn't dive into the basement. */
+                sample.lost_pps = dl > 0.0 ? dl / dt : 0.0;
+                sample.dup_pps = dd > 0.0 ? dd / dt : 0.0;
+                sample.reorder_pps = dr > 0.0 ? dr / dt : 0.0;
+            }
+        }
         sample.jitter_ms = viewer_selected_source->rfc3550_jitter_ms;
         sample.input_fps = viewer_selected_source->rtp_marker_fps;
         sample.decoder_fps_current = stats.decoder.instantaneous_fps;
@@ -1990,12 +2159,15 @@ static void refresh_stats(GuiContext *ctx) {
 
         stats_history_push(ctx, &sample);
 
+        update_stats_metric_labels(ctx);
+
         for (int i = 0; i < STATS_METRIC_COUNT; i++) {
             if (ctx->stats_charts[i]) {
                 gtk_widget_queue_draw(GTK_WIDGET(ctx->stats_charts[i]));
             }
         }
-    } else {
+    } else if (!ctx->stats_paused) {
+        update_stats_metric_labels(ctx);
         for (int i = 0; i < STATS_METRIC_COUNT; i++) {
             if (ctx->stats_charts[i]) {
                 gtk_widget_queue_draw(GTK_WIDGET(ctx->stats_charts[i]));
@@ -3021,12 +3193,62 @@ static GtkWidget *build_settings_page(GuiContext *ctx) {
     return page;
 }
 
+static void on_stats_pause_toggled(GtkToggleButton *btn, gpointer user_data) {
+    GuiContext *ctx = user_data;
+    if (!ctx) return;
+    ctx->stats_paused = gtk_toggle_button_get_active(btn);
+    gtk_button_set_label(GTK_BUTTON(btn), ctx->stats_paused ? "Resume" : "Pause");
+}
+
+static void on_stats_reset_clicked(GtkButton *button, gpointer user_data) {
+    (void)button;
+    GuiContext *ctx = user_data;
+    if (!ctx) return;
+    if (ctx->stats_history) {
+        g_array_set_size(ctx->stats_history, 0);
+    }
+    update_stats_metric_labels(ctx);
+    update_frame_overlay_labels(ctx);
+    for (int i = 0; i < STATS_METRIC_COUNT; i++) {
+        if (ctx->stats_charts[i]) gtk_widget_queue_draw(GTK_WIDGET(ctx->stats_charts[i]));
+    }
+    if (ctx->frame_overlay_lateness) gtk_widget_queue_draw(GTK_WIDGET(ctx->frame_overlay_lateness));
+    if (ctx->frame_overlay_size)     gtk_widget_queue_draw(GTK_WIDGET(ctx->frame_overlay_size));
+}
+
 static GtkWidget *build_stats_page(GuiContext *ctx) {
-    GtkWidget *page = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
+    GtkWidget *page = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
     gtk_widget_set_margin_top(page, 12);
     gtk_widget_set_margin_bottom(page, 12);
     gtk_widget_set_margin_start(page, 12);
     gtk_widget_set_margin_end(page, 12);
+
+    /* Banner: which source is being charted, plus pause/reset. */
+    GtkWidget *banner = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_widget_add_css_class(banner, "uv-status-bar");
+    gtk_box_append(GTK_BOX(page), banner);
+
+    ctx->stats_source_label = GTK_LABEL(gtk_label_new("No source locked."));
+    gtk_label_set_xalign(ctx->stats_source_label, 0.0);
+    gtk_widget_set_hexpand(GTK_WIDGET(ctx->stats_source_label), TRUE);
+    gtk_label_set_wrap(ctx->stats_source_label, FALSE);
+    gtk_label_set_ellipsize(ctx->stats_source_label, PANGO_ELLIPSIZE_END);
+    gtk_widget_add_css_class(GTK_WIDGET(ctx->stats_source_label), "uv-source-detail");
+    gtk_box_append(GTK_BOX(banner), GTK_WIDGET(ctx->stats_source_label));
+
+    GtkWidget *reset_btn = gtk_button_new_with_label("Reset");
+    gtk_widget_add_css_class(reset_btn, "flat");
+    gtk_widget_set_tooltip_text(reset_btn, "Clear the recorded history buffer.");
+    g_signal_connect(reset_btn, "clicked", G_CALLBACK(on_stats_reset_clicked), ctx);
+    gtk_box_append(GTK_BOX(banner), reset_btn);
+
+    GtkWidget *pause_btn = gtk_toggle_button_new_with_label("Pause");
+    ctx->stats_pause_toggle = GTK_TOGGLE_BUTTON(pause_btn);
+    gtk_widget_set_tooltip_text(pause_btn,
+                                "Freeze the chart and labels so you can examine "
+                                "a glitch. New samples are dropped while paused.");
+    g_signal_connect(pause_btn, "toggled", G_CALLBACK(on_stats_pause_toggled), ctx);
+    gtk_box_append(GTK_BOX(banner), pause_btn);
 
     GtkWidget *controls = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
     gtk_box_append(GTK_BOX(page), controls);
@@ -3036,6 +3258,7 @@ static GtkWidget *build_stats_page(GuiContext *ctx) {
     gtk_box_append(GTK_BOX(controls), range_label);
 
     const char *options[] = {
+        "Last 30 seconds",
         "Last 1 minute",
         "Last 5 minutes",
         "Last 10 minutes",
@@ -3044,9 +3267,10 @@ static GtkWidget *build_stats_page(GuiContext *ctx) {
     ctx->stats_range_dropdown = GTK_DROP_DOWN(gtk_drop_down_new_from_strings(options));
     gtk_widget_set_hexpand(GTK_WIDGET(ctx->stats_range_dropdown), FALSE);
 
-    guint default_index = 1;
-    if (fabs(ctx->stats_range_seconds - 60.0) < 0.1) default_index = 0;
-    else if (fabs(ctx->stats_range_seconds - 600.0) < 0.1) default_index = 2;
+    guint default_index = 2;
+    if (fabs(ctx->stats_range_seconds - 30.0) < 0.1) default_index = 0;
+    else if (fabs(ctx->stats_range_seconds - 60.0) < 0.1) default_index = 1;
+    else if (fabs(ctx->stats_range_seconds - 600.0) < 0.1) default_index = 3;
     gtk_drop_down_set_selected(ctx->stats_range_dropdown, default_index);
     g_signal_connect(ctx->stats_range_dropdown, "notify::selected", G_CALLBACK(stats_range_changed), ctx);
     gtk_box_append(GTK_BOX(controls), GTK_WIDGET(ctx->stats_range_dropdown));
@@ -3058,9 +3282,9 @@ static GtkWidget *build_stats_page(GuiContext *ctx) {
 
     static const char *titles[STATS_METRIC_COUNT] = {
         "Inbound Rate (Mbps)",
-        "RTP Lost Packets",
-        "RTP Duplicate Packets",
-        "RTP Reordered Packets",
+        "RTP Lost (pkt/s)",
+        "RTP Duplicate (pkt/s)",
+        "RTP Reordered (pkt/s)",
         "RTP Jitter (ms)",
         "Input Frame FPS",
         "Decoder FPS (current)"
@@ -3085,11 +3309,19 @@ static GtkWidget *build_stats_page(GuiContext *ctx) {
         GtkWidget *live_widget = gtk_label_new("Live: --");
         gtk_label_set_xalign(GTK_LABEL(live_widget), 1.0);
         gtk_widget_set_valign(live_widget, GTK_ALIGN_CENTER);
+        gtk_label_set_single_line_mode(GTK_LABEL(live_widget), TRUE);
+        gtk_label_set_width_chars(GTK_LABEL(live_widget), 18);
+        gtk_label_set_max_width_chars(GTK_LABEL(live_widget), 18);
+        gtk_widget_add_css_class(live_widget, "numeric");
         gtk_box_append(GTK_BOX(label_box), live_widget);
 
         GtkWidget *max_widget = gtk_label_new("Max: --");
         gtk_label_set_xalign(GTK_LABEL(max_widget), 1.0);
         gtk_widget_set_valign(max_widget, GTK_ALIGN_CENTER);
+        gtk_label_set_single_line_mode(GTK_LABEL(max_widget), TRUE);
+        gtk_label_set_width_chars(GTK_LABEL(max_widget), 18);
+        gtk_label_set_max_width_chars(GTK_LABEL(max_widget), 18);
+        gtk_widget_add_css_class(max_widget, "numeric");
         gtk_box_append(GTK_BOX(label_box), max_widget);
 
         gtk_frame_set_label_widget(GTK_FRAME(frame), label_box);
@@ -3270,6 +3502,11 @@ static GtkWidget *build_frame_block_page(GuiContext *ctx) {
     GtkWidget *distribution_stats = gtk_label_new(default_stats);
     gtk_label_set_xalign(GTK_LABEL(distribution_stats), 1.0);
     gtk_widget_set_hexpand(distribution_stats, TRUE);
+    gtk_label_set_single_line_mode(GTK_LABEL(distribution_stats), TRUE);
+    gtk_label_set_width_chars(GTK_LABEL(distribution_stats), 56);
+    gtk_label_set_max_width_chars(GTK_LABEL(distribution_stats), 56);
+    gtk_label_set_ellipsize(GTK_LABEL(distribution_stats), PANGO_ELLIPSIZE_END);
+    gtk_widget_add_css_class(distribution_stats, "numeric");
     gtk_box_append(GTK_BOX(distribution_label_box), distribution_stats);
 
     gtk_frame_set_label_widget(GTK_FRAME(distribution_frame), distribution_label_box);
@@ -3297,11 +3534,19 @@ static GtkWidget *build_frame_block_page(GuiContext *ctx) {
     GtkWidget *lateness_live = gtk_label_new("Live: --");
     gtk_label_set_xalign(GTK_LABEL(lateness_live), 1.0);
     gtk_widget_set_valign(lateness_live, GTK_ALIGN_CENTER);
+    gtk_label_set_single_line_mode(GTK_LABEL(lateness_live), TRUE);
+    gtk_label_set_width_chars(GTK_LABEL(lateness_live), 18);
+    gtk_label_set_max_width_chars(GTK_LABEL(lateness_live), 18);
+    gtk_widget_add_css_class(lateness_live, "numeric");
     gtk_box_append(GTK_BOX(lateness_label_box), lateness_live);
 
     GtkWidget *lateness_max = gtk_label_new("Max: --");
     gtk_label_set_xalign(GTK_LABEL(lateness_max), 1.0);
     gtk_widget_set_valign(lateness_max, GTK_ALIGN_CENTER);
+    gtk_label_set_single_line_mode(GTK_LABEL(lateness_max), TRUE);
+    gtk_label_set_width_chars(GTK_LABEL(lateness_max), 18);
+    gtk_label_set_max_width_chars(GTK_LABEL(lateness_max), 18);
+    gtk_widget_add_css_class(lateness_max, "numeric");
     gtk_box_append(GTK_BOX(lateness_label_box), lateness_max);
 
     gtk_frame_set_label_widget(GTK_FRAME(lateness_frame), lateness_label_box);
@@ -3333,11 +3578,19 @@ static GtkWidget *build_frame_block_page(GuiContext *ctx) {
     GtkWidget *size_live = gtk_label_new("Live: --");
     gtk_label_set_xalign(GTK_LABEL(size_live), 1.0);
     gtk_widget_set_valign(size_live, GTK_ALIGN_CENTER);
+    gtk_label_set_single_line_mode(GTK_LABEL(size_live), TRUE);
+    gtk_label_set_width_chars(GTK_LABEL(size_live), 18);
+    gtk_label_set_max_width_chars(GTK_LABEL(size_live), 18);
+    gtk_widget_add_css_class(size_live, "numeric");
     gtk_box_append(GTK_BOX(size_label_box), size_live);
 
     GtkWidget *size_max = gtk_label_new("Max: --");
     gtk_label_set_xalign(GTK_LABEL(size_max), 1.0);
     gtk_widget_set_valign(size_max, GTK_ALIGN_CENTER);
+    gtk_label_set_single_line_mode(GTK_LABEL(size_max), TRUE);
+    gtk_label_set_width_chars(GTK_LABEL(size_max), 18);
+    gtk_label_set_max_width_chars(GTK_LABEL(size_max), 18);
+    gtk_widget_add_css_class(size_max, "numeric");
     gtk_box_append(GTK_BOX(size_label_box), size_max);
 
     gtk_frame_set_label_widget(GTK_FRAME(size_frame), size_label_box);
@@ -3391,12 +3644,14 @@ static void stats_range_changed(GObject *dropdown, GParamSpec *pspec, gpointer u
     guint selected = gtk_drop_down_get_selected(GTK_DROP_DOWN(dropdown));
     double seconds = 300.0;
     switch (selected) {
-        case 0: seconds = 60.0; break;
-        case 1: seconds = 300.0; break;
-        case 2: seconds = 600.0; break;
+        case 0: seconds = 30.0; break;
+        case 1: seconds = 60.0; break;
+        case 2: seconds = 300.0; break;
+        case 3: seconds = 600.0; break;
         default: break;
     }
     ctx->stats_range_seconds = seconds;
+    update_stats_metric_labels(ctx);
     for (int i = 0; i < STATS_METRIC_COUNT; i++) {
         if (ctx->stats_charts[i]) {
             gtk_widget_queue_draw(GTK_WIDGET(ctx->stats_charts[i]));
@@ -3411,11 +3666,6 @@ static void stats_chart_draw(GtkDrawingArea *area, cairo_t *cr, int width, int h
     if (metric_val < 0 || metric_val >= STATS_METRIC_COUNT) return;
     StatsMetric metric = (StatsMetric)metric_val;
 
-    GtkLabel *live_value_label = GTK_LABEL(g_object_get_data(G_OBJECT(area), "stats-live-label"));
-    GtkLabel *max_value_label = GTK_LABEL(g_object_get_data(G_OBJECT(area), "stats-max-label"));
-    const char *default_live = "Live: --";
-    const char *default_max = "Max: --";
-
     cairo_save(cr);
     cairo_set_source_rgb(cr, 0.10, 0.10, 0.12);
     cairo_paint(cr);
@@ -3425,8 +3675,6 @@ static void stats_chart_draw(GtkDrawingArea *area, cairo_t *cr, int width, int h
     cairo_stroke(cr);
 
     if (!ctx->stats_history || ctx->stats_history->len == 0) {
-        if (live_value_label) gtk_label_set_text(live_value_label, default_live);
-        if (max_value_label) gtk_label_set_text(max_value_label, default_max);
         cairo_set_source_rgb(cr, 0.7, 0.7, 0.7);
         cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
         cairo_set_font_size(cr, 12.0);
@@ -3450,18 +3698,18 @@ static void stats_chart_draw(GtkDrawingArea *area, cairo_t *cr, int width, int h
         start_index = len > 0 ? len - 1 : 0;
     }
 
-    double min_val = G_MAXDOUBLE;
     double max_val = -G_MAXDOUBLE;
+    double sum_val = 0.0;
+    guint  sum_count = 0;
     for (guint i = start_index; i < len; i++) {
         double v = stats_metric_value(&samples[i], metric);
         if (!isfinite(v)) continue;
-        if (v < min_val) min_val = v;
         if (v > max_val) max_val = v;
+        sum_val += v;
+        sum_count++;
     }
 
-    if (min_val == G_MAXDOUBLE || max_val == -G_MAXDOUBLE) {
-        if (live_value_label) gtk_label_set_text(live_value_label, default_live);
-        if (max_value_label) gtk_label_set_text(max_value_label, default_max);
+    if (max_val == -G_MAXDOUBLE) {
         cairo_set_source_rgb(cr, 0.7, 0.7, 0.7);
         cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
         cairo_set_font_size(cr, 12.0);
@@ -3472,19 +3720,12 @@ static void stats_chart_draw(GtkDrawingArea *area, cairo_t *cr, int width, int h
     }
 
     double axis_min = 0.0;
-    double axis_max = max_val;
-    if (!isfinite(axis_max) || axis_max < axis_min) {
-        axis_max = axis_min;
-    }
-    if (axis_max == axis_min) {
-        double delta = axis_max > 1.0 ? axis_max * 0.05 : 1.0;
-        axis_max += delta;
-    }
+    double axis_max = nice_axis_max(max_val > 0.0 ? max_val : 1.0);
 
     const double left_margin = 64.0;
     const double right_margin = 12.0;
     const double top_margin = 12.0;
-    const double bottom_margin = 24.0;
+    const double bottom_margin = 28.0;
     double plot_width = MAX(1.0, width - (left_margin + right_margin));
     double plot_height = MAX(1.0, height - (top_margin + bottom_margin));
     double plot_left = left_margin;
@@ -3511,10 +3752,11 @@ static void stats_chart_draw(GtkDrawingArea *area, cairo_t *cr, int width, int h
 
         char label[64];
         if (metric == STATS_METRIC_RATE) {
-            double value_mbps = value / 1e6;
-            g_snprintf(label, sizeof(label), "%.2f", value_mbps);
+            g_snprintf(label, sizeof(label), "%.1f", value / 1e6);
+        } else if (axis_max >= 100.0) {
+            g_snprintf(label, sizeof(label), "%.0f", value);
         } else {
-            g_snprintf(label, sizeof(label), "%.2f", value);
+            g_snprintf(label, sizeof(label), "%.1f", value);
         }
 
         cairo_text_extents_t label_extents;
@@ -3525,6 +3767,52 @@ static void stats_chart_draw(GtkDrawingArea *area, cairo_t *cr, int width, int h
         cairo_show_text(cr, label);
     }
 
+    /* X-axis time labels: rightmost is "now", others step back in seconds.
+     * Using fixed labels (not relative to the latest sample) keeps the
+     * positions stable across redraws. */
+    cairo_set_source_rgba(cr, 0.7, 0.7, 0.75, 0.85);
+    cairo_set_font_size(cr, 10.0);
+    const int x_tick_count = 4;
+    for (int i = 0; i <= x_tick_count; i++) {
+        double fraction = (double)i / (double)x_tick_count;
+        double x = plot_left + fraction * plot_width;
+        double secs_ago = range * (1.0 - fraction);
+        char tlabel[24];
+        if (secs_ago < 1.0) {
+            g_strlcpy(tlabel, "now", sizeof(tlabel));
+        } else if (secs_ago >= 60.0) {
+            g_snprintf(tlabel, sizeof(tlabel), "-%.0fm", secs_ago / 60.0);
+        } else {
+            g_snprintf(tlabel, sizeof(tlabel), "-%.0fs", secs_ago);
+        }
+        cairo_text_extents_t te;
+        cairo_text_extents(cr, tlabel, &te);
+        double tx = x - te.width * 0.5 - te.x_bearing;
+        if (tx < plot_left) tx = plot_left;
+        if (tx + te.width > plot_right) tx = plot_right - te.width;
+        cairo_move_to(cr, tx, plot_bottom + 14.0);
+        cairo_show_text(cr, tlabel);
+    }
+
+    /* Average line — faint, dashed. */
+    if (sum_count > 1) {
+        double avg = sum_val / (double)sum_count;
+        double y_ratio = (avg - axis_min) / (axis_max - axis_min);
+        if (y_ratio >= 0.0 && y_ratio <= 1.0) {
+            double y = plot_bottom - y_ratio * plot_height;
+            cairo_save(cr);
+            double dashes[] = {3.0, 4.0};
+            cairo_set_dash(cr, dashes, 2, 0);
+            cairo_set_line_width(cr, 1.0);
+            cairo_set_source_rgba(cr, 1.0, 0.85, 0.4, 0.6);
+            cairo_move_to(cr, plot_left, y);
+            cairo_line_to(cr, plot_right, y);
+            cairo_stroke(cr);
+            cairo_restore(cr);
+        }
+    }
+
+    /* Data path. */
     cairo_set_source_rgb(cr, 0.3, 0.7, 1.0);
     cairo_set_line_width(cr, 1.5);
     gboolean path_started = FALSE;
@@ -3535,12 +3823,10 @@ static void stats_chart_draw(GtkDrawingArea *area, cairo_t *cr, int width, int h
         if (x_ratio > 1.0) x_ratio = 1.0;
         double x = plot_left + x_ratio * plot_width;
         double value = stats_metric_value(sample, metric);
+        if (!isfinite(value)) { path_started = FALSE; continue; }
         double y_ratio = (value - axis_min) / (axis_max - axis_min);
-        if (y_ratio < 0.0) {
-            y_ratio = 0.0;
-        } else if (y_ratio > 1.0) {
-            y_ratio = 1.0;
-        }
+        if (y_ratio < 0.0) y_ratio = 0.0;
+        if (y_ratio > 1.0) y_ratio = 1.0;
         double y = plot_bottom - y_ratio * plot_height;
         if (!path_started) {
             cairo_move_to(cr, x, y);
@@ -3550,43 +3836,6 @@ static void stats_chart_draw(GtkDrawingArea *area, cairo_t *cr, int width, int h
         }
     }
     cairo_stroke(cr);
-
-    double latest_value = NAN;
-    for (gint i = (gint)len - 1; i >= (gint)start_index; i--) {
-        double candidate = stats_metric_value(&samples[i], metric);
-        if (isfinite(candidate)) {
-            latest_value = candidate;
-            break;
-        }
-    }
-
-    if (!isfinite(latest_value)) {
-        if (live_value_label) {
-            gtk_label_set_text(live_value_label, default_live);
-        }
-    } else if (metric == STATS_METRIC_RATE) {
-        double latest_mbps = latest_value / 1e6;
-        char latest_text[64];
-        g_snprintf(latest_text, sizeof(latest_text), "Live: %.2f Mbps", latest_mbps);
-        if (live_value_label) gtk_label_set_text(live_value_label, latest_text);
-    } else {
-        char latest_text[64];
-        g_snprintf(latest_text, sizeof(latest_text), "Live: %.2f", latest_value);
-        if (live_value_label) gtk_label_set_text(live_value_label, latest_text);
-    }
-
-    if (isfinite(max_val)) {
-        char max_text[64];
-        if (metric == STATS_METRIC_RATE) {
-            double max_mbps = max_val / 1e6;
-            g_snprintf(max_text, sizeof(max_text), "Max: %.2f Mbps", max_mbps);
-        } else {
-            g_snprintf(max_text, sizeof(max_text), "Max: %.2f", max_val);
-        }
-        if (max_value_label) gtk_label_set_text(max_value_label, max_text);
-    } else {
-        if (max_value_label) gtk_label_set_text(max_value_label, default_max);
-    }
 
     cairo_restore(cr);
 }
@@ -3785,6 +4034,8 @@ static void on_app_shutdown(GApplication *app, gpointer user_data) {
     ctx->window = NULL;
     ctx->idr_button = NULL;
     ctx->idr_port_spin = NULL;
+    ctx->stats_source_label = NULL;
+    ctx->stats_pause_toggle = NULL;
 }
 
 int uv_gui_run(UvViewer **viewer, UvViewerConfig *cfg, const char *program_name) {
