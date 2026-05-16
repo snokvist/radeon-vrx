@@ -126,6 +126,10 @@ typedef struct {
     double frame_overlay_range_seconds;
     gboolean frame_overlay_show_values;
     gboolean frame_overlay_needs_refresh;
+
+    GtkButton *idr_button;
+    GtkSpinButton *idr_port_spin;
+    gint idr_inflight;
 } GuiContext;
 
 typedef struct {
@@ -195,6 +199,9 @@ static void on_frame_overlay_values_toggled(GtkCheckButton *button, gpointer use
 static void on_videorate_toggled(GtkCheckButton *button, gpointer user_data);
 static void on_audio_toggled(GtkCheckButton *button, gpointer user_data);
 static void on_source_dropdown_changed(GObject *dropdown, GParamSpec *pspec, gpointer user_data);
+static void on_idr_button_clicked(GtkButton *button, gpointer user_data);
+static void update_idr_button_sensitivity(GuiContext *ctx);
+static void install_app_css(void);
 
 static const char *decoder_option_labels[] = {
     "Auto",
@@ -1316,9 +1323,215 @@ static void update_status(GuiContext *ctx, const char *message) {
     gtk_label_set_text(ctx->status_label, message ? message : "");
 }
 
+typedef struct {
+    GuiContext *ctx;
+    char address[UV_VIEWER_ADDR_MAX];
+    guint port;
+    char message[192];
+    gboolean ok;
+} IdrJob;
+
+static gboolean idr_apply_result(gpointer data) {
+    IdrJob *job = data;
+    if (!job) return G_SOURCE_REMOVE;
+    GuiContext *ctx = job->ctx;
+    if (ctx && ctx->status_label) {
+        update_status(ctx, job->message);
+    }
+    if (ctx) {
+        if (ctx->idr_inflight > 0) ctx->idr_inflight--;
+        update_idr_button_sensitivity(ctx);
+    }
+    g_free(job);
+    return G_SOURCE_REMOVE;
+}
+
+static gpointer idr_worker(gpointer data) {
+    IdrJob *job = data;
+    if (!job) return NULL;
+
+    GError *err = NULL;
+    GSocketClient *client = g_socket_client_new();
+    g_socket_client_set_timeout(client, 3);
+    GSocketConnection *conn = g_socket_client_connect_to_host(client,
+                                                              job->address,
+                                                              (guint16)job->port,
+                                                              NULL,
+                                                              &err);
+    if (!conn) {
+        g_snprintf(job->message, sizeof(job->message),
+                   "IDR request to %s:%u failed: %s",
+                   job->address, job->port,
+                   err && err->message ? err->message : "connect failed");
+    } else {
+        char request[256];
+        g_snprintf(request, sizeof(request),
+                   "GET /request/idr HTTP/1.0\r\n"
+                   "Host: %s:%u\r\n"
+                   "User-Agent: udp-h265-viewer\r\n"
+                   "Connection: close\r\n\r\n",
+                   job->address, job->port);
+        GOutputStream *ostream = g_io_stream_get_output_stream(G_IO_STREAM(conn));
+        gsize written = 0;
+        if (!g_output_stream_write_all(ostream, request, strlen(request),
+                                       &written, NULL, &err)) {
+            g_snprintf(job->message, sizeof(job->message),
+                       "IDR request to %s:%u failed: %s",
+                       job->address, job->port,
+                       err && err->message ? err->message : "write failed");
+        } else {
+            GInputStream *istream = g_io_stream_get_input_stream(G_IO_STREAM(conn));
+            char buf[256] = {0};
+            gssize n = g_input_stream_read(istream, buf, sizeof(buf) - 1, NULL, &err);
+            if (n <= 0) {
+                g_snprintf(job->message, sizeof(job->message),
+                           "IDR request to %s:%u: no response", job->address, job->port);
+            } else {
+                buf[n] = '\0';
+                char *eol = strpbrk(buf, "\r\n");
+                if (eol) *eol = '\0';
+                if (strncmp(buf, "HTTP/", 5) == 0 && strstr(buf, " 200") != NULL) {
+                    job->ok = TRUE;
+                    g_snprintf(job->message, sizeof(job->message),
+                               "IDR requested for %s:%u (HTTP 200 OK)",
+                               job->address, job->port);
+                } else {
+                    g_snprintf(job->message, sizeof(job->message),
+                               "IDR request to %s:%u: %s",
+                               job->address, job->port, buf);
+                }
+            }
+        }
+        g_io_stream_close(G_IO_STREAM(conn), NULL, NULL);
+        g_object_unref(conn);
+    }
+
+    if (err) g_error_free(err);
+    g_object_unref(client);
+    g_idle_add(idr_apply_result, job);
+    return NULL;
+}
+
+static void update_idr_button_sensitivity(GuiContext *ctx) {
+    if (!ctx || !ctx->idr_button) return;
+    gboolean has_source = ctx->active_source_valid;
+    gboolean busy = (ctx->idr_inflight > 0);
+    gtk_widget_set_sensitive(GTK_WIDGET(ctx->idr_button), has_source && !busy);
+}
+
+static void on_idr_button_clicked(GtkButton *button, gpointer user_data) {
+    (void)button;
+    GuiContext *ctx = user_data;
+    if (!ctx || !ctx->viewer) return;
+
+    if (!ctx->active_source_valid) {
+        update_status(ctx, "IDR request skipped: no source is currently locked.");
+        return;
+    }
+
+    UvViewerStats stats = {0};
+    uv_viewer_stats_init(&stats);
+    if (!uv_viewer_get_stats(ctx->viewer, &stats)) {
+        update_status(ctx, "IDR request failed: could not read viewer stats.");
+        uv_viewer_stats_clear(&stats);
+        return;
+    }
+
+    char address[UV_VIEWER_ADDR_MAX] = {0};
+    gboolean found = FALSE;
+    if (stats.sources) {
+        for (guint i = 0; i < stats.sources->len; i++) {
+            const UvSourceStats *src = &g_array_index(stats.sources, UvSourceStats, i);
+            if (src->selected) {
+                g_strlcpy(address, src->address, sizeof(address));
+                found = TRUE;
+                break;
+            }
+        }
+    }
+    uv_viewer_stats_clear(&stats);
+
+    if (!found || address[0] == '\0') {
+        update_status(ctx, "IDR request skipped: no source is currently locked.");
+        return;
+    }
+
+    guint port = ctx->current_cfg.idr_http_port ? ctx->current_cfg.idr_http_port : 80;
+
+    IdrJob *job = g_new0(IdrJob, 1);
+    job->ctx = ctx;
+    job->port = port;
+    g_strlcpy(job->address, address, sizeof(job->address));
+
+    char msg[160];
+    g_snprintf(msg, sizeof(msg), "Requesting IDR keyframe from %s:%u...", address, port);
+    update_status(ctx, msg);
+
+    ctx->idr_inflight++;
+    update_idr_button_sensitivity(ctx);
+
+    GThread *t = g_thread_new("uv-idr", idr_worker, job);
+    if (!t) {
+        ctx->idr_inflight--;
+        update_idr_button_sensitivity(ctx);
+        update_status(ctx, "IDR request failed: could not spawn worker thread.");
+        g_free(job);
+        return;
+    }
+    g_thread_unref(t);
+}
+
+static void install_app_css(void) {
+    static gboolean installed = FALSE;
+    if (installed) return;
+    installed = TRUE;
+
+    GtkCssProvider *provider = gtk_css_provider_new();
+    static const char *css =
+        ".uv-status {"
+        "  font-weight: 600;"
+        "  padding: 4px 8px;"
+        "  border-radius: 6px;"
+        "}"
+        ".uv-status-bar {"
+        "  background-color: alpha(@theme_fg_color, 0.06);"
+        "  border-radius: 6px;"
+        "  padding: 2px 4px;"
+        "}"
+        ".uv-source-detail {"
+        "  font-family: monospace;"
+        "  font-size: 0.95em;"
+        "}"
+        ".uv-info {"
+        "  font-size: 0.9em;"
+        "  opacity: 0.75;"
+        "}"
+        ".uv-action-bar {"
+        "  padding-top: 4px;"
+        "}"
+        "button.uv-idr {"
+        "  font-weight: 600;"
+        "}"
+        "frame.uv-video > border {"
+        "  border-radius: 8px;"
+        "}";
+#if GTK_CHECK_VERSION(4, 12, 0)
+    gtk_css_provider_load_from_string(provider, css);
+#else
+    gtk_css_provider_load_from_data(provider, css, -1);
+#endif
+    GdkDisplay *display = gdk_display_get_default();
+    if (display) {
+        gtk_style_context_add_provider_for_display(display,
+                                                   GTK_STYLE_PROVIDER(provider),
+                                                   GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+    }
+    g_object_unref(provider);
+}
+
 static void update_info_label(GuiContext *ctx) {
     if (!ctx || !ctx->info_label) return;
-    char info[160];
+    char info[224];
     UvViewerConfig *cfg = &ctx->current_cfg;
     guint vr_den = cfg->videorate_fps_denominator ? cfg->videorate_fps_denominator : 1;
     char videorate_info[24];
@@ -1343,7 +1556,8 @@ static void update_info_label(GuiContext *ctx) {
     if (!sink_pref) sink_pref = "Auto";
     g_snprintf(info, sizeof(info),
                "Listening on %d | PT %d | Clock %d | %s | Jitter %ums | Queue buffers %u"
-               " | drop=%s | lost=%s | bus-msg=%s | videorate=%s | decoder=%s | sink=%s | audio=%s",
+               " | drop=%s | lost=%s | bus-msg=%s | videorate=%s | decoder=%s | sink=%s | audio=%s"
+               " | IDR port %u",
                cfg->listen_port,
                cfg->payload_type,
                cfg->clock_rate,
@@ -1356,7 +1570,8 @@ static void update_info_label(GuiContext *ctx) {
                videorate_info,
                decoder_pref,
                sink_pref,
-               audio_state);
+               audio_state,
+               cfg->idr_http_port ? cfg->idr_http_port : 80u);
     gtk_label_set_text(ctx->info_label, info);
 }
 
@@ -1373,6 +1588,10 @@ static void sync_settings_controls(GuiContext *ctx) {
     }
     if (ctx->stats_refresh_spin) {
         gtk_spin_button_set_value(ctx->stats_refresh_spin, ctx->stats_refresh_interval_ms);
+    }
+    if (ctx->idr_port_spin) {
+        guint port = ctx->current_cfg.idr_http_port ? ctx->current_cfg.idr_http_port : 80;
+        gtk_spin_button_set_value(ctx->idr_port_spin, port);
     }
     if (ctx->decoder_dropdown) {
         gtk_drop_down_set_selected(ctx->decoder_dropdown,
@@ -1574,6 +1793,7 @@ static void refresh_stats(GuiContext *ctx) {
         if (ctx->source_detail_label) {
             gtk_label_set_text(ctx->source_detail_label, "No sources discovered yet.");
         }
+        update_idr_button_sensitivity(ctx);
     } else {
         guint existing_items = 0;
         if (ctx->source_model) {
@@ -1734,6 +1954,8 @@ static void refresh_stats(GuiContext *ctx) {
             ctx->active_source_valid = FALSE;
             ctx->active_source_index = GTK_INVALID_LIST_POSITION;
         }
+
+        update_idr_button_sensitivity(ctx);
 
         if (labels) {
             g_strfreev(labels);
@@ -2324,6 +2546,14 @@ static void on_settings_apply_clicked(GtkButton *button, gpointer user_data) {
     new_cfg.jitter_do_lost = check_get(ctx->jitter_do_lost_toggle);
     new_cfg.jitter_post_drop_messages = check_get(ctx->jitter_post_drop_toggle);
 
+    if (ctx->idr_port_spin) {
+        int port = gtk_spin_button_get_value_as_int(ctx->idr_port_spin);
+        if (port < 1) port = 1;
+        if (port > 65535) port = 65535;
+        new_cfg.idr_http_port = (guint)port;
+        ctx->current_cfg.idr_http_port = (guint)port;
+    }
+
     guint new_refresh_interval = ctx->stats_refresh_interval_ms;
     if (ctx->stats_refresh_spin) {
         int refresh = gtk_spin_button_get_value_as_int(ctx->stats_refresh_spin);
@@ -2532,9 +2762,13 @@ static GtkWidget *build_monitor_page(GuiContext *ctx) {
 
     ctx->status_label = GTK_LABEL(gtk_label_new("Waiting for sources..."));
     gtk_label_set_xalign(ctx->status_label, 0.0);
+    gtk_label_set_wrap(ctx->status_label, TRUE);
+    gtk_widget_add_css_class(GTK_WIDGET(ctx->status_label), "uv-status");
+    gtk_widget_add_css_class(GTK_WIDGET(ctx->status_label), "uv-status-bar");
     gtk_box_append(GTK_BOX(page), GTK_WIDGET(ctx->status_label));
 
     GtkWidget *video_frame = gtk_frame_new("Video Preview");
+    gtk_widget_add_css_class(video_frame, "uv-video");
     gtk_widget_set_hexpand(video_frame, TRUE);
     gtk_widget_set_vexpand(video_frame, TRUE);
     ctx->video_picture = GTK_PICTURE(gtk_picture_new());
@@ -2574,31 +2808,57 @@ static GtkWidget *build_monitor_page(GuiContext *ctx) {
     ctx->source_detail_label = GTK_LABEL(gtk_label_new("No sources discovered yet."));
     gtk_label_set_xalign(ctx->source_detail_label, 0.0);
     gtk_label_set_wrap(ctx->source_detail_label, TRUE);
+    gtk_label_set_selectable(ctx->source_detail_label, TRUE);
+    gtk_widget_add_css_class(GTK_WIDGET(ctx->source_detail_label), "uv-source-detail");
     gtk_box_append(GTK_BOX(sources_box), GTK_WIDGET(ctx->source_detail_label));
 
     GtkWidget *button_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    gtk_widget_add_css_class(button_box, "uv-action-bar");
+    gtk_widget_add_css_class(button_box, "toolbar");
     gtk_box_append(GTK_BOX(page), button_box);
+
+    ctx->idr_button = GTK_BUTTON(gtk_button_new_with_label("Request IDR"));
+    gtk_widget_add_css_class(GTK_WIDGET(ctx->idr_button), "suggested-action");
+    gtk_widget_add_css_class(GTK_WIDGET(ctx->idr_button), "uv-idr");
+    gtk_widget_set_tooltip_text(GTK_WIDGET(ctx->idr_button),
+                                "Ask the currently locked encoder for an IDR keyframe "
+                                "via HTTP GET /request/idr. Useful to recover after a "
+                                "freeze, link blip, or stream join. (Ctrl+I)");
+    g_signal_connect(ctx->idr_button, "clicked", G_CALLBACK(on_idr_button_clicked), ctx);
+    gtk_box_append(GTK_BOX(button_box), GTK_WIDGET(ctx->idr_button));
 
     GtkWidget *refresh_button = gtk_button_new_with_label("Restart Pipeline");
     gtk_widget_set_tooltip_text(refresh_button,
                                 "Tear down and rebuild the GStreamer pipeline. "
-                                "Useful when a mid-stream resolution / SPS change leaves the picture frozen.");
+                                "Useful when a mid-stream resolution / SPS change leaves "
+                                "the picture frozen. (Ctrl+R)");
     g_signal_connect(refresh_button, "clicked", G_CALLBACK(on_refresh_button_clicked), ctx);
     gtk_box_append(GTK_BOX(button_box), refresh_button);
 
     GtkWidget *next_button = gtk_button_new_with_label("Select Next");
+    gtk_widget_set_tooltip_text(next_button,
+                                "Switch to the next discovered source. (Ctrl+N)");
     g_signal_connect(next_button, "clicked", G_CALLBACK(on_next_button_clicked), ctx);
     gtk_box_append(GTK_BOX(button_box), next_button);
 
     ctx->sources_toggle = GTK_TOGGLE_BUTTON(gtk_toggle_button_new_with_label("Hide Sources"));
+    gtk_widget_set_tooltip_text(GTK_WIDGET(ctx->sources_toggle),
+                                "Collapse the source selector to maximize the video pane.");
     g_signal_connect(ctx->sources_toggle, "toggled", G_CALLBACK(on_sources_toggle_toggled), ctx);
     gtk_box_append(GTK_BOX(button_box), GTK_WIDGET(ctx->sources_toggle));
 
+    GtkWidget *spacer = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    gtk_widget_set_hexpand(spacer, TRUE);
+    gtk_box_append(GTK_BOX(button_box), spacer);
+
     GtkWidget *quit_button = gtk_button_new_with_label("Quit");
+    gtk_widget_add_css_class(quit_button, "flat");
     g_signal_connect(quit_button, "clicked", G_CALLBACK(on_quit_button_clicked), ctx);
-    gtk_box_append(GTK_BOX(button_box), quit_button);
+    gtk_box_append(GTK_BOX(button_box), GTK_WIDGET(quit_button));
 
     gtk_toggle_button_set_active(ctx->sources_toggle, TRUE);
+
+    update_idr_button_sensitivity(ctx);
 
     return page;
 }
@@ -2612,6 +2872,8 @@ static GtkWidget *build_settings_page(GuiContext *ctx) {
 
     ctx->info_label = GTK_LABEL(gtk_label_new(""));
     gtk_label_set_xalign(ctx->info_label, 0.0);
+    gtk_label_set_wrap(ctx->info_label, TRUE);
+    gtk_widget_add_css_class(GTK_WIDGET(ctx->info_label), "uv-info");
     gtk_box_append(GTK_BOX(page), GTK_WIDGET(ctx->info_label));
     update_info_label(ctx);
 
@@ -2732,7 +2994,21 @@ static GtkWidget *build_settings_page(GuiContext *ctx) {
     ctx->jitter_post_drop_toggle = GTK_CHECK_BUTTON(gtk_check_button_new_with_label("Post drop messages on bus"));
     gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(ctx->jitter_post_drop_toggle), 0, 11, 2, 1);
 
+    GtkWidget *idr_port_label = gtk_label_new("IDR HTTP Port:");
+    gtk_label_set_xalign(GTK_LABEL(idr_port_label), 0.0);
+    gtk_widget_set_tooltip_text(idr_port_label,
+                                "TCP port used by the 'Request IDR' button to reach the "
+                                "encoder's /request/idr endpoint (default 80).");
+    gtk_grid_attach(GTK_GRID(grid), idr_port_label, 0, 12, 1, 1);
+
+    ctx->idr_port_spin = GTK_SPIN_BUTTON(gtk_spin_button_new_with_range(1, 65535, 1));
+    gtk_widget_set_tooltip_text(GTK_WIDGET(ctx->idr_port_spin),
+                                "Applies on next Apply Settings; the button targets this port "
+                                "on the currently locked source's IP.");
+    gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(ctx->idr_port_spin), 1, 12, 1, 1);
+
     GtkWidget *apply_button = gtk_button_new_with_label("Apply Settings");
+    gtk_widget_add_css_class(apply_button, "suggested-action");
     g_signal_connect(apply_button, "clicked", G_CALLBACK(on_settings_apply_clicked), ctx);
     gtk_box_append(GTK_BOX(page), apply_button);
 
@@ -3315,13 +3591,55 @@ static void stats_chart_draw(GtkDrawingArea *area, cairo_t *cr, int width, int h
     cairo_restore(cr);
 }
 
+static gboolean accel_request_idr(GtkWidget *widget, GVariant *args, gpointer user_data) {
+    (void)widget;
+    (void)args;
+    on_idr_button_clicked(NULL, user_data);
+    return TRUE;
+}
+
+static gboolean accel_restart(GtkWidget *widget, GVariant *args, gpointer user_data) {
+    (void)widget;
+    (void)args;
+    on_refresh_button_clicked(NULL, user_data);
+    return TRUE;
+}
+
+static gboolean accel_next_source(GtkWidget *widget, GVariant *args, gpointer user_data) {
+    (void)widget;
+    (void)args;
+    on_next_button_clicked(NULL, user_data);
+    return TRUE;
+}
+
+static void install_window_accelerators(GuiContext *ctx, GtkWidget *window) {
+    GtkShortcutController *controller = GTK_SHORTCUT_CONTROLLER(gtk_shortcut_controller_new());
+    gtk_shortcut_controller_set_scope(controller, GTK_SHORTCUT_SCOPE_GLOBAL);
+
+    gtk_shortcut_controller_add_shortcut(controller,
+        gtk_shortcut_new(gtk_shortcut_trigger_parse_string("<Control>i"),
+                         gtk_callback_action_new(accel_request_idr, ctx, NULL)));
+    gtk_shortcut_controller_add_shortcut(controller,
+        gtk_shortcut_new(gtk_shortcut_trigger_parse_string("<Control>r"),
+                         gtk_callback_action_new(accel_restart, ctx, NULL)));
+    gtk_shortcut_controller_add_shortcut(controller,
+        gtk_shortcut_new(gtk_shortcut_trigger_parse_string("<Control>n"),
+                         gtk_callback_action_new(accel_next_source, ctx, NULL)));
+
+    gtk_widget_add_controller(window, GTK_EVENT_CONTROLLER(controller));
+}
+
 static void build_ui(GuiContext *ctx) {
+    install_app_css();
+
     GtkWidget *window = gtk_application_window_new(ctx->app);
     ctx->window = GTK_WINDOW(window);
     gtk_window_set_title(ctx->window, "UDP H.265 Viewer");
-    gtk_window_set_default_size(ctx->window, 900, 680);
+    gtk_window_set_default_size(ctx->window, 1080, 760);
     gtk_window_set_resizable(ctx->window, TRUE);
     g_signal_connect(window, "close-request", G_CALLBACK(on_window_close_request), ctx);
+
+    install_window_accelerators(ctx, window);
 
     ctx->notebook = GTK_NOTEBOOK(gtk_notebook_new());
     gtk_window_set_child(ctx->window, GTK_WIDGET(ctx->notebook));
@@ -3465,6 +3783,8 @@ static void on_app_shutdown(GApplication *app, gpointer user_data) {
     ctx->notebook = NULL;
     ctx->paintable_bound = FALSE;
     ctx->window = NULL;
+    ctx->idr_button = NULL;
+    ctx->idr_port_spin = NULL;
 }
 
 int uv_gui_run(UvViewer **viewer, UvViewerConfig *cfg, const char *program_name) {

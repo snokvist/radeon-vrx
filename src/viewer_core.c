@@ -34,6 +34,7 @@ void uv_viewer_config_init(UvViewerConfig *cfg) {
     cfg->audio_jitter_latency_ms = 8;
     cfg->decoder_preference = UV_DECODER_AUTO;
     cfg->video_sink_preference = UV_VIDEO_SINK_AUTO;
+    cfg->idr_http_port = 80;
 }
 
 UvViewer *uv_viewer_new(const UvViewerConfig *cfg) {

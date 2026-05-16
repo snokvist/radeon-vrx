@@ -50,6 +50,7 @@ typedef struct {
     guint audio_jitter_latency_ms; // jitter buffer latency for audio (default: 8)
     UvDecoderPreference decoder_preference;
     UvVideoSinkPreference video_sink_preference;
+    guint idr_http_port; // TCP port for the encoder's /request/idr endpoint (default: 80)
 } UvViewerConfig;
 
 typedef struct {
