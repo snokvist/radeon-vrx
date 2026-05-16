@@ -203,6 +203,22 @@ bool uv_viewer_update_pipeline(UvViewer *viewer, const UvPipelineOverrides *over
     return pipeline_controller_update(&viewer->pipeline, overrides, error);
 }
 
+void uv_viewer_set_sidecar_enabled(UvViewer *viewer, bool enabled, guint port) {
+    if (!viewer) return;
+    gboolean was = viewer->config.sidecar_enabled;
+    guint old_port = viewer->config.sidecar_port;
+    if (port > 0 && port <= 65535) viewer->config.sidecar_port = port;
+    viewer->config.sidecar_enabled = enabled ? TRUE : FALSE;
+
+    gboolean port_changed = (port > 0 && port != old_port);
+    if (was && (!enabled || port_changed)) {
+        sidecar_controller_stop(&viewer->sidecar);
+    }
+    if (enabled && (!was || port_changed)) {
+        sidecar_controller_start(&viewer->sidecar);
+    }
+}
+
 void uv_viewer_frame_block_configure(UvViewer *viewer, gboolean enabled, gboolean snapshot_mode) {
     if (!viewer) return;
     relay_controller_frame_block_configure(&viewer->relay, enabled, snapshot_mode);

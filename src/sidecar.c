@@ -335,6 +335,36 @@ void sidecar_controller_stop(SidecarController *sc) {
     }
     sc->enabled = FALSE;
     sc->local_port = 0;
+    /* Clear all per-session state so a re-enable starts fresh and the GUI
+     * doesn't show stale frame counts / averages while the probe is off. */
+    sc->target_valid = FALSE;
+    sc->target_addr[0] = '\0';
+    sc->last_frame_us = 0;
+    sc->last_subscribe_us = 0;
+    sc->frames_received = 0;
+    sc->idr_inserted_count = 0;
+    sc->scene_change_count = 0;
+    sc->keyframes_count = 0;
+    sc->last_ssrc = 0;
+    sc->last_frame_id = 0;
+    sc->last_rtp_timestamp = 0;
+    sc->last_seq_count = 0;
+    sc->last_frame_size_bytes = 0;
+    sc->last_frame_type = 0;
+    sc->last_qp = 0;
+    sc->last_complexity = 0;
+    sc->last_scene_change = 0;
+    sc->last_gop_state = 0;
+    sc->last_idr_inserted = 0;
+    sc->last_frames_since_idr = 0;
+    sc->window_head = 0;
+    sc->window_count = 0;
+    sc->transport_info_seen = FALSE;
+    sc->encoder_fill_pct = 0;
+    sc->encoder_in_pressure = 0;
+    sc->encoder_transport_drops = 0;
+    sc->encoder_pressure_drops = 0;
+    sc->encoder_packets_sent = 0;
     g_mutex_unlock(&sc->lock);
 }
 

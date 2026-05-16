@@ -137,12 +137,15 @@ typedef struct {
 
     GtkLabel *stream_detail_label;
 
-    GtkCheckButton *sidecar_toggle_settings;
+    /* Sidecar tab widgets. */
+    GtkToggleButton *sidecar_enable_toggle;
     GtkSpinButton *sidecar_port_spin;
     GtkLabel *sidecar_status_label;
     GtkLabel *sidecar_frame_label;
     GtkLabel *sidecar_encoder_label;
+    GtkLabel *sidecar_counters_label;
     GtkLabel *sidecar_transport_label;
+    gboolean sidecar_toggle_suppress;
 } GuiContext;
 
 typedef struct {
@@ -189,6 +192,10 @@ static GtkWidget *build_monitor_page(GuiContext *ctx);
 static GtkWidget *build_settings_page(GuiContext *ctx);
 static GtkWidget *build_stats_page(GuiContext *ctx);
 static GtkWidget *build_frame_block_page(GuiContext *ctx);
+static GtkWidget *build_sidecar_page(GuiContext *ctx);
+static void on_sidecar_enable_toggled(GtkToggleButton *btn, gpointer user_data);
+static void on_sidecar_port_changed(GtkSpinButton *spin, gpointer user_data);
+static void update_sidecar_toggle_label(GuiContext *ctx, gboolean enabled);
 static void viewer_event_callback(const UvViewerEvent *event, gpointer user_data);
 static void on_notebook_switch_page(GtkNotebook *notebook, GtkWidget *page, guint page_num, gpointer user_data);
 static void detach_bound_sink(GuiContext *ctx);
@@ -1577,13 +1584,6 @@ static void sync_settings_controls(GuiContext *ctx) {
         guint port = ctx->current_cfg.idr_http_port ? ctx->current_cfg.idr_http_port : 80;
         gtk_spin_button_set_value(ctx->idr_port_spin, port);
     }
-    if (ctx->sidecar_toggle_settings) {
-        check_set(ctx->sidecar_toggle_settings, ctx->current_cfg.sidecar_enabled ? TRUE : FALSE);
-    }
-    if (ctx->sidecar_port_spin) {
-        guint port = ctx->current_cfg.sidecar_port ? ctx->current_cfg.sidecar_port : 5602;
-        gtk_spin_button_set_value(ctx->sidecar_port_spin, port);
-    }
     if (ctx->decoder_dropdown) {
         gtk_drop_down_set_selected(ctx->decoder_dropdown,
                                    decoder_pref_to_index(ctx->current_cfg.decoder_preference));
@@ -1771,49 +1771,49 @@ static const char *sidecar_frame_type_name(uint8_t t) {
 static void update_sidecar_panel(GuiContext *ctx, const UvSidecarStats *sc) {
     if (!ctx || !sc) return;
 
+    /* Status pill at the top of the sidecar tab. */
     if (ctx->sidecar_status_label) {
-        char line[224];
+        char line[256];
         if (!sc->enabled) {
-            g_strlcpy(line, "Sidecar: disabled (enable in Settings + Apply).",
+            g_strlcpy(line, "Stopped. Press Start to subscribe to the encoder's sidecar.",
                       sizeof(line));
         } else if (!sc->socket_bound) {
-            g_strlcpy(line, "Sidecar: socket not open.", sizeof(line));
+            g_strlcpy(line, "Starting — socket not yet open.", sizeof(line));
         } else if (!sc->target_address[0]) {
             g_snprintf(line, sizeof(line),
-                       "Sidecar: enabled (probe :%u → :%u) — waiting for a locked source.",
+                       "Running (probe :%u → :%u) — waiting for a locked source.",
                        (unsigned)sc->local_port, (unsigned)sc->target_port);
         } else if (!sc->subscribed) {
             const char *seen;
-            char buf[24];
+            char buf[32];
             if (sc->seconds_since_last_frame < 0.0) {
-                seen = "no frames received yet";
+                seen = "no frames yet";
             } else {
                 g_snprintf(buf, sizeof(buf), "last frame %.1fs ago",
                            sc->seconds_since_last_frame);
                 seen = buf;
             }
             g_snprintf(line, sizeof(line),
-                       "Sidecar: subscribing to %s:%u (probe :%u) — %s.",
+                       "Subscribing to %s:%u (probe :%u) — %s",
                        sc->target_address, (unsigned)sc->target_port,
                        (unsigned)sc->local_port, seen);
         } else {
             g_snprintf(line, sizeof(line),
-                       "Sidecar: SUBSCRIBED to %s:%u (probe :%u)  •  %" G_GUINT64_FORMAT
-                       " frames  •  last %.2fs ago",
+                       "SUBSCRIBED to %s:%u  •  probe :%u  •  last frame %.2fs ago",
                        sc->target_address, (unsigned)sc->target_port,
-                       (unsigned)sc->local_port,
-                       sc->frames_received, sc->seconds_since_last_frame);
+                       (unsigned)sc->local_port, sc->seconds_since_last_frame);
         }
         gtk_label_set_text(ctx->sidecar_status_label, line);
     }
 
-    char frame_line[256] = {0};
-    char enc_line[256]   = {0};
-    char trans_line[256] = {0};
+    char frame_line[256]    = {0};
+    char enc_line[256]      = {0};
+    char counters_line[224] = {0};
+    char trans_line[256]    = {0};
 
-    if (sc->subscribed && sc->frames_received > 0) {
+    if (sc->enabled && sc->frames_received > 0) {
         g_snprintf(frame_line, sizeof(frame_line),
-                   "Last frame: %s  •  %u bytes  •  RTP packets: %u  •  ssrc=0x%08x  •  frame_id=%" G_GUINT64_FORMAT,
+                   "Last frame: %s  •  %u bytes  •  %u RTP packets  •  ssrc=0x%08x  •  frame_id=%" G_GUINT64_FORMAT,
                    sidecar_frame_type_name(sc->last_frame_type),
                    (unsigned)sc->last_frame_size_bytes,
                    (unsigned)sc->last_seq_count,
@@ -1821,33 +1821,59 @@ static void update_sidecar_panel(GuiContext *ctx, const UvSidecarStats *sc) {
                    sc->last_frame_id);
 
         g_snprintf(enc_line, sizeof(enc_line),
-                   "QP=%u (avg %.1f)  •  complexity=%u (avg %.1f)  •  scene_change=%u  •  gop_state=%u"
-                   "  •  IDRs inserted=%" G_GUINT64_FORMAT
-                   "  •  scene changes=%" G_GUINT64_FORMAT
-                   "  •  frames since IDR=%u",
+                   "QP %u (avg %.1f)  •  complexity %u (avg %.1f)  •  scene_change=%s"
+                   "  •  gop_state=%u  •  frames since IDR=%u",
                    (unsigned)sc->last_qp, sc->avg_qp,
                    (unsigned)sc->last_complexity, sc->avg_complexity,
-                   (unsigned)sc->last_scene_change,
+                   sc->last_scene_change ? "YES" : "no",
                    (unsigned)sc->last_gop_state,
+                   (unsigned)sc->last_frames_since_idr);
+
+        g_snprintf(counters_line, sizeof(counters_line),
+                   "Frames %" G_GUINT64_FORMAT
+                   "  •  IDR insertions %" G_GUINT64_FORMAT
+                   "  •  scene changes %" G_GUINT64_FORMAT
+                   "  •  keyframes (I+IDR) %" G_GUINT64_FORMAT,
+                   sc->frames_received,
                    sc->idr_inserted_count,
                    sc->scene_change_count,
-                   (unsigned)sc->last_frames_since_idr);
+                   sc->keyframes_count);
 
         if (sc->transport_info_seen) {
             g_snprintf(trans_line, sizeof(trans_line),
-                       "Encoder queue: %u%%  •  pressure=%s"
-                       "  •  transport drops=%u  •  pressure drops=%u  •  packets sent=%u",
+                       "Queue %u%%  •  pressure %s"
+                       "  •  transport drops %u  •  pressure drops %u  •  packets sent %u",
                        (unsigned)sc->encoder_fill_pct,
                        sc->encoder_in_pressure ? "ASSERTED" : "—",
                        (unsigned)sc->encoder_transport_drops,
                        (unsigned)sc->encoder_pressure_drops,
                        (unsigned)sc->encoder_packets_sent);
+        } else {
+            g_strlcpy(trans_line,
+                      "Transport trailer not yet seen on this encoder.",
+                      sizeof(trans_line));
         }
     }
 
-    if (ctx->sidecar_frame_label)    gtk_label_set_text(ctx->sidecar_frame_label, frame_line);
-    if (ctx->sidecar_encoder_label)  gtk_label_set_text(ctx->sidecar_encoder_label, enc_line);
+    if (ctx->sidecar_frame_label)     gtk_label_set_text(ctx->sidecar_frame_label, frame_line);
+    if (ctx->sidecar_encoder_label)   gtk_label_set_text(ctx->sidecar_encoder_label, enc_line);
+    if (ctx->sidecar_counters_label)  gtk_label_set_text(ctx->sidecar_counters_label, counters_line);
     if (ctx->sidecar_transport_label) gtk_label_set_text(ctx->sidecar_transport_label, trans_line);
+
+    /* Keep the toggle button text in sync with reality (in case state
+     * changes via a different code path, e.g. uv_viewer_set_sidecar). */
+    if (ctx->sidecar_enable_toggle && !ctx->sidecar_toggle_suppress) {
+        gboolean active = gtk_toggle_button_get_active(ctx->sidecar_enable_toggle);
+        if (active != sc->enabled) {
+            ctx->sidecar_toggle_suppress = TRUE;
+            gtk_toggle_button_set_active(ctx->sidecar_enable_toggle, sc->enabled);
+            ctx->sidecar_toggle_suppress = FALSE;
+        }
+        update_sidecar_toggle_label(ctx, sc->enabled);
+    }
+    if (ctx->sidecar_port_spin) {
+        gtk_widget_set_sensitive(GTK_WIDGET(ctx->sidecar_port_spin), !sc->enabled);
+    }
 }
 
 static void update_frame_overlay_labels(GuiContext *ctx) {
@@ -2906,13 +2932,10 @@ static void on_settings_apply_clicked(GtkButton *button, gpointer user_data) {
         new_cfg.idr_http_port = (guint)port;
         ctx->current_cfg.idr_http_port = (guint)port;
     }
-    new_cfg.sidecar_enabled = check_get(ctx->sidecar_toggle_settings);
-    if (ctx->sidecar_port_spin) {
-        int port = gtk_spin_button_get_value_as_int(ctx->sidecar_port_spin);
-        if (port < 1) port = 1;
-        if (port > 65535) port = 65535;
-        new_cfg.sidecar_port = (guint)port;
-    }
+    /* Sidecar telemetry has its own tab + runtime start/stop — keep the
+     * applied-on-restart settings flow free of it. */
+    new_cfg.sidecar_enabled = ctx->current_cfg.sidecar_enabled;
+    new_cfg.sidecar_port    = ctx->current_cfg.sidecar_port;
 
     guint new_refresh_interval = ctx->stats_refresh_interval_ms;
     if (ctx->stats_refresh_spin) {
@@ -3379,28 +3402,6 @@ static GtkWidget *build_settings_page(GuiContext *ctx) {
                                 "on the currently locked source's IP.");
     gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(ctx->idr_port_spin), 1, 12, 1, 1);
 
-    GtkWidget *sidecar_label = gtk_label_new("Sidecar Telemetry:");
-    gtk_label_set_xalign(GTK_LABEL(sidecar_label), 0.0);
-    gtk_widget_set_tooltip_text(sidecar_label,
-                                "Subscribe to waybeam_venc's RTP sidecar telemetry channel "
-                                "on the locked source to receive per-frame QP, complexity, "
-                                "and IDR-insertion data.");
-    gtk_grid_attach(GTK_GRID(grid), sidecar_label, 0, 13, 1, 1);
-
-    GtkWidget *sidecar_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
-    gtk_grid_attach(GTK_GRID(grid), sidecar_box, 1, 13, 1, 1);
-
-    ctx->sidecar_toggle_settings = GTK_CHECK_BUTTON(gtk_check_button_new_with_label("Enable"));
-    gtk_box_append(GTK_BOX(sidecar_box), GTK_WIDGET(ctx->sidecar_toggle_settings));
-
-    GtkWidget *sidecar_port_label = gtk_label_new("Port:");
-    gtk_box_append(GTK_BOX(sidecar_box), sidecar_port_label);
-
-    ctx->sidecar_port_spin = GTK_SPIN_BUTTON(gtk_spin_button_new_with_range(1, 65535, 1));
-    gtk_widget_set_tooltip_text(GTK_WIDGET(ctx->sidecar_port_spin),
-                                "Encoder-side UDP port for the sidecar protocol (default 5602).");
-    gtk_box_append(GTK_BOX(sidecar_box), GTK_WIDGET(ctx->sidecar_port_spin));
-
     GtkWidget *apply_button = gtk_button_new_with_label("Apply Settings");
     gtk_widget_add_css_class(apply_button, "suggested-action");
     g_signal_connect(apply_button, "clicked", G_CALLBACK(on_settings_apply_clicked), ctx);
@@ -3561,50 +3562,187 @@ static GtkWidget *build_stats_page(GuiContext *ctx) {
         ctx->stats_max_labels[i] = GTK_LABEL(max_widget);
     }
 
-    /* Encoder telemetry panel — populated when the optional waybeam_venc
-     * RTP sidecar feed is connected (Settings tab → enable + port). */
-    GtkWidget *sidecar_frame = gtk_frame_new("Encoder Telemetry (sidecar)");
-    gtk_widget_set_hexpand(sidecar_frame, TRUE);
-    gtk_widget_set_vexpand(sidecar_frame, FALSE);
-    gtk_widget_set_tooltip_text(sidecar_frame,
-                                "Per-frame telemetry from waybeam_venc's RTP sidecar protocol. "
-                                "Subscribe to the encoder UDP port (default 5602) in Settings "
-                                "to see live QP, complexity, scene-change flags, and IDR "
-                                "insertion events alongside the receive-side stats.");
-    GtkWidget *sidecar_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
-    gtk_widget_set_margin_top(sidecar_box, 6);
-    gtk_widget_set_margin_bottom(sidecar_box, 6);
-    gtk_widget_set_margin_start(sidecar_box, 8);
-    gtk_widget_set_margin_end(sidecar_box, 8);
-    gtk_frame_set_child(GTK_FRAME(sidecar_frame), sidecar_box);
-    gtk_box_append(GTK_BOX(page), sidecar_frame);
+    return page;
+}
 
-    ctx->sidecar_status_label = GTK_LABEL(gtk_label_new("Sidecar: disabled."));
+static void update_sidecar_toggle_label(GuiContext *ctx, gboolean enabled) {
+    if (!ctx || !ctx->sidecar_enable_toggle) return;
+    gtk_button_set_label(GTK_BUTTON(ctx->sidecar_enable_toggle),
+                         enabled ? "Stop telemetry" : "Start telemetry");
+    if (enabled) {
+        gtk_widget_remove_css_class(GTK_WIDGET(ctx->sidecar_enable_toggle), "suggested-action");
+        gtk_widget_add_css_class(GTK_WIDGET(ctx->sidecar_enable_toggle), "destructive-action");
+    } else {
+        gtk_widget_remove_css_class(GTK_WIDGET(ctx->sidecar_enable_toggle), "destructive-action");
+        gtk_widget_add_css_class(GTK_WIDGET(ctx->sidecar_enable_toggle), "suggested-action");
+    }
+}
+
+static void on_sidecar_enable_toggled(GtkToggleButton *btn, gpointer user_data) {
+    GuiContext *ctx = user_data;
+    if (!ctx || ctx->sidecar_toggle_suppress) return;
+    if (!ctx->viewer) return;
+
+    gboolean want_on = gtk_toggle_button_get_active(btn);
+    guint port = ctx->current_cfg.sidecar_port ? ctx->current_cfg.sidecar_port : 5602;
+    if (ctx->sidecar_port_spin) {
+        int v = gtk_spin_button_get_value_as_int(ctx->sidecar_port_spin);
+        if (v >= 1 && v <= 65535) port = (guint)v;
+    }
+
+    uv_viewer_set_sidecar_enabled(ctx->viewer, want_on, port);
+    ctx->current_cfg.sidecar_enabled = want_on;
+    ctx->current_cfg.sidecar_port = port;
+    if (ctx->cfg_slot) {
+        ctx->cfg_slot->sidecar_enabled = want_on;
+        ctx->cfg_slot->sidecar_port = port;
+    }
+    update_sidecar_toggle_label(ctx, want_on);
+    if (ctx->sidecar_port_spin) {
+        gtk_widget_set_sensitive(GTK_WIDGET(ctx->sidecar_port_spin), !want_on);
+    }
+}
+
+static void on_sidecar_port_changed(GtkSpinButton *spin, gpointer user_data) {
+    GuiContext *ctx = user_data;
+    if (!ctx) return;
+    int v = gtk_spin_button_get_value_as_int(spin);
+    if (v < 1) v = 1;
+    if (v > 65535) v = 65535;
+    ctx->current_cfg.sidecar_port = (guint)v;
+    if (ctx->cfg_slot) ctx->cfg_slot->sidecar_port = (guint)v;
+}
+
+static GtkWidget *build_sidecar_page(GuiContext *ctx) {
+    GtkWidget *page = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
+    gtk_widget_set_margin_top(page, 12);
+    gtk_widget_set_margin_bottom(page, 12);
+    gtk_widget_set_margin_start(page, 12);
+    gtk_widget_set_margin_end(page, 12);
+
+    /* Controls row: Start/Stop, port spin. */
+    GtkWidget *controls = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_widget_add_css_class(controls, "toolbar");
+    gtk_widget_add_css_class(controls, "uv-action-bar");
+    gtk_box_append(GTK_BOX(page), controls);
+
+    ctx->sidecar_enable_toggle = GTK_TOGGLE_BUTTON(gtk_toggle_button_new_with_label("Start telemetry"));
+    gtk_widget_add_css_class(GTK_WIDGET(ctx->sidecar_enable_toggle), "suggested-action");
+    gtk_widget_set_tooltip_text(GTK_WIDGET(ctx->sidecar_enable_toggle),
+                                "Open a UDP probe socket and subscribe to the locked source's "
+                                "waybeam_venc sidecar telemetry channel. Stops cleanly when "
+                                "toggled off.");
+    g_signal_connect(ctx->sidecar_enable_toggle, "toggled",
+                     G_CALLBACK(on_sidecar_enable_toggled), ctx);
+    gtk_box_append(GTK_BOX(controls), GTK_WIDGET(ctx->sidecar_enable_toggle));
+
+    GtkWidget *port_label = gtk_label_new("Encoder port:");
+    gtk_widget_set_valign(port_label, GTK_ALIGN_CENTER);
+    gtk_box_append(GTK_BOX(controls), port_label);
+
+    ctx->sidecar_port_spin = GTK_SPIN_BUTTON(gtk_spin_button_new_with_range(1, 65535, 1));
+    gtk_widget_set_tooltip_text(GTK_WIDGET(ctx->sidecar_port_spin),
+                                "UDP port on the encoder side that hosts the sidecar listener "
+                                "(default 5602). Editable only when telemetry is stopped.");
+    gtk_widget_set_valign(GTK_WIDGET(ctx->sidecar_port_spin), GTK_ALIGN_CENTER);
+    g_signal_connect(ctx->sidecar_port_spin, "value-changed",
+                     G_CALLBACK(on_sidecar_port_changed), ctx);
+    gtk_box_append(GTK_BOX(controls), GTK_WIDGET(ctx->sidecar_port_spin));
+
+    GtkWidget *spacer = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    gtk_widget_set_hexpand(spacer, TRUE);
+    gtk_box_append(GTK_BOX(controls), spacer);
+
+    /* Status frame. */
+    GtkWidget *status_frame = gtk_frame_new("Status");
+    gtk_widget_set_hexpand(status_frame, TRUE);
+    gtk_box_append(GTK_BOX(page), status_frame);
+    ctx->sidecar_status_label = GTK_LABEL(gtk_label_new(
+        "Stopped. Press Start to subscribe to the encoder's sidecar."));
     gtk_label_set_xalign(ctx->sidecar_status_label, 0.0);
+    gtk_label_set_wrap(ctx->sidecar_status_label, TRUE);
     gtk_label_set_selectable(ctx->sidecar_status_label, TRUE);
     gtk_widget_add_css_class(GTK_WIDGET(ctx->sidecar_status_label), "uv-source-detail");
-    gtk_box_append(GTK_BOX(sidecar_box), GTK_WIDGET(ctx->sidecar_status_label));
+    gtk_widget_set_margin_top(GTK_WIDGET(ctx->sidecar_status_label), 6);
+    gtk_widget_set_margin_bottom(GTK_WIDGET(ctx->sidecar_status_label), 6);
+    gtk_widget_set_margin_start(GTK_WIDGET(ctx->sidecar_status_label), 8);
+    gtk_widget_set_margin_end(GTK_WIDGET(ctx->sidecar_status_label), 8);
+    gtk_frame_set_child(GTK_FRAME(status_frame), GTK_WIDGET(ctx->sidecar_status_label));
 
+    /* Last frame frame. */
+    GtkWidget *frame_frame = gtk_frame_new("Last frame");
+    gtk_widget_set_hexpand(frame_frame, TRUE);
+    gtk_box_append(GTK_BOX(page), frame_frame);
     ctx->sidecar_frame_label = GTK_LABEL(gtk_label_new(""));
     gtk_label_set_xalign(ctx->sidecar_frame_label, 0.0);
     gtk_label_set_wrap(ctx->sidecar_frame_label, TRUE);
     gtk_label_set_selectable(ctx->sidecar_frame_label, TRUE);
     gtk_widget_add_css_class(GTK_WIDGET(ctx->sidecar_frame_label), "uv-source-detail");
-    gtk_box_append(GTK_BOX(sidecar_box), GTK_WIDGET(ctx->sidecar_frame_label));
+    gtk_widget_set_margin_top(GTK_WIDGET(ctx->sidecar_frame_label), 6);
+    gtk_widget_set_margin_bottom(GTK_WIDGET(ctx->sidecar_frame_label), 6);
+    gtk_widget_set_margin_start(GTK_WIDGET(ctx->sidecar_frame_label), 8);
+    gtk_widget_set_margin_end(GTK_WIDGET(ctx->sidecar_frame_label), 8);
+    gtk_frame_set_child(GTK_FRAME(frame_frame), GTK_WIDGET(ctx->sidecar_frame_label));
 
+    /* Encoder rate-control frame. */
+    GtkWidget *enc_frame = gtk_frame_new("Encoder rate control");
+    gtk_widget_set_hexpand(enc_frame, TRUE);
+    gtk_box_append(GTK_BOX(page), enc_frame);
     ctx->sidecar_encoder_label = GTK_LABEL(gtk_label_new(""));
     gtk_label_set_xalign(ctx->sidecar_encoder_label, 0.0);
     gtk_label_set_wrap(ctx->sidecar_encoder_label, TRUE);
     gtk_label_set_selectable(ctx->sidecar_encoder_label, TRUE);
     gtk_widget_add_css_class(GTK_WIDGET(ctx->sidecar_encoder_label), "uv-source-detail");
-    gtk_box_append(GTK_BOX(sidecar_box), GTK_WIDGET(ctx->sidecar_encoder_label));
+    gtk_widget_set_margin_top(GTK_WIDGET(ctx->sidecar_encoder_label), 6);
+    gtk_widget_set_margin_bottom(GTK_WIDGET(ctx->sidecar_encoder_label), 6);
+    gtk_widget_set_margin_start(GTK_WIDGET(ctx->sidecar_encoder_label), 8);
+    gtk_widget_set_margin_end(GTK_WIDGET(ctx->sidecar_encoder_label), 8);
+    gtk_frame_set_child(GTK_FRAME(enc_frame), GTK_WIDGET(ctx->sidecar_encoder_label));
 
+    /* Counters frame. */
+    GtkWidget *counters_frame = gtk_frame_new("Lifetime counters");
+    gtk_widget_set_hexpand(counters_frame, TRUE);
+    gtk_box_append(GTK_BOX(page), counters_frame);
+    ctx->sidecar_counters_label = GTK_LABEL(gtk_label_new(""));
+    gtk_label_set_xalign(ctx->sidecar_counters_label, 0.0);
+    gtk_label_set_wrap(ctx->sidecar_counters_label, TRUE);
+    gtk_label_set_selectable(ctx->sidecar_counters_label, TRUE);
+    gtk_widget_add_css_class(GTK_WIDGET(ctx->sidecar_counters_label), "uv-source-detail");
+    gtk_widget_set_margin_top(GTK_WIDGET(ctx->sidecar_counters_label), 6);
+    gtk_widget_set_margin_bottom(GTK_WIDGET(ctx->sidecar_counters_label), 6);
+    gtk_widget_set_margin_start(GTK_WIDGET(ctx->sidecar_counters_label), 8);
+    gtk_widget_set_margin_end(GTK_WIDGET(ctx->sidecar_counters_label), 8);
+    gtk_frame_set_child(GTK_FRAME(counters_frame), GTK_WIDGET(ctx->sidecar_counters_label));
+
+    /* Encoder transport queue frame. */
+    GtkWidget *trans_frame = gtk_frame_new("Encoder transport queue");
+    gtk_widget_set_hexpand(trans_frame, TRUE);
+    gtk_widget_set_tooltip_text(trans_frame,
+                                "Optional encoder-side queue snapshot. Only some waybeam_venc "
+                                "transports emit this trailer.");
+    gtk_box_append(GTK_BOX(page), trans_frame);
     ctx->sidecar_transport_label = GTK_LABEL(gtk_label_new(""));
     gtk_label_set_xalign(ctx->sidecar_transport_label, 0.0);
     gtk_label_set_wrap(ctx->sidecar_transport_label, TRUE);
     gtk_label_set_selectable(ctx->sidecar_transport_label, TRUE);
     gtk_widget_add_css_class(GTK_WIDGET(ctx->sidecar_transport_label), "uv-source-detail");
-    gtk_box_append(GTK_BOX(sidecar_box), GTK_WIDGET(ctx->sidecar_transport_label));
+    gtk_widget_set_margin_top(GTK_WIDGET(ctx->sidecar_transport_label), 6);
+    gtk_widget_set_margin_bottom(GTK_WIDGET(ctx->sidecar_transport_label), 6);
+    gtk_widget_set_margin_start(GTK_WIDGET(ctx->sidecar_transport_label), 8);
+    gtk_widget_set_margin_end(GTK_WIDGET(ctx->sidecar_transport_label), 8);
+    gtk_frame_set_child(GTK_FRAME(trans_frame), GTK_WIDGET(ctx->sidecar_transport_label));
+
+    /* Prime widget state from the current config. */
+    if (ctx->sidecar_port_spin) {
+        guint port = ctx->current_cfg.sidecar_port ? ctx->current_cfg.sidecar_port : 5602;
+        gtk_spin_button_set_value(ctx->sidecar_port_spin, port);
+    }
+    if (ctx->sidecar_enable_toggle) {
+        ctx->sidecar_toggle_suppress = TRUE;
+        gtk_toggle_button_set_active(ctx->sidecar_enable_toggle, ctx->current_cfg.sidecar_enabled);
+        ctx->sidecar_toggle_suppress = FALSE;
+        update_sidecar_toggle_label(ctx, ctx->current_cfg.sidecar_enabled);
+    }
 
     return page;
 }
@@ -4172,6 +4310,9 @@ static void build_ui(GuiContext *ctx) {
     GtkWidget *frame_page = build_frame_block_page(ctx);
     gtk_notebook_append_page(ctx->notebook, frame_page, gtk_label_new("Frame Blocks"));
 
+    GtkWidget *sidecar_page = build_sidecar_page(ctx);
+    gtk_notebook_append_page(ctx->notebook, sidecar_page, gtk_label_new("Sidecar"));
+
     g_signal_connect(ctx->notebook, "switch-page", G_CALLBACK(on_notebook_switch_page), ctx);
 
     gtk_window_present(ctx->window);
@@ -4304,11 +4445,12 @@ static void on_app_shutdown(GApplication *app, gpointer user_data) {
     ctx->stats_source_label = NULL;
     ctx->stats_pause_toggle = NULL;
     ctx->stream_detail_label = NULL;
-    ctx->sidecar_toggle_settings = NULL;
+    ctx->sidecar_enable_toggle = NULL;
     ctx->sidecar_port_spin = NULL;
     ctx->sidecar_status_label = NULL;
     ctx->sidecar_frame_label = NULL;
     ctx->sidecar_encoder_label = NULL;
+    ctx->sidecar_counters_label = NULL;
     ctx->sidecar_transport_label = NULL;
 }
 

@@ -251,6 +251,11 @@ int  uv_viewer_get_selected_source(const UvViewer *viewer);
 
 bool uv_viewer_update_pipeline(UvViewer *viewer, const UvPipelineOverrides *overrides, GError **error);
 
+/* Toggle the sidecar probe at runtime. Pass port=0 to keep the currently
+ * configured port. Starts/stops the worker thread synchronously so the
+ * GUI no longer has to restart the whole viewer to (un)subscribe. */
+void uv_viewer_set_sidecar_enabled(UvViewer *viewer, bool enabled, guint port);
+
 void uv_viewer_frame_block_configure(UvViewer *viewer, gboolean enabled, gboolean snapshot_mode);
 void uv_viewer_frame_block_pause(UvViewer *viewer, gboolean paused);
 void uv_viewer_frame_block_reset(UvViewer *viewer);
