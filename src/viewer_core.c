@@ -32,6 +32,8 @@ void uv_viewer_config_init(UvViewerConfig *cfg) {
     cfg->audio_payload_type = 98;
     cfg->audio_clock_rate = 48000;
     cfg->audio_jitter_latency_ms = 8;
+    cfg->audio_use_separate_port = FALSE;
+    cfg->audio_listen_port = 5601;
     cfg->decoder_preference = UV_DECODER_AUTO;
     cfg->video_sink_preference = UV_VIDEO_SINK_AUTO;
     cfg->idr_http_port = 80;

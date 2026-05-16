@@ -48,6 +48,8 @@ typedef struct {
     guint audio_payload_type; // RTP payload type carrying OPUS (default: 98)
     guint audio_clock_rate; // RTP clock rate for audio (default: 48000)
     guint audio_jitter_latency_ms; // jitter buffer latency for audio (default: 8)
+    gboolean audio_use_separate_port; // TRUE: audio comes in on its own UDP port
+    guint audio_listen_port;          // UDP port for audio when use_separate_port is set
     UvDecoderPreference decoder_preference;
     UvVideoSinkPreference video_sink_preference;
     guint idr_http_port; // TCP port for the encoder's /request/idr endpoint (default: 80)

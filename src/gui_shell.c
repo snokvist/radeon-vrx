@@ -63,6 +63,9 @@ typedef struct {
     GtkCheckButton *audio_toggle;
     GtkSpinButton *audio_payload_spin;
     GtkSpinButton *audio_jitter_spin;
+    GtkDropDown   *audio_port_mode_dropdown; /* 0 = shared with video, 1 = separate */
+    GtkSpinButton *audio_port_spin;
+    GtkLabel      *audio_status_label;
     GtkCheckButton *jitter_drop_toggle;
     GtkCheckButton *jitter_do_lost_toggle;
     GtkCheckButton *jitter_post_drop_toggle;
@@ -131,7 +134,6 @@ typedef struct {
     GtkSpinButton *idr_port_spin;
     gint idr_inflight;
 
-    GtkLabel *stats_source_label;
     GtkToggleButton *stats_pause_toggle;
     gboolean stats_paused;
 
@@ -196,6 +198,10 @@ static GtkWidget *build_sidecar_page(GuiContext *ctx);
 static void on_sidecar_enable_toggled(GtkToggleButton *btn, gpointer user_data);
 static void on_sidecar_port_changed(GtkSpinButton *spin, gpointer user_data);
 static void update_sidecar_toggle_label(GuiContext *ctx, gboolean enabled);
+static GtkWidget *build_audio_page(GuiContext *ctx);
+static void on_audio_apply_clicked(GtkButton *btn, gpointer user_data);
+static void on_audio_port_mode_changed(GObject *dropdown, GParamSpec *pspec, gpointer user_data);
+static void update_audio_status_label(GuiContext *ctx, const UvViewerStats *stats);
 static void viewer_event_callback(const UvViewerEvent *event, gpointer user_data);
 static void on_notebook_switch_page(GtkNotebook *notebook, GtkWidget *page, guint page_num, gpointer user_data);
 static void detach_bound_sink(GuiContext *ctx);
@@ -2287,40 +2293,6 @@ static void refresh_stats(GuiContext *ctx) {
         }
     }
 
-    if (viewer_selected_source && ctx->stats_source_label) {
-        char rate_buf[48];
-        format_bitrate(viewer_selected_source->inbound_bitrate_bps, rate_buf, sizeof(rate_buf));
-        uint64_t kf_total = viewer_selected_source->hevc_idr_count
-                          + viewer_selected_source->hevc_cra_count;
-        char kf_age_buf[24];
-        if (viewer_selected_source->seconds_since_keyframe < 0.0) {
-            g_strlcpy(kf_age_buf, "n/a", sizeof(kf_age_buf));
-        } else if (viewer_selected_source->seconds_since_keyframe >= 60.0) {
-            g_snprintf(kf_age_buf, sizeof(kf_age_buf), "%.0fm%.0fs",
-                       floor(viewer_selected_source->seconds_since_keyframe / 60.0),
-                       fmod(viewer_selected_source->seconds_since_keyframe, 60.0));
-        } else {
-            g_snprintf(kf_age_buf, sizeof(kf_age_buf), "%.1fs",
-                       viewer_selected_source->seconds_since_keyframe);
-        }
-        char banner[320];
-        g_snprintf(banner, sizeof(banner),
-                   "Source %s  •  %s  •  jitter %.2f ms  •  input %.1f fps  •  decoder %.1f fps"
-                   "  •  lost %" G_GUINT64_FORMAT
-                   "  •  KF %" G_GUINT64_FORMAT " (last %s)",
-                   viewer_selected_source->address,
-                   rate_buf,
-                   viewer_selected_source->rfc3550_jitter_ms,
-                   viewer_selected_source->rtp_marker_fps,
-                   stats.decoder.instantaneous_fps,
-                   viewer_selected_source->rtp_lost_packets,
-                   kf_total,
-                   kf_age_buf);
-        gtk_label_set_text(ctx->stats_source_label, banner);
-    } else if (ctx->stats_source_label) {
-        gtk_label_set_text(ctx->stats_source_label, "No source locked.");
-    }
-
     if (viewer_selected_source && !ctx->stats_paused) {
         StatsSample sample = {0};
         sample.timestamp = g_get_monotonic_time() / 1e6;
@@ -2466,6 +2438,7 @@ static void refresh_stats(GuiContext *ctx) {
     frame_block_queue_overlay_draws(ctx);
 
     update_sidecar_panel(ctx, &stats.sidecar);
+    update_audio_status_label(ctx, &stats);
 
     uv_viewer_stats_clear(&stats);
 }
@@ -2908,18 +2881,13 @@ static void on_settings_apply_clicked(GtkButton *button, gpointer user_data) {
         if (fps_den <= 0) fps_den = 1;
         new_cfg.videorate_fps_denominator = (guint)fps_den;
     }
-    new_cfg.audio_enabled = check_get(ctx->audio_toggle);
-    if (ctx->audio_payload_spin) {
-        int payload = gtk_spin_button_get_value_as_int(ctx->audio_payload_spin);
-        if (payload < 0) payload = 0;
-        if (payload > 127) payload = 127;
-        new_cfg.audio_payload_type = (guint)payload;
-    }
-    if (ctx->audio_jitter_spin) {
-        int aj = gtk_spin_button_get_value_as_int(ctx->audio_jitter_spin);
-        if (aj < 0) aj = 0;
-        new_cfg.audio_jitter_latency_ms = (guint)aj;
-    }
+    /* Audio settings are owned by the Audio tab — preserve them. */
+    new_cfg.audio_enabled            = ctx->current_cfg.audio_enabled;
+    new_cfg.audio_payload_type       = ctx->current_cfg.audio_payload_type;
+    new_cfg.audio_jitter_latency_ms  = ctx->current_cfg.audio_jitter_latency_ms;
+    new_cfg.audio_clock_rate         = ctx->current_cfg.audio_clock_rate;
+    new_cfg.audio_use_separate_port  = ctx->current_cfg.audio_use_separate_port;
+    new_cfg.audio_listen_port        = ctx->current_cfg.audio_listen_port;
     new_cfg.sync_to_clock = check_get(ctx->sync_toggle_settings);
     new_cfg.jitter_drop_on_latency = check_get(ctx->jitter_drop_toggle);
     new_cfg.jitter_do_lost = check_get(ctx->jitter_do_lost_toggle);
@@ -2986,6 +2954,15 @@ static void on_audio_toggled(GtkCheckButton *button, gpointer user_data) {
     }
     if (ctx->audio_jitter_spin) {
         gtk_widget_set_sensitive(GTK_WIDGET(ctx->audio_jitter_spin), active);
+    }
+    if (ctx->audio_port_mode_dropdown) {
+        gtk_widget_set_sensitive(GTK_WIDGET(ctx->audio_port_mode_dropdown), active);
+    }
+    if (ctx->audio_port_spin) {
+        guint mode = ctx->audio_port_mode_dropdown
+                   ? gtk_drop_down_get_selected(ctx->audio_port_mode_dropdown) : 0;
+        gtk_widget_set_sensitive(GTK_WIDGET(ctx->audio_port_spin),
+                                 active && mode == 1);
     }
 }
 
@@ -3355,30 +3332,7 @@ static GtkWidget *build_settings_page(GuiContext *ctx) {
     ctx->videorate_den_spin = GTK_SPIN_BUTTON(gtk_spin_button_new_with_range(1, 1000, 1));
     gtk_box_append(GTK_BOX(videorate_box), GTK_WIDGET(ctx->videorate_den_spin));
 
-    GtkWidget *audio_label = gtk_label_new("Audio:");
-    gtk_label_set_xalign(GTK_LABEL(audio_label), 0.0);
-    gtk_grid_attach(GTK_GRID(grid), audio_label, 0, 8, 1, 1);
-
-    GtkWidget *audio_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
-    gtk_grid_attach(GTK_GRID(grid), audio_box, 1, 8, 1, 1);
-
-    ctx->audio_toggle = GTK_CHECK_BUTTON(gtk_check_button_new_with_label("Enable"));
-    gtk_box_append(GTK_BOX(audio_box), GTK_WIDGET(ctx->audio_toggle));
-    g_signal_connect(ctx->audio_toggle, "toggled", G_CALLBACK(on_audio_toggled), ctx);
-
-    GtkWidget *payload_label = gtk_label_new("PT:");
-    gtk_label_set_xalign(GTK_LABEL(payload_label), 0.0);
-    gtk_box_append(GTK_BOX(audio_box), payload_label);
-
-    ctx->audio_payload_spin = GTK_SPIN_BUTTON(gtk_spin_button_new_with_range(0, 127, 1));
-    gtk_box_append(GTK_BOX(audio_box), GTK_WIDGET(ctx->audio_payload_spin));
-
-    GtkWidget *audio_jitter_label = gtk_label_new("Jitter (ms):");
-    gtk_label_set_xalign(GTK_LABEL(audio_jitter_label), 0.0);
-    gtk_box_append(GTK_BOX(audio_box), audio_jitter_label);
-
-    ctx->audio_jitter_spin = GTK_SPIN_BUTTON(gtk_spin_button_new_with_range(0, 500, 1));
-    gtk_box_append(GTK_BOX(audio_box), GTK_WIDGET(ctx->audio_jitter_spin));
+    /* Audio settings now live on the dedicated Audio tab. */
 
     ctx->jitter_drop_toggle = GTK_CHECK_BUTTON(gtk_check_button_new_with_label("Drop packets exceeding latency"));
     gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(ctx->jitter_drop_toggle), 0, 9, 2, 1);
@@ -3446,33 +3400,10 @@ static GtkWidget *build_stats_page(GuiContext *ctx) {
     gtk_widget_set_margin_start(page, 12);
     gtk_widget_set_margin_end(page, 12);
 
-    /* Banner: which source is being charted, plus pause/reset. */
-    GtkWidget *banner = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-    gtk_widget_add_css_class(banner, "uv-status-bar");
-    gtk_box_append(GTK_BOX(page), banner);
-
-    ctx->stats_source_label = GTK_LABEL(gtk_label_new("No source locked."));
-    gtk_label_set_xalign(ctx->stats_source_label, 0.0);
-    gtk_widget_set_hexpand(GTK_WIDGET(ctx->stats_source_label), TRUE);
-    gtk_label_set_wrap(ctx->stats_source_label, FALSE);
-    gtk_label_set_ellipsize(ctx->stats_source_label, PANGO_ELLIPSIZE_END);
-    gtk_widget_add_css_class(GTK_WIDGET(ctx->stats_source_label), "uv-source-detail");
-    gtk_box_append(GTK_BOX(banner), GTK_WIDGET(ctx->stats_source_label));
-
-    GtkWidget *reset_btn = gtk_button_new_with_label("Reset");
-    gtk_widget_add_css_class(reset_btn, "flat");
-    gtk_widget_set_tooltip_text(reset_btn, "Clear the recorded history buffer.");
-    g_signal_connect(reset_btn, "clicked", G_CALLBACK(on_stats_reset_clicked), ctx);
-    gtk_box_append(GTK_BOX(banner), reset_btn);
-
-    GtkWidget *pause_btn = gtk_toggle_button_new_with_label("Pause");
-    ctx->stats_pause_toggle = GTK_TOGGLE_BUTTON(pause_btn);
-    gtk_widget_set_tooltip_text(pause_btn,
-                                "Freeze the chart and labels so you can examine "
-                                "a glitch. New samples are dropped while paused.");
-    g_signal_connect(pause_btn, "toggled", G_CALLBACK(on_stats_pause_toggled), ctx);
-    gtk_box_append(GTK_BOX(banner), pause_btn);
-
+    /* Controls row: time range + pause / reset. The source / bitrate /
+     * jitter / fps banner is intentionally absent — the same info is
+     * already on the Monitor tab and visible on the per-chart "Live"
+     * labels, so a third copy was just adding visual noise. */
     GtkWidget *controls = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
     gtk_box_append(GTK_BOX(page), controls);
 
@@ -3497,6 +3428,24 @@ static GtkWidget *build_stats_page(GuiContext *ctx) {
     gtk_drop_down_set_selected(ctx->stats_range_dropdown, default_index);
     g_signal_connect(ctx->stats_range_dropdown, "notify::selected", G_CALLBACK(stats_range_changed), ctx);
     gtk_box_append(GTK_BOX(controls), GTK_WIDGET(ctx->stats_range_dropdown));
+
+    GtkWidget *ctrl_spacer = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    gtk_widget_set_hexpand(ctrl_spacer, TRUE);
+    gtk_box_append(GTK_BOX(controls), ctrl_spacer);
+
+    GtkWidget *reset_btn = gtk_button_new_with_label("Reset");
+    gtk_widget_add_css_class(reset_btn, "flat");
+    gtk_widget_set_tooltip_text(reset_btn, "Clear the recorded history buffer.");
+    g_signal_connect(reset_btn, "clicked", G_CALLBACK(on_stats_reset_clicked), ctx);
+    gtk_box_append(GTK_BOX(controls), reset_btn);
+
+    GtkWidget *pause_btn = gtk_toggle_button_new_with_label("Pause");
+    ctx->stats_pause_toggle = GTK_TOGGLE_BUTTON(pause_btn);
+    gtk_widget_set_tooltip_text(pause_btn,
+                                "Freeze the chart and labels so you can examine "
+                                "a glitch. New samples are dropped while paused.");
+    g_signal_connect(pause_btn, "toggled", G_CALLBACK(on_stats_pause_toggled), ctx);
+    gtk_box_append(GTK_BOX(controls), pause_btn);
 
     GtkWidget *grid = gtk_grid_new();
     gtk_grid_set_row_spacing(GTK_GRID(grid), 12);
@@ -3563,6 +3512,211 @@ static GtkWidget *build_stats_page(GuiContext *ctx) {
     }
 
     return page;
+}
+
+static void on_audio_port_mode_changed(GObject *dropdown, GParamSpec *pspec, gpointer user_data) {
+    (void)pspec;
+    GuiContext *ctx = user_data;
+    if (!ctx || !GTK_IS_DROP_DOWN(dropdown)) return;
+    guint mode = gtk_drop_down_get_selected(GTK_DROP_DOWN(dropdown));
+    gboolean separate = (mode == 1);
+    gboolean audio_on = ctx->audio_toggle ? check_get(ctx->audio_toggle) : FALSE;
+    if (ctx->audio_port_spin) {
+        gtk_widget_set_sensitive(GTK_WIDGET(ctx->audio_port_spin), audio_on && separate);
+    }
+}
+
+static void on_audio_apply_clicked(GtkButton *btn, gpointer user_data) {
+    (void)btn;
+    GuiContext *ctx = user_data;
+    if (!ctx) return;
+
+    UvViewerConfig new_cfg = ctx->current_cfg;
+
+    new_cfg.audio_enabled = ctx->audio_toggle ? check_get(ctx->audio_toggle) : FALSE;
+    if (ctx->audio_payload_spin) {
+        int v = gtk_spin_button_get_value_as_int(ctx->audio_payload_spin);
+        if (v < 0) v = 0;
+        if (v > 127) v = 127;
+        new_cfg.audio_payload_type = (guint)v;
+    }
+    if (ctx->audio_jitter_spin) {
+        int v = gtk_spin_button_get_value_as_int(ctx->audio_jitter_spin);
+        if (v < 0) v = 0;
+        new_cfg.audio_jitter_latency_ms = (guint)v;
+    }
+    if (ctx->audio_port_mode_dropdown) {
+        guint mode = gtk_drop_down_get_selected(ctx->audio_port_mode_dropdown);
+        new_cfg.audio_use_separate_port = (mode == 1);
+    }
+    if (ctx->audio_port_spin) {
+        int v = gtk_spin_button_get_value_as_int(ctx->audio_port_spin);
+        if (v < 1) v = 1;
+        if (v > 65535) v = 65535;
+        new_cfg.audio_listen_port = (guint)v;
+    }
+
+    if (new_cfg.audio_use_separate_port &&
+        (gint)new_cfg.audio_listen_port == new_cfg.listen_port) {
+        update_status(ctx,
+            "Audio: separate port would collide with video — keeping shared mode.");
+        new_cfg.audio_use_separate_port = FALSE;
+    }
+
+    if (!gui_restart_with_config(ctx, &new_cfg)) {
+        sync_settings_controls(ctx);
+    } else {
+        update_status(ctx, "Audio settings applied.");
+    }
+}
+
+static GtkWidget *build_audio_page(GuiContext *ctx) {
+    GtkWidget *page = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
+    gtk_widget_set_margin_top(page, 12);
+    gtk_widget_set_margin_bottom(page, 12);
+    gtk_widget_set_margin_start(page, 12);
+    gtk_widget_set_margin_end(page, 12);
+
+    /* Status frame at the top. */
+    GtkWidget *status_frame = gtk_frame_new("Status");
+    gtk_widget_set_hexpand(status_frame, TRUE);
+    gtk_box_append(GTK_BOX(page), status_frame);
+    ctx->audio_status_label = GTK_LABEL(gtk_label_new("Audio disabled."));
+    gtk_label_set_xalign(ctx->audio_status_label, 0.0);
+    gtk_label_set_wrap(ctx->audio_status_label, TRUE);
+    gtk_widget_add_css_class(GTK_WIDGET(ctx->audio_status_label), "uv-source-detail");
+    gtk_widget_set_margin_top(GTK_WIDGET(ctx->audio_status_label), 6);
+    gtk_widget_set_margin_bottom(GTK_WIDGET(ctx->audio_status_label), 6);
+    gtk_widget_set_margin_start(GTK_WIDGET(ctx->audio_status_label), 8);
+    gtk_widget_set_margin_end(GTK_WIDGET(ctx->audio_status_label), 8);
+    gtk_frame_set_child(GTK_FRAME(status_frame), GTK_WIDGET(ctx->audio_status_label));
+
+    /* Configuration grid. */
+    GtkWidget *grid = gtk_grid_new();
+    gtk_grid_set_row_spacing(GTK_GRID(grid), 8);
+    gtk_grid_set_column_spacing(GTK_GRID(grid), 12);
+    gtk_box_append(GTK_BOX(page), grid);
+
+    GtkWidget *enable_label = gtk_label_new("Enable audio:");
+    gtk_label_set_xalign(GTK_LABEL(enable_label), 0.0);
+    gtk_grid_attach(GTK_GRID(grid), enable_label, 0, 0, 1, 1);
+    ctx->audio_toggle = GTK_CHECK_BUTTON(gtk_check_button_new());
+    gtk_widget_set_tooltip_text(GTK_WIDGET(ctx->audio_toggle),
+                                "Build the Opus receive branch in the pipeline.");
+    g_signal_connect(ctx->audio_toggle, "toggled", G_CALLBACK(on_audio_toggled), ctx);
+    gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(ctx->audio_toggle), 1, 0, 1, 1);
+
+    GtkWidget *pt_label = gtk_label_new("Payload type:");
+    gtk_label_set_xalign(GTK_LABEL(pt_label), 0.0);
+    gtk_grid_attach(GTK_GRID(grid), pt_label, 0, 1, 1, 1);
+    ctx->audio_payload_spin = GTK_SPIN_BUTTON(gtk_spin_button_new_with_range(0, 127, 1));
+    gtk_widget_set_tooltip_text(GTK_WIDGET(ctx->audio_payload_spin),
+                                "RTP payload type for the OPUS audio packets (default 98).");
+    gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(ctx->audio_payload_spin), 1, 1, 1, 1);
+
+    GtkWidget *jitter_label = gtk_label_new("Jitter latency (ms):");
+    gtk_label_set_xalign(GTK_LABEL(jitter_label), 0.0);
+    gtk_grid_attach(GTK_GRID(grid), jitter_label, 0, 2, 1, 1);
+    ctx->audio_jitter_spin = GTK_SPIN_BUTTON(gtk_spin_button_new_with_range(0, 500, 1));
+    gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(ctx->audio_jitter_spin), 1, 2, 1, 1);
+
+    GtkWidget *mode_label = gtk_label_new("Port mode:");
+    gtk_label_set_xalign(GTK_LABEL(mode_label), 0.0);
+    gtk_widget_set_tooltip_text(mode_label,
+                                "\"Shared with video\" demuxes audio out of the same RTP stream "
+                                "by payload type (default). \"Separate UDP port\" binds a "
+                                "second listener on its own port.");
+    gtk_grid_attach(GTK_GRID(grid), mode_label, 0, 3, 1, 1);
+    const char *mode_options[] = {"Shared with video port", "Separate UDP port", NULL};
+    ctx->audio_port_mode_dropdown = GTK_DROP_DOWN(gtk_drop_down_new_from_strings(mode_options));
+    g_signal_connect(ctx->audio_port_mode_dropdown, "notify::selected",
+                     G_CALLBACK(on_audio_port_mode_changed), ctx);
+    gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(ctx->audio_port_mode_dropdown), 1, 3, 1, 1);
+
+    GtkWidget *port_label = gtk_label_new("Audio UDP port:");
+    gtk_label_set_xalign(GTK_LABEL(port_label), 0.0);
+    gtk_grid_attach(GTK_GRID(grid), port_label, 0, 4, 1, 1);
+    ctx->audio_port_spin = GTK_SPIN_BUTTON(gtk_spin_button_new_with_range(1, 65535, 1));
+    gtk_widget_set_tooltip_text(GTK_WIDGET(ctx->audio_port_spin),
+                                "Used only when the port mode is \"Separate UDP port\". "
+                                "Must differ from the video listen port.");
+    gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(ctx->audio_port_spin), 1, 4, 1, 1);
+
+    /* Apply button. */
+    GtkWidget *apply_btn = gtk_button_new_with_label("Apply Audio Settings");
+    gtk_widget_add_css_class(apply_btn, "suggested-action");
+    gtk_widget_set_tooltip_text(apply_btn,
+                                "Rebuild the pipeline with the new audio config. "
+                                "Video keeps running on its existing listen port.");
+    g_signal_connect(apply_btn, "clicked", G_CALLBACK(on_audio_apply_clicked), ctx);
+    gtk_box_append(GTK_BOX(page), apply_btn);
+
+    GtkWidget *hint = gtk_label_new(
+        "Applying restarts the GStreamer pipeline so the audio branch can be "
+        "added, removed, or rebound to a new port.");
+    gtk_label_set_xalign(GTK_LABEL(hint), 0.0);
+    gtk_label_set_wrap(GTK_LABEL(hint), TRUE);
+    gtk_widget_add_css_class(hint, "uv-info");
+    gtk_box_append(GTK_BOX(page), hint);
+
+    /* Prime the controls from the current config. */
+    if (ctx->audio_toggle) {
+        check_set(ctx->audio_toggle, ctx->current_cfg.audio_enabled ? TRUE : FALSE);
+    }
+    if (ctx->audio_payload_spin) {
+        gtk_spin_button_set_value(ctx->audio_payload_spin, ctx->current_cfg.audio_payload_type);
+    }
+    if (ctx->audio_jitter_spin) {
+        gtk_spin_button_set_value(ctx->audio_jitter_spin, ctx->current_cfg.audio_jitter_latency_ms);
+    }
+    if (ctx->audio_port_mode_dropdown) {
+        gtk_drop_down_set_selected(ctx->audio_port_mode_dropdown,
+                                   ctx->current_cfg.audio_use_separate_port ? 1 : 0);
+    }
+    if (ctx->audio_port_spin) {
+        guint p = ctx->current_cfg.audio_listen_port ? ctx->current_cfg.audio_listen_port : 5601;
+        gtk_spin_button_set_value(ctx->audio_port_spin, p);
+    }
+    /* Initial sensitivity. */
+    on_audio_toggled(ctx->audio_toggle, ctx);
+
+    return page;
+}
+
+static void update_audio_status_label(GuiContext *ctx, const UvViewerStats *stats) {
+    if (!ctx || !ctx->audio_status_label) return;
+    const UvViewerConfig *cfg = &ctx->current_cfg;
+    if (!cfg->audio_enabled) {
+        gtk_label_set_text(ctx->audio_status_label, "Audio disabled.");
+        return;
+    }
+    const char *state;
+    if (!stats || !stats->audio_enabled) {
+        state = "audio branch failed to build";
+    } else if (stats->audio_active) {
+        state = "ACTIVE — buffers flowing";
+    } else {
+        state = "waiting for packets";
+    }
+    char line[224];
+    if (cfg->audio_use_separate_port) {
+        g_snprintf(line, sizeof(line),
+                   "%s  •  separate UDP :%u  •  PT %u  •  jitter %u ms  •  clock %u Hz",
+                   state,
+                   cfg->audio_listen_port,
+                   cfg->audio_payload_type,
+                   cfg->audio_jitter_latency_ms,
+                   cfg->audio_clock_rate ? cfg->audio_clock_rate : 48000u);
+    } else {
+        g_snprintf(line, sizeof(line),
+                   "%s  •  shared with video on :%d  •  PT %u  •  jitter %u ms  •  clock %u Hz",
+                   state,
+                   cfg->listen_port,
+                   cfg->audio_payload_type,
+                   cfg->audio_jitter_latency_ms,
+                   cfg->audio_clock_rate ? cfg->audio_clock_rate : 48000u);
+    }
+    gtk_label_set_text(ctx->audio_status_label, line);
 }
 
 static void update_sidecar_toggle_label(GuiContext *ctx, gboolean enabled) {
@@ -4310,6 +4464,9 @@ static void build_ui(GuiContext *ctx) {
     GtkWidget *frame_page = build_frame_block_page(ctx);
     gtk_notebook_append_page(ctx->notebook, frame_page, gtk_label_new("Frame Blocks"));
 
+    GtkWidget *audio_page = build_audio_page(ctx);
+    gtk_notebook_append_page(ctx->notebook, audio_page, gtk_label_new("Audio"));
+
     GtkWidget *sidecar_page = build_sidecar_page(ctx);
     gtk_notebook_append_page(ctx->notebook, sidecar_page, gtk_label_new("Sidecar"));
 
@@ -4397,6 +4554,9 @@ static void on_app_shutdown(GApplication *app, gpointer user_data) {
     ctx->audio_toggle = NULL;
     ctx->audio_payload_spin = NULL;
     ctx->audio_jitter_spin = NULL;
+    ctx->audio_port_mode_dropdown = NULL;
+    ctx->audio_port_spin = NULL;
+    ctx->audio_status_label = NULL;
     ctx->jitter_drop_toggle = NULL;
     ctx->jitter_do_lost_toggle = NULL;
     ctx->jitter_post_drop_toggle = NULL;
@@ -4442,7 +4602,6 @@ static void on_app_shutdown(GApplication *app, gpointer user_data) {
     ctx->window = NULL;
     ctx->idr_button = NULL;
     ctx->idr_port_spin = NULL;
-    ctx->stats_source_label = NULL;
     ctx->stats_pause_toggle = NULL;
     ctx->stream_detail_label = NULL;
     ctx->sidecar_enable_toggle = NULL;

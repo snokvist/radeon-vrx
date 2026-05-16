@@ -197,6 +197,8 @@ typedef struct {
     guint audio_payload_type;
     guint audio_clock_rate;
     guint audio_jitter_latency_ms;
+    gboolean audio_use_separate_port;
+    guint audio_listen_port;
 
     struct _UvViewer *viewer;
 
@@ -221,6 +223,7 @@ typedef struct {
 
     GstElement *queue_audio_in;
     GstElement *capsfilter_rtp_audio;
+    GstElement *audio_udpsrc;            /* used when audio_use_separate_port */
     GstElement *audio_jitter;
     GstElement *audio_depay;
     GstElement *audio_decoder;

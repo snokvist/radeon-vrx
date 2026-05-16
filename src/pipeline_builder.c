@@ -425,6 +425,16 @@ static gboolean build_pipeline(PipelineController *pc, GError **error) {
     if (pc->audio_enabled) {
         pc->queue_audio_in = gst_element_factory_make("queue", "queue_audio_in");
         pc->capsfilter_rtp_audio = gst_element_factory_make("capsfilter", "cf_rtp_audio");
+        if (pc->audio_use_separate_port) {
+            pc->audio_udpsrc = gst_element_factory_make("udpsrc", "audio_udpsrc");
+            if (pc->audio_udpsrc) {
+                g_object_set(pc->audio_udpsrc,
+                             "port", (gint)pc->audio_listen_port,
+                             "buffer-size", 524288,
+                             "auto-multicast", TRUE,
+                             NULL);
+            }
+        }
         pc->audio_jitter = gst_element_factory_make("rtpjitterbuffer", "jbuf_audio");
         pc->audio_depay = gst_element_factory_make("rtpopusdepay", "depay_audio");
         pc->audio_decoder = gst_element_factory_make("opusdec", "opus_decoder");
@@ -495,12 +505,14 @@ static gboolean build_pipeline(PipelineController *pc, GError **error) {
     }
 
     if (pc->audio_enabled) {
+        gboolean separate_ok = !pc->audio_use_separate_port || pc->audio_udpsrc != NULL;
         if (!pc->queue_audio_in || !pc->capsfilter_rtp_audio || !pc->audio_jitter ||
             !pc->audio_depay || !pc->audio_decoder || !pc->audio_convert ||
-            !pc->audio_resample || !pc->audio_sink) {
+            !pc->audio_resample || !pc->audio_sink || !separate_ok) {
             uv_log_warn("Audio pipeline requested but missing components; disabling audio");
             if (pc->queue_audio_in) { gst_object_unref(pc->queue_audio_in); pc->queue_audio_in = NULL; }
             if (pc->capsfilter_rtp_audio) { gst_object_unref(pc->capsfilter_rtp_audio); pc->capsfilter_rtp_audio = NULL; }
+            if (pc->audio_udpsrc) { gst_object_unref(pc->audio_udpsrc); pc->audio_udpsrc = NULL; }
             if (pc->audio_jitter) { gst_object_unref(pc->audio_jitter); pc->audio_jitter = NULL; }
             if (pc->audio_depay) { gst_object_unref(pc->audio_depay); pc->audio_depay = NULL; }
             if (pc->audio_decoder) { gst_object_unref(pc->audio_decoder); pc->audio_decoder = NULL; }
@@ -647,6 +659,9 @@ static gboolean build_pipeline(PipelineController *pc, GError **error) {
     }
 
     if (pc->audio_enabled) {
+        if (pc->audio_use_separate_port && pc->audio_udpsrc) {
+            gst_bin_add(GST_BIN(pc->pipeline), pc->audio_udpsrc);
+        }
         gst_bin_add_many(GST_BIN(pc->pipeline),
                          pc->queue_audio_in,
                          pc->capsfilter_rtp_audio,
@@ -729,10 +744,31 @@ static gboolean build_pipeline(PipelineController *pc, GError **error) {
     }
 
     if (pc->audio_enabled) {
-        if (!gst_element_link(pc->tee, pc->queue_audio_in)) {
-            g_set_error(error, g_quark_from_static_string("uv-viewer"), 14,
-                        "Failed to link tee to audio queue");
-            return FALSE;
+        if (pc->audio_use_separate_port && pc->audio_udpsrc) {
+            /* Separate UDP port: stamp the expected RTP caps on the udpsrc
+             * output so the jitter buffer / depay negotiate immediately. */
+            GstCaps *udp_caps = gst_caps_new_simple("application/x-rtp",
+                                                    "media",         G_TYPE_STRING, "audio",
+                                                    "encoding-name", G_TYPE_STRING, "OPUS",
+                                                    "payload",       G_TYPE_INT,    (gint)pc->audio_payload_type,
+                                                    "clock-rate",    G_TYPE_INT,    (gint)pc->audio_clock_rate,
+                                                    NULL);
+            if (udp_caps) {
+                g_object_set(pc->audio_udpsrc, "caps", udp_caps, NULL);
+                gst_caps_unref(udp_caps);
+            }
+            if (!gst_element_link(pc->audio_udpsrc, pc->queue_audio_in)) {
+                g_set_error(error, g_quark_from_static_string("uv-viewer"), 14,
+                            "Failed to link audio udpsrc to audio queue");
+                return FALSE;
+            }
+            uv_log_info("Audio: listening on UDP :%u (separate from video)", pc->audio_listen_port);
+        } else {
+            if (!gst_element_link(pc->tee, pc->queue_audio_in)) {
+                g_set_error(error, g_quark_from_static_string("uv-viewer"), 14,
+                            "Failed to link tee to audio queue");
+                return FALSE;
+            }
         }
         if (!gst_element_link_many(pc->queue_audio_in,
                                    pc->capsfilter_rtp_audio,
@@ -825,6 +861,15 @@ gboolean pipeline_controller_init(PipelineController *pc, struct _UvViewer *view
         pc->audio_clock_rate = 48000;
     }
     pc->audio_jitter_latency_ms = viewer->config.audio_jitter_latency_ms;
+    pc->audio_use_separate_port = viewer->config.audio_use_separate_port;
+    pc->audio_listen_port = viewer->config.audio_listen_port ? viewer->config.audio_listen_port : 5601;
+    /* Avoid an obviously broken configuration: separate-port mode but the
+     * audio port collides with the video listen port. Downgrade silently. */
+    if (pc->audio_use_separate_port &&
+        (gint)pc->audio_listen_port == viewer->config.listen_port) {
+        pc->audio_use_separate_port = FALSE;
+    }
+    pc->audio_udpsrc = NULL;
     pc->audio_sink_is_fakesink = FALSE;
     pc->audio_probe_id = 0;
     pc->audio_last_buffer_us = 0;
@@ -858,6 +903,7 @@ void pipeline_controller_deinit(PipelineController *pc) {
     pc->capsfilter_rtp_video = NULL;
     pc->queue_audio_in = NULL;
     pc->capsfilter_rtp_audio = NULL;
+    pc->audio_udpsrc = NULL;
     pc->audio_jitter = NULL;
     pc->audio_depay = NULL;
     pc->audio_decoder = NULL;
