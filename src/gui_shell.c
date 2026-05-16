@@ -63,6 +63,9 @@ typedef struct {
     GtkCheckButton *audio_toggle;
     GtkSpinButton *audio_payload_spin;
     GtkSpinButton *audio_jitter_spin;
+    GtkDropDown   *audio_port_mode_dropdown; /* 0 = shared with video, 1 = separate */
+    GtkSpinButton *audio_port_spin;
+    GtkLabel      *audio_status_label;
     GtkCheckButton *jitter_drop_toggle;
     GtkCheckButton *jitter_do_lost_toggle;
     GtkCheckButton *jitter_post_drop_toggle;
@@ -126,6 +129,25 @@ typedef struct {
     double frame_overlay_range_seconds;
     gboolean frame_overlay_show_values;
     gboolean frame_overlay_needs_refresh;
+
+    GtkButton *idr_button;
+    GtkSpinButton *idr_port_spin;
+    gint idr_inflight;
+
+    GtkToggleButton *stats_pause_toggle;
+    gboolean stats_paused;
+
+    GtkLabel *stream_detail_label;
+
+    /* Sidecar tab widgets. */
+    GtkToggleButton *sidecar_enable_toggle;
+    GtkSpinButton *sidecar_port_spin;
+    GtkLabel *sidecar_status_label;
+    GtkLabel *sidecar_frame_label;
+    GtkLabel *sidecar_encoder_label;
+    GtkLabel *sidecar_counters_label;
+    GtkLabel *sidecar_transport_label;
+    gboolean sidecar_toggle_suppress;
 } GuiContext;
 
 typedef struct {
@@ -139,9 +161,12 @@ typedef struct {
 typedef struct {
     double timestamp;
     double rate_bps;
-    double lost_packets;
+    double lost_packets;      // cumulative count (kept for delta arithmetic)
     double dup_packets;
     double reorder_packets;
+    double lost_pps;          // per-second rate vs. previous sample (charted)
+    double dup_pps;
+    double reorder_pps;
     double jitter_ms;
     double input_fps;
     double decoder_fps_current;
@@ -169,6 +194,15 @@ static GtkWidget *build_monitor_page(GuiContext *ctx);
 static GtkWidget *build_settings_page(GuiContext *ctx);
 static GtkWidget *build_stats_page(GuiContext *ctx);
 static GtkWidget *build_frame_block_page(GuiContext *ctx);
+static GtkWidget *build_sidecar_page(GuiContext *ctx);
+static void on_sidecar_enable_toggled(GtkToggleButton *btn, gpointer user_data);
+static void on_sidecar_port_changed(GtkSpinButton *spin, gpointer user_data);
+static void update_sidecar_toggle_label(GuiContext *ctx, gboolean enabled);
+static GtkWidget *build_audio_page(GuiContext *ctx);
+static void on_audio_apply_clicked(GtkButton *btn, gpointer user_data);
+static void on_audio_restart_clicked(GtkButton *btn, gpointer user_data);
+static void on_audio_port_mode_changed(GObject *dropdown, GParamSpec *pspec, gpointer user_data);
+static void update_audio_status_label(GuiContext *ctx, const UvViewerStats *stats);
 static void viewer_event_callback(const UvViewerEvent *event, gpointer user_data);
 static void on_notebook_switch_page(GtkNotebook *notebook, GtkWidget *page, guint page_num, gpointer user_data);
 static void detach_bound_sink(GuiContext *ctx);
@@ -195,6 +229,12 @@ static void on_frame_overlay_values_toggled(GtkCheckButton *button, gpointer use
 static void on_videorate_toggled(GtkCheckButton *button, gpointer user_data);
 static void on_audio_toggled(GtkCheckButton *button, gpointer user_data);
 static void on_source_dropdown_changed(GObject *dropdown, GParamSpec *pspec, gpointer user_data);
+static void on_idr_button_clicked(GtkButton *button, gpointer user_data);
+static void update_idr_button_sensitivity(GuiContext *ctx);
+static void install_app_css(void);
+static double nice_axis_max(double v);
+static void update_frame_overlay_labels(GuiContext *ctx);
+static void update_stats_metric_labels(GuiContext *ctx);
 
 static const char *decoder_option_labels[] = {
     "Auto",
@@ -448,6 +488,8 @@ static void frame_block_queue_overlay_draws_internal(GuiContext *ctx, gboolean f
     }
 
     ctx->frame_overlay_needs_refresh = FALSE;
+
+    update_frame_overlay_labels(ctx);
 
     if (ctx->frame_overlay_lateness) {
         gtk_widget_queue_draw(GTK_WIDGET(ctx->frame_overlay_lateness));
@@ -799,11 +841,7 @@ static void frame_overlay_draw(GtkDrawingArea *area, cairo_t *cr, int width, int
         }
     }
 
-    GtkLabel *live_label = GTK_LABEL(g_object_get_data(G_OBJECT(area), "overlay-live-label"));
-    GtkLabel *max_label = GTK_LABEL(g_object_get_data(G_OBJECT(area), "overlay-max-label"));
     gboolean show_values = ctx->frame_overlay_show_values;
-    const char *default_live = "Live: --";
-    const char *default_max = "Max: --";
 
     cairo_save(cr);
     cairo_set_source_rgb(cr, 0.10, 0.10, 0.12);
@@ -816,8 +854,6 @@ static void frame_overlay_draw(GtkDrawingArea *area, cairo_t *cr, int width, int
     GArray *points = NULL;
 
     if (!ctx->stats_history || ctx->stats_history->len == 0) {
-        if (live_label) gtk_label_set_text(live_label, default_live);
-        if (max_label) gtk_label_set_text(max_label, default_max);
         cairo_set_source_rgb(cr, 0.7, 0.7, 0.7);
         cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
         cairo_set_font_size(cr, 12.0);
@@ -857,8 +893,6 @@ static void frame_overlay_draw(GtkDrawingArea *area, cairo_t *cr, int width, int
     }
 
     if (!any_value) {
-        if (live_label) gtk_label_set_text(live_label, default_live);
-        if (max_label) gtk_label_set_text(max_label, default_max);
         cairo_set_source_rgb(cr, 0.7, 0.7, 0.7);
         cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
         cairo_set_font_size(cr, 12.0);
@@ -873,7 +907,7 @@ static void frame_overlay_draw(GtkDrawingArea *area, cairo_t *cr, int width, int
     }
 
     double axis_min = 0.0;
-    double axis_max = peak_value;
+    double axis_max = nice_axis_max(peak_value > 0.0 ? peak_value : 1.0);
     if (!isfinite(axis_max) || axis_max <= axis_min) {
         axis_max = axis_min + 1.0;
     }
@@ -1000,39 +1034,6 @@ static void frame_overlay_draw(GtkDrawingArea *area, cairo_t *cr, int width, int
                 cairo_show_text(cr, value_text);
             }
         }
-    }
-
-    double latest_value = NAN;
-    for (guint i = len; i > start_index; i--) {
-        double value = 0.0;
-        if (frame_overlay_sample_value(&samples[i - 1], metric, &value, NULL)) {
-            latest_value = value;
-            break;
-        }
-    }
-
-    if (!isfinite(latest_value)) {
-        if (live_label) gtk_label_set_text(live_label, default_live);
-    } else if (metric == FRAME_OVERLAY_METRIC_SIZE) {
-        char latest_text[64];
-        g_snprintf(latest_text, sizeof(latest_text), "Live: %.2f KB", latest_value);
-        if (live_label) gtk_label_set_text(live_label, latest_text);
-    } else {
-        char latest_text[64];
-        g_snprintf(latest_text, sizeof(latest_text), "Live: %.2f ms", latest_value);
-        if (live_label) gtk_label_set_text(live_label, latest_text);
-    }
-
-    if (isfinite(peak_value)) {
-        char max_text[64];
-        if (metric == FRAME_OVERLAY_METRIC_SIZE) {
-            g_snprintf(max_text, sizeof(max_text), "Max: %.2f KB", peak_value);
-        } else {
-            g_snprintf(max_text, sizeof(max_text), "Max: %.2f ms", peak_value);
-        }
-        if (max_label) gtk_label_set_text(max_label, max_text);
-    } else if (max_label) {
-        gtk_label_set_text(max_label, default_max);
     }
 
     if (missing_seen) {
@@ -1316,9 +1317,219 @@ static void update_status(GuiContext *ctx, const char *message) {
     gtk_label_set_text(ctx->status_label, message ? message : "");
 }
 
+typedef struct {
+    GuiContext *ctx;
+    char address[UV_VIEWER_ADDR_MAX];
+    guint port;
+    char message[192];
+    gboolean ok;
+} IdrJob;
+
+static gboolean idr_apply_result(gpointer data) {
+    IdrJob *job = data;
+    if (!job) return G_SOURCE_REMOVE;
+    GuiContext *ctx = job->ctx;
+    if (ctx && ctx->status_label) {
+        update_status(ctx, job->message);
+    }
+    if (ctx) {
+        if (ctx->idr_inflight > 0) ctx->idr_inflight--;
+        update_idr_button_sensitivity(ctx);
+    }
+    g_free(job);
+    return G_SOURCE_REMOVE;
+}
+
+static gpointer idr_worker(gpointer data) {
+    IdrJob *job = data;
+    if (!job) return NULL;
+
+    GError *err = NULL;
+    GSocketClient *client = g_socket_client_new();
+    g_socket_client_set_timeout(client, 3);
+    GSocketConnection *conn = g_socket_client_connect_to_host(client,
+                                                              job->address,
+                                                              (guint16)job->port,
+                                                              NULL,
+                                                              &err);
+    if (!conn) {
+        g_snprintf(job->message, sizeof(job->message),
+                   "IDR request to %s:%u failed: %s",
+                   job->address, job->port,
+                   err && err->message ? err->message : "connect failed");
+    } else {
+        char request[256];
+        g_snprintf(request, sizeof(request),
+                   "GET /request/idr HTTP/1.0\r\n"
+                   "Host: %s:%u\r\n"
+                   "User-Agent: udp-h265-viewer\r\n"
+                   "Connection: close\r\n\r\n",
+                   job->address, job->port);
+        GOutputStream *ostream = g_io_stream_get_output_stream(G_IO_STREAM(conn));
+        gsize written = 0;
+        if (!g_output_stream_write_all(ostream, request, strlen(request),
+                                       &written, NULL, &err)) {
+            g_snprintf(job->message, sizeof(job->message),
+                       "IDR request to %s:%u failed: %s",
+                       job->address, job->port,
+                       err && err->message ? err->message : "write failed");
+        } else {
+            GInputStream *istream = g_io_stream_get_input_stream(G_IO_STREAM(conn));
+            char buf[256] = {0};
+            gssize n = g_input_stream_read(istream, buf, sizeof(buf) - 1, NULL, &err);
+            if (n <= 0) {
+                g_snprintf(job->message, sizeof(job->message),
+                           "IDR request to %s:%u: no response", job->address, job->port);
+            } else {
+                buf[n] = '\0';
+                char *eol = strpbrk(buf, "\r\n");
+                if (eol) *eol = '\0';
+                if (strncmp(buf, "HTTP/", 5) == 0 && strstr(buf, " 200") != NULL) {
+                    job->ok = TRUE;
+                    g_snprintf(job->message, sizeof(job->message),
+                               "IDR requested for %s:%u (HTTP 200 OK)",
+                               job->address, job->port);
+                } else {
+                    g_snprintf(job->message, sizeof(job->message),
+                               "IDR request to %s:%u: %s",
+                               job->address, job->port, buf);
+                }
+            }
+        }
+        g_io_stream_close(G_IO_STREAM(conn), NULL, NULL);
+        g_object_unref(conn);
+    }
+
+    if (err) g_error_free(err);
+    g_object_unref(client);
+    g_idle_add(idr_apply_result, job);
+    return NULL;
+}
+
+static void update_idr_button_sensitivity(GuiContext *ctx) {
+    if (!ctx || !ctx->idr_button) return;
+    gboolean has_source = ctx->active_source_valid;
+    gboolean busy = (ctx->idr_inflight > 0);
+    gtk_widget_set_sensitive(GTK_WIDGET(ctx->idr_button), has_source && !busy);
+}
+
+static void on_idr_button_clicked(GtkButton *button, gpointer user_data) {
+    (void)button;
+    GuiContext *ctx = user_data;
+    if (!ctx || !ctx->viewer) return;
+
+    if (!ctx->active_source_valid) {
+        update_status(ctx, "IDR request skipped: no source is currently locked.");
+        return;
+    }
+
+    UvViewerStats stats = {0};
+    uv_viewer_stats_init(&stats);
+    if (!uv_viewer_get_stats(ctx->viewer, &stats)) {
+        update_status(ctx, "IDR request failed: could not read viewer stats.");
+        uv_viewer_stats_clear(&stats);
+        return;
+    }
+
+    char address[UV_VIEWER_ADDR_MAX] = {0};
+    gboolean found = FALSE;
+    if (stats.sources) {
+        for (guint i = 0; i < stats.sources->len; i++) {
+            const UvSourceStats *src = &g_array_index(stats.sources, UvSourceStats, i);
+            if (src->selected) {
+                g_strlcpy(address, src->address, sizeof(address));
+                found = TRUE;
+                break;
+            }
+        }
+    }
+    uv_viewer_stats_clear(&stats);
+
+    if (!found || address[0] == '\0') {
+        update_status(ctx, "IDR request skipped: no source is currently locked.");
+        return;
+    }
+
+    guint port = ctx->current_cfg.idr_http_port ? ctx->current_cfg.idr_http_port : 80;
+
+    IdrJob *job = g_new0(IdrJob, 1);
+    job->ctx = ctx;
+    job->port = port;
+    g_strlcpy(job->address, address, sizeof(job->address));
+
+    char msg[160];
+    g_snprintf(msg, sizeof(msg), "Requesting IDR keyframe from %s:%u...", address, port);
+    update_status(ctx, msg);
+
+    ctx->idr_inflight++;
+    update_idr_button_sensitivity(ctx);
+
+    GThread *t = g_thread_new("uv-idr", idr_worker, job);
+    if (!t) {
+        ctx->idr_inflight--;
+        update_idr_button_sensitivity(ctx);
+        update_status(ctx, "IDR request failed: could not spawn worker thread.");
+        g_free(job);
+        return;
+    }
+    g_thread_unref(t);
+}
+
+static void install_app_css(void) {
+    static gboolean installed = FALSE;
+    if (installed) return;
+    installed = TRUE;
+
+    GtkCssProvider *provider = gtk_css_provider_new();
+    static const char *css =
+        ".uv-status {"
+        "  font-weight: 600;"
+        "  padding: 4px 8px;"
+        "  border-radius: 6px;"
+        "}"
+        ".uv-status-bar {"
+        "  background-color: alpha(@theme_fg_color, 0.06);"
+        "  border-radius: 6px;"
+        "  padding: 2px 4px;"
+        "}"
+        ".uv-source-detail {"
+        "  font-family: monospace;"
+        "  font-size: 0.95em;"
+        "}"
+        ".uv-info {"
+        "  font-size: 0.9em;"
+        "  opacity: 0.75;"
+        "}"
+        ".uv-action-bar {"
+        "  padding-top: 4px;"
+        "}"
+        "button.uv-idr {"
+        "  font-weight: 600;"
+        "}"
+        "frame.uv-video > border {"
+        "  border-radius: 8px;"
+        "}"
+        ".numeric {"
+        "  font-feature-settings: \"tnum\";"
+        "  font-variant-numeric: tabular-nums;"
+        "}";
+#if GTK_CHECK_VERSION(4, 12, 0)
+    gtk_css_provider_load_from_string(provider, css);
+#else
+    gtk_css_provider_load_from_data(provider, css, -1);
+#endif
+    GdkDisplay *display = gdk_display_get_default();
+    if (display) {
+        gtk_style_context_add_provider_for_display(display,
+                                                   GTK_STYLE_PROVIDER(provider),
+                                                   GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+    }
+    g_object_unref(provider);
+}
+
 static void update_info_label(GuiContext *ctx) {
     if (!ctx || !ctx->info_label) return;
-    char info[160];
+    char info[224];
     UvViewerConfig *cfg = &ctx->current_cfg;
     guint vr_den = cfg->videorate_fps_denominator ? cfg->videorate_fps_denominator : 1;
     char videorate_info[24];
@@ -1343,7 +1554,8 @@ static void update_info_label(GuiContext *ctx) {
     if (!sink_pref) sink_pref = "Auto";
     g_snprintf(info, sizeof(info),
                "Listening on %d | PT %d | Clock %d | %s | Jitter %ums | Queue buffers %u"
-               " | drop=%s | lost=%s | bus-msg=%s | videorate=%s | decoder=%s | sink=%s | audio=%s",
+               " | drop=%s | lost=%s | bus-msg=%s | videorate=%s | decoder=%s | sink=%s | audio=%s"
+               " | IDR port %u",
                cfg->listen_port,
                cfg->payload_type,
                cfg->clock_rate,
@@ -1356,7 +1568,8 @@ static void update_info_label(GuiContext *ctx) {
                videorate_info,
                decoder_pref,
                sink_pref,
-               audio_state);
+               audio_state,
+               cfg->idr_http_port ? cfg->idr_http_port : 80u);
     gtk_label_set_text(ctx->info_label, info);
 }
 
@@ -1373,6 +1586,10 @@ static void sync_settings_controls(GuiContext *ctx) {
     }
     if (ctx->stats_refresh_spin) {
         gtk_spin_button_set_value(ctx->stats_refresh_spin, ctx->stats_refresh_interval_ms);
+    }
+    if (ctx->idr_port_spin) {
+        guint port = ctx->current_cfg.idr_http_port ? ctx->current_cfg.idr_http_port : 80;
+        gtk_spin_button_set_value(ctx->idr_port_spin, port);
     }
     if (ctx->decoder_dropdown) {
         gtk_drop_down_set_selected(ctx->decoder_dropdown,
@@ -1493,13 +1710,292 @@ static gboolean ensure_video_paintable(GuiContext *ctx) {
 static double stats_metric_value(const StatsSample *sample, StatsMetric metric) {
     switch (metric) {
         case STATS_METRIC_RATE:    return sample->rate_bps;
-        case STATS_METRIC_LOST:    return sample->lost_packets;
-        case STATS_METRIC_DUP:     return sample->dup_packets;
-        case STATS_METRIC_REORDER: return sample->reorder_packets;
+        case STATS_METRIC_LOST:    return sample->lost_pps;
+        case STATS_METRIC_DUP:     return sample->dup_pps;
+        case STATS_METRIC_REORDER: return sample->reorder_pps;
         case STATS_METRIC_JITTER:  return sample->jitter_ms;
         case STATS_METRIC_INPUT_FPS: return sample->input_fps;
         case STATS_METRIC_DECODER_FPS: return sample->decoder_fps_current;
         default:                   return 0.0;
+    }
+}
+
+static const char *stats_metric_unit(StatsMetric metric) {
+    switch (metric) {
+        case STATS_METRIC_RATE:        return "Mbps";
+        case STATS_METRIC_LOST:
+        case STATS_METRIC_DUP:
+        case STATS_METRIC_REORDER:     return "pps";
+        case STATS_METRIC_JITTER:      return "ms";
+        case STATS_METRIC_INPUT_FPS:
+        case STATS_METRIC_DECODER_FPS: return "fps";
+        default:                       return "";
+    }
+}
+
+/* Round axis_max up to the next "nice" 1/2/5 * 10^k boundary so y-axis ticks
+ * stop wobbling on every redraw when the live max creeps up slowly. */
+static double nice_axis_max(double v) {
+    if (!isfinite(v) || v <= 0.0) return 1.0;
+    double exp10 = pow(10.0, floor(log10(v)));
+    double frac = v / exp10;
+    double nice;
+    if (frac <= 1.0)      nice = 1.0;
+    else if (frac <= 2.0) nice = 2.0;
+    else if (frac <= 5.0) nice = 5.0;
+    else                  nice = 10.0;
+    return nice * exp10;
+}
+
+static void format_metric_value(StatsMetric metric, double value, char *out, size_t outlen) {
+    const char *unit = stats_metric_unit(metric);
+    if (!isfinite(value)) {
+        g_strlcpy(out, "--", outlen);
+        return;
+    }
+    if (metric == STATS_METRIC_RATE) {
+        g_snprintf(out, outlen, "%.2f %s", value / 1e6, unit);
+    } else if (metric == STATS_METRIC_LOST || metric == STATS_METRIC_DUP || metric == STATS_METRIC_REORDER) {
+        if (value < 10.0) {
+            g_snprintf(out, outlen, "%.2f %s", value, unit);
+        } else {
+            g_snprintf(out, outlen, "%.0f %s", value, unit);
+        }
+    } else {
+        g_snprintf(out, outlen, "%.2f %s", value, unit);
+    }
+}
+
+static const char *sidecar_frame_type_name(uint8_t t) {
+    switch (t) {
+        case UV_SIDECAR_FRAME_P:   return "P";
+        case UV_SIDECAR_FRAME_I:   return "I";
+        case UV_SIDECAR_FRAME_IDR: return "IDR";
+        default: return "?";
+    }
+}
+
+static void update_sidecar_panel(GuiContext *ctx, const UvSidecarStats *sc) {
+    if (!ctx || !sc) return;
+
+    /* Status pill at the top of the sidecar tab. */
+    if (ctx->sidecar_status_label) {
+        char line[256];
+        if (!sc->enabled) {
+            g_strlcpy(line, "Stopped. Press Start to subscribe to the encoder's sidecar.",
+                      sizeof(line));
+        } else if (!sc->socket_bound) {
+            g_strlcpy(line, "Starting — socket not yet open.", sizeof(line));
+        } else if (!sc->target_address[0]) {
+            g_snprintf(line, sizeof(line),
+                       "Running (probe :%u → :%u) — waiting for a locked source.",
+                       (unsigned)sc->local_port, (unsigned)sc->target_port);
+        } else if (!sc->subscribed) {
+            const char *seen;
+            char buf[32];
+            if (sc->seconds_since_last_frame < 0.0) {
+                seen = "no frames yet";
+            } else {
+                g_snprintf(buf, sizeof(buf), "last frame %.1fs ago",
+                           sc->seconds_since_last_frame);
+                seen = buf;
+            }
+            g_snprintf(line, sizeof(line),
+                       "Subscribing to %s:%u (probe :%u) — %s",
+                       sc->target_address, (unsigned)sc->target_port,
+                       (unsigned)sc->local_port, seen);
+        } else {
+            g_snprintf(line, sizeof(line),
+                       "SUBSCRIBED to %s:%u  •  probe :%u  •  last frame %.2fs ago",
+                       sc->target_address, (unsigned)sc->target_port,
+                       (unsigned)sc->local_port, sc->seconds_since_last_frame);
+        }
+        gtk_label_set_text(ctx->sidecar_status_label, line);
+    }
+
+    char frame_line[256]    = {0};
+    char enc_line[256]      = {0};
+    char counters_line[224] = {0};
+    char trans_line[256]    = {0};
+
+    if (sc->enabled && sc->frames_received > 0) {
+        g_snprintf(frame_line, sizeof(frame_line),
+                   "Last frame: %s  •  %u bytes  •  %u RTP packets  •  ssrc=0x%08x  •  frame_id=%" G_GUINT64_FORMAT,
+                   sidecar_frame_type_name(sc->last_frame_type),
+                   (unsigned)sc->last_frame_size_bytes,
+                   (unsigned)sc->last_seq_count,
+                   (unsigned)sc->last_ssrc,
+                   sc->last_frame_id);
+
+        g_snprintf(enc_line, sizeof(enc_line),
+                   "QP %u (avg %.1f)  •  complexity %u (avg %.1f)  •  scene_change=%s"
+                   "  •  gop_state=%u  •  frames since IDR=%u",
+                   (unsigned)sc->last_qp, sc->avg_qp,
+                   (unsigned)sc->last_complexity, sc->avg_complexity,
+                   sc->last_scene_change ? "YES" : "no",
+                   (unsigned)sc->last_gop_state,
+                   (unsigned)sc->last_frames_since_idr);
+
+        g_snprintf(counters_line, sizeof(counters_line),
+                   "Frames %" G_GUINT64_FORMAT
+                   "  •  IDR insertions %" G_GUINT64_FORMAT
+                   "  •  scene changes %" G_GUINT64_FORMAT
+                   "  •  keyframes (I+IDR) %" G_GUINT64_FORMAT,
+                   sc->frames_received,
+                   sc->idr_inserted_count,
+                   sc->scene_change_count,
+                   sc->keyframes_count);
+
+        if (sc->transport_info_seen) {
+            g_snprintf(trans_line, sizeof(trans_line),
+                       "Queue %u%%  •  pressure %s"
+                       "  •  transport drops %u  •  pressure drops %u  •  packets sent %u",
+                       (unsigned)sc->encoder_fill_pct,
+                       sc->encoder_in_pressure ? "ASSERTED" : "—",
+                       (unsigned)sc->encoder_transport_drops,
+                       (unsigned)sc->encoder_pressure_drops,
+                       (unsigned)sc->encoder_packets_sent);
+        } else {
+            g_strlcpy(trans_line,
+                      "Transport trailer not yet seen on this encoder.",
+                      sizeof(trans_line));
+        }
+    }
+
+    if (ctx->sidecar_frame_label)     gtk_label_set_text(ctx->sidecar_frame_label, frame_line);
+    if (ctx->sidecar_encoder_label)   gtk_label_set_text(ctx->sidecar_encoder_label, enc_line);
+    if (ctx->sidecar_counters_label)  gtk_label_set_text(ctx->sidecar_counters_label, counters_line);
+    if (ctx->sidecar_transport_label) gtk_label_set_text(ctx->sidecar_transport_label, trans_line);
+
+    /* Keep the toggle button text in sync with reality (in case state
+     * changes via a different code path, e.g. uv_viewer_set_sidecar). */
+    if (ctx->sidecar_enable_toggle && !ctx->sidecar_toggle_suppress) {
+        gboolean active = gtk_toggle_button_get_active(ctx->sidecar_enable_toggle);
+        if (active != sc->enabled) {
+            ctx->sidecar_toggle_suppress = TRUE;
+            gtk_toggle_button_set_active(ctx->sidecar_enable_toggle, sc->enabled);
+            ctx->sidecar_toggle_suppress = FALSE;
+        }
+        update_sidecar_toggle_label(ctx, sc->enabled);
+    }
+    if (ctx->sidecar_port_spin) {
+        gtk_widget_set_sensitive(GTK_WIDGET(ctx->sidecar_port_spin), !sc->enabled);
+    }
+}
+
+static void update_frame_overlay_labels(GuiContext *ctx) {
+    if (!ctx) return;
+    const char *units[2] = {"ms", "KB"};
+    for (int m = 0; m < 2; m++) {
+        GtkLabel *live_label = ctx->frame_overlay_live_labels[m];
+        GtkLabel *max_label  = ctx->frame_overlay_max_labels[m];
+        if (!ctx->stats_history || ctx->stats_history->len == 0) {
+            if (live_label) gtk_label_set_text(live_label, "Live: --");
+            if (max_label)  gtk_label_set_text(max_label, "Max: --");
+            continue;
+        }
+
+        double range = ctx->frame_overlay_range_seconds > 0.0
+                     ? ctx->frame_overlay_range_seconds : 60.0;
+        if (range < 1.0) range = 1.0;
+        double now = g_get_monotonic_time() / 1e6;
+        double start_time = now - range;
+
+        StatsSample *samples = (StatsSample *)ctx->stats_history->data;
+        guint len = ctx->stats_history->len;
+        guint start_index = 0;
+        while (start_index < len && samples[start_index].timestamp < start_time) {
+            start_index++;
+        }
+        if (start_index == len) start_index = len > 0 ? len - 1 : 0;
+
+        double latest = NAN;
+        double peak = -G_MAXDOUBLE;
+        for (guint i = start_index; i < len; i++) {
+            double v = 0.0;
+            if (frame_overlay_sample_value(&samples[i], (guint)m, &v, NULL)) {
+                if (v > peak) peak = v;
+            }
+        }
+        for (gint i = (gint)len - 1; i >= (gint)start_index; i--) {
+            double v = 0.0;
+            if (frame_overlay_sample_value(&samples[i], (guint)m, &v, NULL)) {
+                latest = v; break;
+            }
+        }
+
+        char buf[80];
+        if (live_label) {
+            if (isfinite(latest)) {
+                g_snprintf(buf, sizeof(buf), "Live: %.2f %s", latest, units[m]);
+            } else {
+                g_strlcpy(buf, "Live: --", sizeof(buf));
+            }
+            gtk_label_set_text(live_label, buf);
+        }
+        if (max_label) {
+            if (peak == -G_MAXDOUBLE) {
+                g_strlcpy(buf, "Max: --", sizeof(buf));
+            } else {
+                g_snprintf(buf, sizeof(buf), "Max: %.2f %s", peak, units[m]);
+            }
+            gtk_label_set_text(max_label, buf);
+        }
+    }
+}
+
+static void update_stats_metric_labels(GuiContext *ctx) {
+    if (!ctx) return;
+    if (!ctx->stats_history || ctx->stats_history->len == 0) {
+        for (int i = 0; i < STATS_METRIC_COUNT; i++) {
+            if (ctx->stats_live_labels[i]) gtk_label_set_text(ctx->stats_live_labels[i], "Live: --");
+            if (ctx->stats_max_labels[i])  gtk_label_set_text(ctx->stats_max_labels[i],  "Max: --");
+        }
+        return;
+    }
+
+    double range = MAX(ctx->stats_range_seconds, 60.0);
+    double now = g_get_monotonic_time() / 1e6;
+    double start_time = now - range;
+
+    StatsSample *samples = (StatsSample *)ctx->stats_history->data;
+    guint len = ctx->stats_history->len;
+    guint start_index = 0;
+    while (start_index < len && samples[start_index].timestamp < start_time) {
+        start_index++;
+    }
+    if (start_index == len) {
+        start_index = len > 0 ? len - 1 : 0;
+    }
+
+    for (int m = 0; m < STATS_METRIC_COUNT; m++) {
+        StatsMetric metric = (StatsMetric)m;
+        double latest = NAN;
+        double max_val = -G_MAXDOUBLE;
+        for (guint i = start_index; i < len; i++) {
+            double v = stats_metric_value(&samples[i], metric);
+            if (!isfinite(v)) continue;
+            if (v > max_val) max_val = v;
+        }
+        for (gint i = (gint)len - 1; i >= (gint)start_index; i--) {
+            double v = stats_metric_value(&samples[i], metric);
+            if (isfinite(v)) { latest = v; break; }
+        }
+
+        char buf[80];
+        if (ctx->stats_live_labels[m]) {
+            char value_text[64];
+            format_metric_value(metric, latest, value_text, sizeof(value_text));
+            g_snprintf(buf, sizeof(buf), "Live: %s", value_text);
+            gtk_label_set_text(ctx->stats_live_labels[m], buf);
+        }
+        if (ctx->stats_max_labels[m]) {
+            char value_text[64];
+            format_metric_value(metric, (max_val == -G_MAXDOUBLE) ? NAN : max_val,
+                                value_text, sizeof(value_text));
+            g_snprintf(buf, sizeof(buf), "Max: %s", value_text);
+            gtk_label_set_text(ctx->stats_max_labels[m], buf);
+        }
     }
 }
 
@@ -1574,6 +2070,10 @@ static void refresh_stats(GuiContext *ctx) {
         if (ctx->source_detail_label) {
             gtk_label_set_text(ctx->source_detail_label, "No sources discovered yet.");
         }
+        if (ctx->stream_detail_label) {
+            gtk_label_set_text(ctx->stream_detail_label, "");
+        }
+        update_idr_button_sensitivity(ctx);
     } else {
         guint existing_items = 0;
         if (ctx->source_model) {
@@ -1710,12 +2210,64 @@ static void refresh_stats(GuiContext *ctx) {
                 } else {
                     gtk_label_set_text(ctx->source_detail_label, detail);
                 }
+
+                if (ctx->stream_detail_label) {
+                    uint64_t kf_total = detail_source->hevc_idr_count + detail_source->hevc_cra_count;
+                    uint64_t total_pkts = detail_source->rtp_unique_packets;
+                    double frag_pct = (total_pkts > 0)
+                                    ? (100.0 * (double)detail_source->rtp_fu_packets / (double)total_pkts)
+                                    : 0.0;
+                    char kf_age_buf[24];
+                    if (detail_source->seconds_since_keyframe < 0.0) {
+                        g_strlcpy(kf_age_buf, "n/a", sizeof(kf_age_buf));
+                    } else if (detail_source->seconds_since_keyframe >= 60.0) {
+                        g_snprintf(kf_age_buf, sizeof(kf_age_buf), "%.0fm%.0fs",
+                                   floor(detail_source->seconds_since_keyframe / 60.0),
+                                   fmod(detail_source->seconds_since_keyframe, 60.0));
+                    } else {
+                        g_snprintf(kf_age_buf, sizeof(kf_age_buf), "%.1fs",
+                                   detail_source->seconds_since_keyframe);
+                    }
+                    char kf_gap_buf[24];
+                    if (detail_source->last_keyframe_interval_seconds < 0.0) {
+                        g_strlcpy(kf_gap_buf, "—", sizeof(kf_gap_buf));
+                    } else {
+                        g_snprintf(kf_gap_buf, sizeof(kf_gap_buf), "%.2fs",
+                                   detail_source->last_keyframe_interval_seconds);
+                    }
+                    char stream_detail[384];
+                    g_snprintf(stream_detail, sizeof(stream_detail),
+                               "HEVC  IDR=%" G_GUINT64_FORMAT "  CRA=%" G_GUINT64_FORMAT
+                               "  trail=%" G_GUINT64_FORMAT "  VPS/SPS/PPS=%" G_GUINT64_FORMAT
+                               "/%" G_GUINT64_FORMAT "/%" G_GUINT64_FORMAT
+                               "  SEI=%" G_GUINT64_FORMAT "  AUD=%" G_GUINT64_FORMAT
+                               "  •  AP=%" G_GUINT64_FORMAT "  FU=%" G_GUINT64_FORMAT
+                               " (%.1f%% frag)"
+                               "  •  KF total=%" G_GUINT64_FORMAT "  last %s ago  Δ %s",
+                               detail_source->hevc_idr_count,
+                               detail_source->hevc_cra_count,
+                               detail_source->hevc_trail_count,
+                               detail_source->hevc_vps_count,
+                               detail_source->hevc_sps_count,
+                               detail_source->hevc_pps_count,
+                               detail_source->hevc_sei_count,
+                               detail_source->hevc_aud_count,
+                               detail_source->rtp_ap_packets,
+                               detail_source->rtp_fu_packets,
+                               frag_pct,
+                               kf_total,
+                               kf_age_buf,
+                               kf_gap_buf);
+                    gtk_label_set_text(ctx->stream_detail_label, stream_detail);
+                }
             } else if (waiting_for_switch) {
                 char message[128];
                 g_snprintf(message, sizeof(message), "Switching to source %u...", detail_index);
                 gtk_label_set_text(ctx->source_detail_label, message);
+                if (ctx->stream_detail_label) gtk_label_set_text(ctx->stream_detail_label, "");
             } else {
                 gtk_label_set_text(ctx->source_detail_label, "Select a source to view details.");
+                if (ctx->stream_detail_label) gtk_label_set_text(ctx->stream_detail_label, "");
             }
         }
 
@@ -1735,18 +2287,35 @@ static void refresh_stats(GuiContext *ctx) {
             ctx->active_source_index = GTK_INVALID_LIST_POSITION;
         }
 
+        update_idr_button_sensitivity(ctx);
+
         if (labels) {
             g_strfreev(labels);
         }
     }
 
-    if (viewer_selected_source) {
+    if (viewer_selected_source && !ctx->stats_paused) {
         StatsSample sample = {0};
         sample.timestamp = g_get_monotonic_time() / 1e6;
         sample.rate_bps = viewer_selected_source->inbound_bitrate_bps;
         sample.lost_packets = (double)viewer_selected_source->rtp_lost_packets;
         sample.dup_packets = (double)viewer_selected_source->rtp_duplicate_packets;
         sample.reorder_packets = (double)viewer_selected_source->rtp_reordered_packets;
+        if (ctx->stats_history && ctx->stats_history->len > 0) {
+            const StatsSample *prev = &g_array_index(ctx->stats_history, StatsSample,
+                                                    ctx->stats_history->len - 1);
+            double dt = sample.timestamp - prev->timestamp;
+            if (dt > 1e-3) {
+                double dl = sample.lost_packets - prev->lost_packets;
+                double dd = sample.dup_packets - prev->dup_packets;
+                double dr = sample.reorder_packets - prev->reorder_packets;
+                /* Counter resets (source switch / restart) read as huge negatives;
+                 * clamp so the chart doesn't dive into the basement. */
+                sample.lost_pps = dl > 0.0 ? dl / dt : 0.0;
+                sample.dup_pps = dd > 0.0 ? dd / dt : 0.0;
+                sample.reorder_pps = dr > 0.0 ? dr / dt : 0.0;
+            }
+        }
         sample.jitter_ms = viewer_selected_source->rfc3550_jitter_ms;
         sample.input_fps = viewer_selected_source->rtp_marker_fps;
         sample.decoder_fps_current = stats.decoder.instantaneous_fps;
@@ -1768,12 +2337,15 @@ static void refresh_stats(GuiContext *ctx) {
 
         stats_history_push(ctx, &sample);
 
+        update_stats_metric_labels(ctx);
+
         for (int i = 0; i < STATS_METRIC_COUNT; i++) {
             if (ctx->stats_charts[i]) {
                 gtk_widget_queue_draw(GTK_WIDGET(ctx->stats_charts[i]));
             }
         }
-    } else {
+    } else if (!ctx->stats_paused) {
+        update_stats_metric_labels(ctx);
         for (int i = 0; i < STATS_METRIC_COUNT; i++) {
             if (ctx->stats_charts[i]) {
                 gtk_widget_queue_draw(GTK_WIDGET(ctx->stats_charts[i]));
@@ -1865,6 +2437,9 @@ static void refresh_stats(GuiContext *ctx) {
         gtk_widget_queue_draw(GTK_WIDGET(ctx->frame_block_area));
     }
     frame_block_queue_overlay_draws(ctx);
+
+    update_sidecar_panel(ctx, &stats.sidecar);
+    update_audio_status_label(ctx, &stats);
 
     uv_viewer_stats_clear(&stats);
 }
@@ -2190,10 +2765,21 @@ static void on_frame_overlay_values_toggled(GtkCheckButton *button, gpointer use
     frame_block_queue_overlay_draws_force(ctx);
 }
 
+static gboolean gui_restart_with_config_ex(GuiContext *ctx,
+                                            const UvViewerConfig *cfg,
+                                            gboolean force_restart);
+
 static gboolean gui_restart_with_config(GuiContext *ctx, const UvViewerConfig *cfg) {
+    return gui_restart_with_config_ex(ctx, cfg, FALSE);
+}
+
+static gboolean gui_restart_with_config_ex(GuiContext *ctx,
+                                            const UvViewerConfig *cfg,
+                                            gboolean force_restart) {
     if (!ctx || !ctx->viewer || !cfg) return FALSE;
 
-    if (cfg->listen_port == ctx->current_cfg.listen_port &&
+    if (!force_restart &&
+        cfg->listen_port == ctx->current_cfg.listen_port &&
         cfg->sync_to_clock == ctx->current_cfg.sync_to_clock &&
         cfg->jitter_latency_ms == ctx->current_cfg.jitter_latency_ms &&
         cfg->queue_max_buffers == ctx->current_cfg.queue_max_buffers &&
@@ -2206,6 +2792,8 @@ static gboolean gui_restart_with_config(GuiContext *ctx, const UvViewerConfig *c
         cfg->audio_payload_type == ctx->current_cfg.audio_payload_type &&
         cfg->audio_clock_rate == ctx->current_cfg.audio_clock_rate &&
         cfg->audio_jitter_latency_ms == ctx->current_cfg.audio_jitter_latency_ms &&
+        cfg->audio_use_separate_port == ctx->current_cfg.audio_use_separate_port &&
+        cfg->audio_listen_port == ctx->current_cfg.audio_listen_port &&
         cfg->jitter_drop_on_latency == ctx->current_cfg.jitter_drop_on_latency &&
         cfg->jitter_do_lost == ctx->current_cfg.jitter_do_lost &&
         cfg->jitter_post_drop_messages == ctx->current_cfg.jitter_post_drop_messages) {
@@ -2307,22 +2895,29 @@ static void on_settings_apply_clicked(GtkButton *button, gpointer user_data) {
         if (fps_den <= 0) fps_den = 1;
         new_cfg.videorate_fps_denominator = (guint)fps_den;
     }
-    new_cfg.audio_enabled = check_get(ctx->audio_toggle);
-    if (ctx->audio_payload_spin) {
-        int payload = gtk_spin_button_get_value_as_int(ctx->audio_payload_spin);
-        if (payload < 0) payload = 0;
-        if (payload > 127) payload = 127;
-        new_cfg.audio_payload_type = (guint)payload;
-    }
-    if (ctx->audio_jitter_spin) {
-        int aj = gtk_spin_button_get_value_as_int(ctx->audio_jitter_spin);
-        if (aj < 0) aj = 0;
-        new_cfg.audio_jitter_latency_ms = (guint)aj;
-    }
+    /* Audio settings are owned by the Audio tab — preserve them. */
+    new_cfg.audio_enabled            = ctx->current_cfg.audio_enabled;
+    new_cfg.audio_payload_type       = ctx->current_cfg.audio_payload_type;
+    new_cfg.audio_jitter_latency_ms  = ctx->current_cfg.audio_jitter_latency_ms;
+    new_cfg.audio_clock_rate         = ctx->current_cfg.audio_clock_rate;
+    new_cfg.audio_use_separate_port  = ctx->current_cfg.audio_use_separate_port;
+    new_cfg.audio_listen_port        = ctx->current_cfg.audio_listen_port;
     new_cfg.sync_to_clock = check_get(ctx->sync_toggle_settings);
     new_cfg.jitter_drop_on_latency = check_get(ctx->jitter_drop_toggle);
     new_cfg.jitter_do_lost = check_get(ctx->jitter_do_lost_toggle);
     new_cfg.jitter_post_drop_messages = check_get(ctx->jitter_post_drop_toggle);
+
+    if (ctx->idr_port_spin) {
+        int port = gtk_spin_button_get_value_as_int(ctx->idr_port_spin);
+        if (port < 1) port = 1;
+        if (port > 65535) port = 65535;
+        new_cfg.idr_http_port = (guint)port;
+        ctx->current_cfg.idr_http_port = (guint)port;
+    }
+    /* Sidecar telemetry has its own tab + runtime start/stop — keep the
+     * applied-on-restart settings flow free of it. */
+    new_cfg.sidecar_enabled = ctx->current_cfg.sidecar_enabled;
+    new_cfg.sidecar_port    = ctx->current_cfg.sidecar_port;
 
     guint new_refresh_interval = ctx->stats_refresh_interval_ms;
     if (ctx->stats_refresh_spin) {
@@ -2373,6 +2968,15 @@ static void on_audio_toggled(GtkCheckButton *button, gpointer user_data) {
     }
     if (ctx->audio_jitter_spin) {
         gtk_widget_set_sensitive(GTK_WIDGET(ctx->audio_jitter_spin), active);
+    }
+    if (ctx->audio_port_mode_dropdown) {
+        gtk_widget_set_sensitive(GTK_WIDGET(ctx->audio_port_mode_dropdown), active);
+    }
+    if (ctx->audio_port_spin) {
+        guint mode = ctx->audio_port_mode_dropdown
+                   ? gtk_drop_down_get_selected(ctx->audio_port_mode_dropdown) : 0;
+        gtk_widget_set_sensitive(GTK_WIDGET(ctx->audio_port_spin),
+                                 active && mode == 1);
     }
 }
 
@@ -2532,9 +3136,13 @@ static GtkWidget *build_monitor_page(GuiContext *ctx) {
 
     ctx->status_label = GTK_LABEL(gtk_label_new("Waiting for sources..."));
     gtk_label_set_xalign(ctx->status_label, 0.0);
+    gtk_label_set_wrap(ctx->status_label, TRUE);
+    gtk_widget_add_css_class(GTK_WIDGET(ctx->status_label), "uv-status");
+    gtk_widget_add_css_class(GTK_WIDGET(ctx->status_label), "uv-status-bar");
     gtk_box_append(GTK_BOX(page), GTK_WIDGET(ctx->status_label));
 
     GtkWidget *video_frame = gtk_frame_new("Video Preview");
+    gtk_widget_add_css_class(video_frame, "uv-video");
     gtk_widget_set_hexpand(video_frame, TRUE);
     gtk_widget_set_vexpand(video_frame, TRUE);
     ctx->video_picture = GTK_PICTURE(gtk_picture_new());
@@ -2574,31 +3182,69 @@ static GtkWidget *build_monitor_page(GuiContext *ctx) {
     ctx->source_detail_label = GTK_LABEL(gtk_label_new("No sources discovered yet."));
     gtk_label_set_xalign(ctx->source_detail_label, 0.0);
     gtk_label_set_wrap(ctx->source_detail_label, TRUE);
+    gtk_label_set_selectable(ctx->source_detail_label, TRUE);
+    gtk_widget_add_css_class(GTK_WIDGET(ctx->source_detail_label), "uv-source-detail");
     gtk_box_append(GTK_BOX(sources_box), GTK_WIDGET(ctx->source_detail_label));
 
+    ctx->stream_detail_label = GTK_LABEL(gtk_label_new(""));
+    gtk_label_set_xalign(ctx->stream_detail_label, 0.0);
+    gtk_label_set_wrap(ctx->stream_detail_label, TRUE);
+    gtk_label_set_selectable(ctx->stream_detail_label, TRUE);
+    gtk_widget_add_css_class(GTK_WIDGET(ctx->stream_detail_label), "uv-source-detail");
+    gtk_widget_add_css_class(GTK_WIDGET(ctx->stream_detail_label), "uv-info");
+    gtk_widget_set_tooltip_text(GTK_WIDGET(ctx->stream_detail_label),
+                                "HEVC NAL-unit counts decoded from the RTP payload. "
+                                "'KF' is the most recent keyframe (IDR or CRA). "
+                                "Long KF gap with low SPS/PPS rate suggests intra-refresh / GDR mode.");
+    gtk_box_append(GTK_BOX(sources_box), GTK_WIDGET(ctx->stream_detail_label));
+
     GtkWidget *button_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    gtk_widget_add_css_class(button_box, "uv-action-bar");
+    gtk_widget_add_css_class(button_box, "toolbar");
     gtk_box_append(GTK_BOX(page), button_box);
+
+    ctx->idr_button = GTK_BUTTON(gtk_button_new_with_label("Request IDR"));
+    gtk_widget_add_css_class(GTK_WIDGET(ctx->idr_button), "suggested-action");
+    gtk_widget_add_css_class(GTK_WIDGET(ctx->idr_button), "uv-idr");
+    gtk_widget_set_tooltip_text(GTK_WIDGET(ctx->idr_button),
+                                "Ask the currently locked encoder for an IDR keyframe "
+                                "via HTTP GET /request/idr. Useful to recover after a "
+                                "freeze, link blip, or stream join. (Ctrl+I)");
+    g_signal_connect(ctx->idr_button, "clicked", G_CALLBACK(on_idr_button_clicked), ctx);
+    gtk_box_append(GTK_BOX(button_box), GTK_WIDGET(ctx->idr_button));
 
     GtkWidget *refresh_button = gtk_button_new_with_label("Restart Pipeline");
     gtk_widget_set_tooltip_text(refresh_button,
                                 "Tear down and rebuild the GStreamer pipeline. "
-                                "Useful when a mid-stream resolution / SPS change leaves the picture frozen.");
+                                "Useful when a mid-stream resolution / SPS change leaves "
+                                "the picture frozen. (Ctrl+R)");
     g_signal_connect(refresh_button, "clicked", G_CALLBACK(on_refresh_button_clicked), ctx);
     gtk_box_append(GTK_BOX(button_box), refresh_button);
 
     GtkWidget *next_button = gtk_button_new_with_label("Select Next");
+    gtk_widget_set_tooltip_text(next_button,
+                                "Switch to the next discovered source. (Ctrl+N)");
     g_signal_connect(next_button, "clicked", G_CALLBACK(on_next_button_clicked), ctx);
     gtk_box_append(GTK_BOX(button_box), next_button);
 
     ctx->sources_toggle = GTK_TOGGLE_BUTTON(gtk_toggle_button_new_with_label("Hide Sources"));
+    gtk_widget_set_tooltip_text(GTK_WIDGET(ctx->sources_toggle),
+                                "Collapse the source selector to maximize the video pane.");
     g_signal_connect(ctx->sources_toggle, "toggled", G_CALLBACK(on_sources_toggle_toggled), ctx);
     gtk_box_append(GTK_BOX(button_box), GTK_WIDGET(ctx->sources_toggle));
 
+    GtkWidget *spacer = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    gtk_widget_set_hexpand(spacer, TRUE);
+    gtk_box_append(GTK_BOX(button_box), spacer);
+
     GtkWidget *quit_button = gtk_button_new_with_label("Quit");
+    gtk_widget_add_css_class(quit_button, "flat");
     g_signal_connect(quit_button, "clicked", G_CALLBACK(on_quit_button_clicked), ctx);
-    gtk_box_append(GTK_BOX(button_box), quit_button);
+    gtk_box_append(GTK_BOX(button_box), GTK_WIDGET(quit_button));
 
     gtk_toggle_button_set_active(ctx->sources_toggle, TRUE);
+
+    update_idr_button_sensitivity(ctx);
 
     return page;
 }
@@ -2612,6 +3258,8 @@ static GtkWidget *build_settings_page(GuiContext *ctx) {
 
     ctx->info_label = GTK_LABEL(gtk_label_new(""));
     gtk_label_set_xalign(ctx->info_label, 0.0);
+    gtk_label_set_wrap(ctx->info_label, TRUE);
+    gtk_widget_add_css_class(GTK_WIDGET(ctx->info_label), "uv-info");
     gtk_box_append(GTK_BOX(page), GTK_WIDGET(ctx->info_label));
     update_info_label(ctx);
 
@@ -2698,30 +3346,7 @@ static GtkWidget *build_settings_page(GuiContext *ctx) {
     ctx->videorate_den_spin = GTK_SPIN_BUTTON(gtk_spin_button_new_with_range(1, 1000, 1));
     gtk_box_append(GTK_BOX(videorate_box), GTK_WIDGET(ctx->videorate_den_spin));
 
-    GtkWidget *audio_label = gtk_label_new("Audio:");
-    gtk_label_set_xalign(GTK_LABEL(audio_label), 0.0);
-    gtk_grid_attach(GTK_GRID(grid), audio_label, 0, 8, 1, 1);
-
-    GtkWidget *audio_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
-    gtk_grid_attach(GTK_GRID(grid), audio_box, 1, 8, 1, 1);
-
-    ctx->audio_toggle = GTK_CHECK_BUTTON(gtk_check_button_new_with_label("Enable"));
-    gtk_box_append(GTK_BOX(audio_box), GTK_WIDGET(ctx->audio_toggle));
-    g_signal_connect(ctx->audio_toggle, "toggled", G_CALLBACK(on_audio_toggled), ctx);
-
-    GtkWidget *payload_label = gtk_label_new("PT:");
-    gtk_label_set_xalign(GTK_LABEL(payload_label), 0.0);
-    gtk_box_append(GTK_BOX(audio_box), payload_label);
-
-    ctx->audio_payload_spin = GTK_SPIN_BUTTON(gtk_spin_button_new_with_range(0, 127, 1));
-    gtk_box_append(GTK_BOX(audio_box), GTK_WIDGET(ctx->audio_payload_spin));
-
-    GtkWidget *audio_jitter_label = gtk_label_new("Jitter (ms):");
-    gtk_label_set_xalign(GTK_LABEL(audio_jitter_label), 0.0);
-    gtk_box_append(GTK_BOX(audio_box), audio_jitter_label);
-
-    ctx->audio_jitter_spin = GTK_SPIN_BUTTON(gtk_spin_button_new_with_range(0, 500, 1));
-    gtk_box_append(GTK_BOX(audio_box), GTK_WIDGET(ctx->audio_jitter_spin));
+    /* Audio settings now live on the dedicated Audio tab. */
 
     ctx->jitter_drop_toggle = GTK_CHECK_BUTTON(gtk_check_button_new_with_label("Drop packets exceeding latency"));
     gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(ctx->jitter_drop_toggle), 0, 9, 2, 1);
@@ -2732,7 +3357,21 @@ static GtkWidget *build_settings_page(GuiContext *ctx) {
     ctx->jitter_post_drop_toggle = GTK_CHECK_BUTTON(gtk_check_button_new_with_label("Post drop messages on bus"));
     gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(ctx->jitter_post_drop_toggle), 0, 11, 2, 1);
 
+    GtkWidget *idr_port_label = gtk_label_new("IDR HTTP Port:");
+    gtk_label_set_xalign(GTK_LABEL(idr_port_label), 0.0);
+    gtk_widget_set_tooltip_text(idr_port_label,
+                                "TCP port used by the 'Request IDR' button to reach the "
+                                "encoder's /request/idr endpoint (default 80).");
+    gtk_grid_attach(GTK_GRID(grid), idr_port_label, 0, 12, 1, 1);
+
+    ctx->idr_port_spin = GTK_SPIN_BUTTON(gtk_spin_button_new_with_range(1, 65535, 1));
+    gtk_widget_set_tooltip_text(GTK_WIDGET(ctx->idr_port_spin),
+                                "Applies on next Apply Settings; the button targets this port "
+                                "on the currently locked source's IP.");
+    gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(ctx->idr_port_spin), 1, 12, 1, 1);
+
     GtkWidget *apply_button = gtk_button_new_with_label("Apply Settings");
+    gtk_widget_add_css_class(apply_button, "suggested-action");
     g_signal_connect(apply_button, "clicked", G_CALLBACK(on_settings_apply_clicked), ctx);
     gtk_box_append(GTK_BOX(page), apply_button);
 
@@ -2745,13 +3384,40 @@ static GtkWidget *build_settings_page(GuiContext *ctx) {
     return page;
 }
 
+static void on_stats_pause_toggled(GtkToggleButton *btn, gpointer user_data) {
+    GuiContext *ctx = user_data;
+    if (!ctx) return;
+    ctx->stats_paused = gtk_toggle_button_get_active(btn);
+    gtk_button_set_label(GTK_BUTTON(btn), ctx->stats_paused ? "Resume" : "Pause");
+}
+
+static void on_stats_reset_clicked(GtkButton *button, gpointer user_data) {
+    (void)button;
+    GuiContext *ctx = user_data;
+    if (!ctx) return;
+    if (ctx->stats_history) {
+        g_array_set_size(ctx->stats_history, 0);
+    }
+    update_stats_metric_labels(ctx);
+    update_frame_overlay_labels(ctx);
+    for (int i = 0; i < STATS_METRIC_COUNT; i++) {
+        if (ctx->stats_charts[i]) gtk_widget_queue_draw(GTK_WIDGET(ctx->stats_charts[i]));
+    }
+    if (ctx->frame_overlay_lateness) gtk_widget_queue_draw(GTK_WIDGET(ctx->frame_overlay_lateness));
+    if (ctx->frame_overlay_size)     gtk_widget_queue_draw(GTK_WIDGET(ctx->frame_overlay_size));
+}
+
 static GtkWidget *build_stats_page(GuiContext *ctx) {
-    GtkWidget *page = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
+    GtkWidget *page = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
     gtk_widget_set_margin_top(page, 12);
     gtk_widget_set_margin_bottom(page, 12);
     gtk_widget_set_margin_start(page, 12);
     gtk_widget_set_margin_end(page, 12);
 
+    /* Controls row: time range + pause / reset. The source / bitrate /
+     * jitter / fps banner is intentionally absent — the same info is
+     * already on the Monitor tab and visible on the per-chart "Live"
+     * labels, so a third copy was just adding visual noise. */
     GtkWidget *controls = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
     gtk_box_append(GTK_BOX(page), controls);
 
@@ -2760,6 +3426,7 @@ static GtkWidget *build_stats_page(GuiContext *ctx) {
     gtk_box_append(GTK_BOX(controls), range_label);
 
     const char *options[] = {
+        "Last 30 seconds",
         "Last 1 minute",
         "Last 5 minutes",
         "Last 10 minutes",
@@ -2768,12 +3435,31 @@ static GtkWidget *build_stats_page(GuiContext *ctx) {
     ctx->stats_range_dropdown = GTK_DROP_DOWN(gtk_drop_down_new_from_strings(options));
     gtk_widget_set_hexpand(GTK_WIDGET(ctx->stats_range_dropdown), FALSE);
 
-    guint default_index = 1;
-    if (fabs(ctx->stats_range_seconds - 60.0) < 0.1) default_index = 0;
-    else if (fabs(ctx->stats_range_seconds - 600.0) < 0.1) default_index = 2;
+    guint default_index = 2;
+    if (fabs(ctx->stats_range_seconds - 30.0) < 0.1) default_index = 0;
+    else if (fabs(ctx->stats_range_seconds - 60.0) < 0.1) default_index = 1;
+    else if (fabs(ctx->stats_range_seconds - 600.0) < 0.1) default_index = 3;
     gtk_drop_down_set_selected(ctx->stats_range_dropdown, default_index);
     g_signal_connect(ctx->stats_range_dropdown, "notify::selected", G_CALLBACK(stats_range_changed), ctx);
     gtk_box_append(GTK_BOX(controls), GTK_WIDGET(ctx->stats_range_dropdown));
+
+    GtkWidget *ctrl_spacer = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    gtk_widget_set_hexpand(ctrl_spacer, TRUE);
+    gtk_box_append(GTK_BOX(controls), ctrl_spacer);
+
+    GtkWidget *reset_btn = gtk_button_new_with_label("Reset");
+    gtk_widget_add_css_class(reset_btn, "flat");
+    gtk_widget_set_tooltip_text(reset_btn, "Clear the recorded history buffer.");
+    g_signal_connect(reset_btn, "clicked", G_CALLBACK(on_stats_reset_clicked), ctx);
+    gtk_box_append(GTK_BOX(controls), reset_btn);
+
+    GtkWidget *pause_btn = gtk_toggle_button_new_with_label("Pause");
+    ctx->stats_pause_toggle = GTK_TOGGLE_BUTTON(pause_btn);
+    gtk_widget_set_tooltip_text(pause_btn,
+                                "Freeze the chart and labels so you can examine "
+                                "a glitch. New samples are dropped while paused.");
+    g_signal_connect(pause_btn, "toggled", G_CALLBACK(on_stats_pause_toggled), ctx);
+    gtk_box_append(GTK_BOX(controls), pause_btn);
 
     GtkWidget *grid = gtk_grid_new();
     gtk_grid_set_row_spacing(GTK_GRID(grid), 12);
@@ -2782,9 +3468,9 @@ static GtkWidget *build_stats_page(GuiContext *ctx) {
 
     static const char *titles[STATS_METRIC_COUNT] = {
         "Inbound Rate (Mbps)",
-        "RTP Lost Packets",
-        "RTP Duplicate Packets",
-        "RTP Reordered Packets",
+        "RTP Lost (pkt/s)",
+        "RTP Duplicate (pkt/s)",
+        "RTP Reordered (pkt/s)",
         "RTP Jitter (ms)",
         "Input Frame FPS",
         "Decoder FPS (current)"
@@ -2809,11 +3495,19 @@ static GtkWidget *build_stats_page(GuiContext *ctx) {
         GtkWidget *live_widget = gtk_label_new("Live: --");
         gtk_label_set_xalign(GTK_LABEL(live_widget), 1.0);
         gtk_widget_set_valign(live_widget, GTK_ALIGN_CENTER);
+        gtk_label_set_single_line_mode(GTK_LABEL(live_widget), TRUE);
+        gtk_label_set_width_chars(GTK_LABEL(live_widget), 18);
+        gtk_label_set_max_width_chars(GTK_LABEL(live_widget), 18);
+        gtk_widget_add_css_class(live_widget, "numeric");
         gtk_box_append(GTK_BOX(label_box), live_widget);
 
         GtkWidget *max_widget = gtk_label_new("Max: --");
         gtk_label_set_xalign(GTK_LABEL(max_widget), 1.0);
         gtk_widget_set_valign(max_widget, GTK_ALIGN_CENTER);
+        gtk_label_set_single_line_mode(GTK_LABEL(max_widget), TRUE);
+        gtk_label_set_width_chars(GTK_LABEL(max_widget), 18);
+        gtk_label_set_max_width_chars(GTK_LABEL(max_widget), 18);
+        gtk_widget_add_css_class(max_widget, "numeric");
         gtk_box_append(GTK_BOX(label_box), max_widget);
 
         gtk_frame_set_label_widget(GTK_FRAME(frame), label_box);
@@ -2829,6 +3523,432 @@ static GtkWidget *build_stats_page(GuiContext *ctx) {
         ctx->stats_charts[i] = area;
         ctx->stats_live_labels[i] = GTK_LABEL(live_widget);
         ctx->stats_max_labels[i] = GTK_LABEL(max_widget);
+    }
+
+    return page;
+}
+
+static void on_audio_port_mode_changed(GObject *dropdown, GParamSpec *pspec, gpointer user_data) {
+    (void)pspec;
+    GuiContext *ctx = user_data;
+    if (!ctx || !GTK_IS_DROP_DOWN(dropdown)) return;
+    guint mode = gtk_drop_down_get_selected(GTK_DROP_DOWN(dropdown));
+    gboolean separate = (mode == 1);
+    gboolean audio_on = ctx->audio_toggle ? check_get(ctx->audio_toggle) : FALSE;
+    if (ctx->audio_port_spin) {
+        gtk_widget_set_sensitive(GTK_WIDGET(ctx->audio_port_spin), audio_on && separate);
+    }
+}
+
+static void audio_collect_cfg_from_ui(GuiContext *ctx, UvViewerConfig *new_cfg) {
+    *new_cfg = ctx->current_cfg;
+
+    new_cfg->audio_enabled = ctx->audio_toggle ? check_get(ctx->audio_toggle) : FALSE;
+    if (ctx->audio_payload_spin) {
+        int v = gtk_spin_button_get_value_as_int(ctx->audio_payload_spin);
+        if (v < 0) v = 0;
+        if (v > 127) v = 127;
+        new_cfg->audio_payload_type = (guint)v;
+    }
+    if (ctx->audio_jitter_spin) {
+        int v = gtk_spin_button_get_value_as_int(ctx->audio_jitter_spin);
+        if (v < 0) v = 0;
+        new_cfg->audio_jitter_latency_ms = (guint)v;
+    }
+    if (ctx->audio_port_mode_dropdown) {
+        guint mode = gtk_drop_down_get_selected(ctx->audio_port_mode_dropdown);
+        new_cfg->audio_use_separate_port = (mode == 1);
+    }
+    if (ctx->audio_port_spin) {
+        int v = gtk_spin_button_get_value_as_int(ctx->audio_port_spin);
+        if (v < 1) v = 1;
+        if (v > 65535) v = 65535;
+        new_cfg->audio_listen_port = (guint)v;
+    }
+
+    if (new_cfg->audio_use_separate_port &&
+        (gint)new_cfg->audio_listen_port == new_cfg->listen_port) {
+        update_status(ctx,
+            "Audio: separate port would collide with video — keeping shared mode.");
+        new_cfg->audio_use_separate_port = FALSE;
+    }
+}
+
+static void on_audio_apply_clicked(GtkButton *btn, gpointer user_data) {
+    (void)btn;
+    GuiContext *ctx = user_data;
+    if (!ctx) return;
+
+    UvViewerConfig new_cfg;
+    audio_collect_cfg_from_ui(ctx, &new_cfg);
+
+    if (!gui_restart_with_config(ctx, &new_cfg)) {
+        sync_settings_controls(ctx);
+    } else {
+        update_status(ctx, "Audio settings applied.");
+    }
+}
+
+static void on_audio_restart_clicked(GtkButton *btn, gpointer user_data) {
+    (void)btn;
+    GuiContext *ctx = user_data;
+    if (!ctx) return;
+
+    UvViewerConfig new_cfg;
+    audio_collect_cfg_from_ui(ctx, &new_cfg);
+
+    /* Force rebuild even if config matches current — that's the point of
+     * the explicit Restart button: kick a stuck audio chain without
+     * having to change a setting first. */
+    if (!gui_restart_with_config_ex(ctx, &new_cfg, TRUE)) {
+        sync_settings_controls(ctx);
+    } else {
+        update_status(ctx, "Audio pipeline restarted.");
+    }
+}
+
+static GtkWidget *build_audio_page(GuiContext *ctx) {
+    GtkWidget *page = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
+    gtk_widget_set_margin_top(page, 12);
+    gtk_widget_set_margin_bottom(page, 12);
+    gtk_widget_set_margin_start(page, 12);
+    gtk_widget_set_margin_end(page, 12);
+
+    /* Status frame at the top. */
+    GtkWidget *status_frame = gtk_frame_new("Status");
+    gtk_widget_set_hexpand(status_frame, TRUE);
+    gtk_box_append(GTK_BOX(page), status_frame);
+    ctx->audio_status_label = GTK_LABEL(gtk_label_new("Audio disabled."));
+    gtk_label_set_xalign(ctx->audio_status_label, 0.0);
+    gtk_label_set_wrap(ctx->audio_status_label, TRUE);
+    gtk_widget_add_css_class(GTK_WIDGET(ctx->audio_status_label), "uv-source-detail");
+    gtk_widget_set_margin_top(GTK_WIDGET(ctx->audio_status_label), 6);
+    gtk_widget_set_margin_bottom(GTK_WIDGET(ctx->audio_status_label), 6);
+    gtk_widget_set_margin_start(GTK_WIDGET(ctx->audio_status_label), 8);
+    gtk_widget_set_margin_end(GTK_WIDGET(ctx->audio_status_label), 8);
+    gtk_frame_set_child(GTK_FRAME(status_frame), GTK_WIDGET(ctx->audio_status_label));
+
+    /* Configuration grid. */
+    GtkWidget *grid = gtk_grid_new();
+    gtk_grid_set_row_spacing(GTK_GRID(grid), 8);
+    gtk_grid_set_column_spacing(GTK_GRID(grid), 12);
+    gtk_box_append(GTK_BOX(page), grid);
+
+    GtkWidget *enable_label = gtk_label_new("Enable audio:");
+    gtk_label_set_xalign(GTK_LABEL(enable_label), 0.0);
+    gtk_grid_attach(GTK_GRID(grid), enable_label, 0, 0, 1, 1);
+    ctx->audio_toggle = GTK_CHECK_BUTTON(gtk_check_button_new());
+    gtk_widget_set_tooltip_text(GTK_WIDGET(ctx->audio_toggle),
+                                "Build the Opus receive branch in the pipeline.");
+    g_signal_connect(ctx->audio_toggle, "toggled", G_CALLBACK(on_audio_toggled), ctx);
+    gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(ctx->audio_toggle), 1, 0, 1, 1);
+
+    GtkWidget *pt_label = gtk_label_new("Payload type:");
+    gtk_label_set_xalign(GTK_LABEL(pt_label), 0.0);
+    gtk_grid_attach(GTK_GRID(grid), pt_label, 0, 1, 1, 1);
+    ctx->audio_payload_spin = GTK_SPIN_BUTTON(gtk_spin_button_new_with_range(0, 127, 1));
+    gtk_widget_set_tooltip_text(GTK_WIDGET(ctx->audio_payload_spin),
+                                "RTP payload type for the OPUS audio packets (default 98).");
+    gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(ctx->audio_payload_spin), 1, 1, 1, 1);
+
+    GtkWidget *jitter_label = gtk_label_new("Jitter latency (ms):");
+    gtk_label_set_xalign(GTK_LABEL(jitter_label), 0.0);
+    gtk_grid_attach(GTK_GRID(grid), jitter_label, 0, 2, 1, 1);
+    ctx->audio_jitter_spin = GTK_SPIN_BUTTON(gtk_spin_button_new_with_range(0, 2000, 5));
+    gtk_widget_set_tooltip_text(GTK_WIDGET(ctx->audio_jitter_spin),
+                                "rtpjitterbuffer latency for audio in ms. Opus packets are "
+                                "typically 20 ms apart, so anything below ~30 ms will under-"
+                                "run on most links. 40-100 ms is a sensible range.");
+    gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(ctx->audio_jitter_spin), 1, 2, 1, 1);
+
+    GtkWidget *mode_label = gtk_label_new("Port mode:");
+    gtk_label_set_xalign(GTK_LABEL(mode_label), 0.0);
+    gtk_widget_set_tooltip_text(mode_label,
+                                "\"Shared with video\" demuxes audio out of the same RTP stream "
+                                "by payload type (default). \"Separate UDP port\" binds a "
+                                "second listener on its own port.");
+    gtk_grid_attach(GTK_GRID(grid), mode_label, 0, 3, 1, 1);
+    const char *mode_options[] = {"Shared with video port", "Separate UDP port", NULL};
+    ctx->audio_port_mode_dropdown = GTK_DROP_DOWN(gtk_drop_down_new_from_strings(mode_options));
+    g_signal_connect(ctx->audio_port_mode_dropdown, "notify::selected",
+                     G_CALLBACK(on_audio_port_mode_changed), ctx);
+    gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(ctx->audio_port_mode_dropdown), 1, 3, 1, 1);
+
+    GtkWidget *port_label = gtk_label_new("Audio UDP port:");
+    gtk_label_set_xalign(GTK_LABEL(port_label), 0.0);
+    gtk_grid_attach(GTK_GRID(grid), port_label, 0, 4, 1, 1);
+    ctx->audio_port_spin = GTK_SPIN_BUTTON(gtk_spin_button_new_with_range(1, 65535, 1));
+    gtk_widget_set_tooltip_text(GTK_WIDGET(ctx->audio_port_spin),
+                                "Used only when the port mode is \"Separate UDP port\". "
+                                "Must differ from the video listen port.");
+    gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(ctx->audio_port_spin), 1, 4, 1, 1);
+
+    /* Apply / Restart buttons. */
+    GtkWidget *button_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_box_append(GTK_BOX(page), button_row);
+
+    GtkWidget *apply_btn = gtk_button_new_with_label("Apply Audio Settings");
+    gtk_widget_add_css_class(apply_btn, "suggested-action");
+    gtk_widget_set_tooltip_text(apply_btn,
+                                "Rebuild the pipeline with the new audio config. "
+                                "Video keeps running on its existing listen port.");
+    g_signal_connect(apply_btn, "clicked", G_CALLBACK(on_audio_apply_clicked), ctx);
+    gtk_box_append(GTK_BOX(button_row), apply_btn);
+
+    GtkWidget *restart_btn = gtk_button_new_with_label("Restart Audio");
+    gtk_widget_set_tooltip_text(restart_btn,
+                                "Force a pipeline rebuild with the current audio settings "
+                                "even if nothing changed — kicks the audio branch out of "
+                                "a glitch (stuck jitter buffer, silent after a network "
+                                "blip) without touching any config.");
+    g_signal_connect(restart_btn, "clicked", G_CALLBACK(on_audio_restart_clicked), ctx);
+    gtk_box_append(GTK_BOX(button_row), restart_btn);
+
+    GtkWidget *hint = gtk_label_new(
+        "Apply restarts the GStreamer pipeline with the values above. "
+        "Restart Audio does the same rebuild but with no config changes.");
+    gtk_label_set_xalign(GTK_LABEL(hint), 0.0);
+    gtk_label_set_wrap(GTK_LABEL(hint), TRUE);
+    gtk_widget_add_css_class(hint, "uv-info");
+    gtk_box_append(GTK_BOX(page), hint);
+
+    /* Prime the controls from the current config. */
+    if (ctx->audio_toggle) {
+        check_set(ctx->audio_toggle, ctx->current_cfg.audio_enabled ? TRUE : FALSE);
+    }
+    if (ctx->audio_payload_spin) {
+        gtk_spin_button_set_value(ctx->audio_payload_spin, ctx->current_cfg.audio_payload_type);
+    }
+    if (ctx->audio_jitter_spin) {
+        gtk_spin_button_set_value(ctx->audio_jitter_spin, ctx->current_cfg.audio_jitter_latency_ms);
+    }
+    if (ctx->audio_port_mode_dropdown) {
+        gtk_drop_down_set_selected(ctx->audio_port_mode_dropdown,
+                                   ctx->current_cfg.audio_use_separate_port ? 1 : 0);
+    }
+    if (ctx->audio_port_spin) {
+        guint p = ctx->current_cfg.audio_listen_port ? ctx->current_cfg.audio_listen_port : 5601;
+        gtk_spin_button_set_value(ctx->audio_port_spin, p);
+    }
+    /* Initial sensitivity. */
+    on_audio_toggled(ctx->audio_toggle, ctx);
+
+    return page;
+}
+
+static void update_audio_status_label(GuiContext *ctx, const UvViewerStats *stats) {
+    if (!ctx || !ctx->audio_status_label) return;
+    const UvViewerConfig *cfg = &ctx->current_cfg;
+    if (!cfg->audio_enabled) {
+        gtk_label_set_text(ctx->audio_status_label, "Audio disabled.");
+        return;
+    }
+    const char *state;
+    if (!stats || !stats->audio_enabled) {
+        state = "audio branch failed to build";
+    } else if (stats->audio_active) {
+        state = "ACTIVE — buffers flowing";
+    } else {
+        state = "waiting for packets";
+    }
+    char line[224];
+    if (cfg->audio_use_separate_port) {
+        g_snprintf(line, sizeof(line),
+                   "%s  •  separate UDP :%u  •  PT %u  •  jitter %u ms  •  clock %u Hz",
+                   state,
+                   cfg->audio_listen_port,
+                   cfg->audio_payload_type,
+                   cfg->audio_jitter_latency_ms,
+                   cfg->audio_clock_rate ? cfg->audio_clock_rate : 48000u);
+    } else {
+        g_snprintf(line, sizeof(line),
+                   "%s  •  shared with video on :%d  •  PT %u  •  jitter %u ms  •  clock %u Hz",
+                   state,
+                   cfg->listen_port,
+                   cfg->audio_payload_type,
+                   cfg->audio_jitter_latency_ms,
+                   cfg->audio_clock_rate ? cfg->audio_clock_rate : 48000u);
+    }
+    gtk_label_set_text(ctx->audio_status_label, line);
+}
+
+static void update_sidecar_toggle_label(GuiContext *ctx, gboolean enabled) {
+    if (!ctx || !ctx->sidecar_enable_toggle) return;
+    gtk_button_set_label(GTK_BUTTON(ctx->sidecar_enable_toggle),
+                         enabled ? "Stop telemetry" : "Start telemetry");
+    if (enabled) {
+        gtk_widget_remove_css_class(GTK_WIDGET(ctx->sidecar_enable_toggle), "suggested-action");
+        gtk_widget_add_css_class(GTK_WIDGET(ctx->sidecar_enable_toggle), "destructive-action");
+    } else {
+        gtk_widget_remove_css_class(GTK_WIDGET(ctx->sidecar_enable_toggle), "destructive-action");
+        gtk_widget_add_css_class(GTK_WIDGET(ctx->sidecar_enable_toggle), "suggested-action");
+    }
+}
+
+static void on_sidecar_enable_toggled(GtkToggleButton *btn, gpointer user_data) {
+    GuiContext *ctx = user_data;
+    if (!ctx || ctx->sidecar_toggle_suppress) return;
+    if (!ctx->viewer) return;
+
+    gboolean want_on = gtk_toggle_button_get_active(btn);
+    guint port = ctx->current_cfg.sidecar_port ? ctx->current_cfg.sidecar_port : 5602;
+    if (ctx->sidecar_port_spin) {
+        int v = gtk_spin_button_get_value_as_int(ctx->sidecar_port_spin);
+        if (v >= 1 && v <= 65535) port = (guint)v;
+    }
+
+    uv_viewer_set_sidecar_enabled(ctx->viewer, want_on, port);
+    ctx->current_cfg.sidecar_enabled = want_on;
+    ctx->current_cfg.sidecar_port = port;
+    if (ctx->cfg_slot) {
+        ctx->cfg_slot->sidecar_enabled = want_on;
+        ctx->cfg_slot->sidecar_port = port;
+    }
+    update_sidecar_toggle_label(ctx, want_on);
+    if (ctx->sidecar_port_spin) {
+        gtk_widget_set_sensitive(GTK_WIDGET(ctx->sidecar_port_spin), !want_on);
+    }
+}
+
+static void on_sidecar_port_changed(GtkSpinButton *spin, gpointer user_data) {
+    GuiContext *ctx = user_data;
+    if (!ctx) return;
+    int v = gtk_spin_button_get_value_as_int(spin);
+    if (v < 1) v = 1;
+    if (v > 65535) v = 65535;
+    ctx->current_cfg.sidecar_port = (guint)v;
+    if (ctx->cfg_slot) ctx->cfg_slot->sidecar_port = (guint)v;
+}
+
+static GtkWidget *build_sidecar_page(GuiContext *ctx) {
+    GtkWidget *page = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
+    gtk_widget_set_margin_top(page, 12);
+    gtk_widget_set_margin_bottom(page, 12);
+    gtk_widget_set_margin_start(page, 12);
+    gtk_widget_set_margin_end(page, 12);
+
+    /* Controls row: Start/Stop, port spin. */
+    GtkWidget *controls = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_widget_add_css_class(controls, "toolbar");
+    gtk_widget_add_css_class(controls, "uv-action-bar");
+    gtk_box_append(GTK_BOX(page), controls);
+
+    ctx->sidecar_enable_toggle = GTK_TOGGLE_BUTTON(gtk_toggle_button_new_with_label("Start telemetry"));
+    gtk_widget_add_css_class(GTK_WIDGET(ctx->sidecar_enable_toggle), "suggested-action");
+    gtk_widget_set_tooltip_text(GTK_WIDGET(ctx->sidecar_enable_toggle),
+                                "Open a UDP probe socket and subscribe to the locked source's "
+                                "waybeam_venc sidecar telemetry channel. Stops cleanly when "
+                                "toggled off.");
+    g_signal_connect(ctx->sidecar_enable_toggle, "toggled",
+                     G_CALLBACK(on_sidecar_enable_toggled), ctx);
+    gtk_box_append(GTK_BOX(controls), GTK_WIDGET(ctx->sidecar_enable_toggle));
+
+    GtkWidget *port_label = gtk_label_new("Encoder port:");
+    gtk_widget_set_valign(port_label, GTK_ALIGN_CENTER);
+    gtk_box_append(GTK_BOX(controls), port_label);
+
+    ctx->sidecar_port_spin = GTK_SPIN_BUTTON(gtk_spin_button_new_with_range(1, 65535, 1));
+    gtk_widget_set_tooltip_text(GTK_WIDGET(ctx->sidecar_port_spin),
+                                "UDP port on the encoder side that hosts the sidecar listener "
+                                "(default 5602). Editable only when telemetry is stopped.");
+    gtk_widget_set_valign(GTK_WIDGET(ctx->sidecar_port_spin), GTK_ALIGN_CENTER);
+    g_signal_connect(ctx->sidecar_port_spin, "value-changed",
+                     G_CALLBACK(on_sidecar_port_changed), ctx);
+    gtk_box_append(GTK_BOX(controls), GTK_WIDGET(ctx->sidecar_port_spin));
+
+    GtkWidget *spacer = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    gtk_widget_set_hexpand(spacer, TRUE);
+    gtk_box_append(GTK_BOX(controls), spacer);
+
+    /* Status frame. */
+    GtkWidget *status_frame = gtk_frame_new("Status");
+    gtk_widget_set_hexpand(status_frame, TRUE);
+    gtk_box_append(GTK_BOX(page), status_frame);
+    ctx->sidecar_status_label = GTK_LABEL(gtk_label_new(
+        "Stopped. Press Start to subscribe to the encoder's sidecar."));
+    gtk_label_set_xalign(ctx->sidecar_status_label, 0.0);
+    gtk_label_set_wrap(ctx->sidecar_status_label, TRUE);
+    gtk_label_set_selectable(ctx->sidecar_status_label, TRUE);
+    gtk_widget_add_css_class(GTK_WIDGET(ctx->sidecar_status_label), "uv-source-detail");
+    gtk_widget_set_margin_top(GTK_WIDGET(ctx->sidecar_status_label), 6);
+    gtk_widget_set_margin_bottom(GTK_WIDGET(ctx->sidecar_status_label), 6);
+    gtk_widget_set_margin_start(GTK_WIDGET(ctx->sidecar_status_label), 8);
+    gtk_widget_set_margin_end(GTK_WIDGET(ctx->sidecar_status_label), 8);
+    gtk_frame_set_child(GTK_FRAME(status_frame), GTK_WIDGET(ctx->sidecar_status_label));
+
+    /* Last frame frame. */
+    GtkWidget *frame_frame = gtk_frame_new("Last frame");
+    gtk_widget_set_hexpand(frame_frame, TRUE);
+    gtk_box_append(GTK_BOX(page), frame_frame);
+    ctx->sidecar_frame_label = GTK_LABEL(gtk_label_new(""));
+    gtk_label_set_xalign(ctx->sidecar_frame_label, 0.0);
+    gtk_label_set_wrap(ctx->sidecar_frame_label, TRUE);
+    gtk_label_set_selectable(ctx->sidecar_frame_label, TRUE);
+    gtk_widget_add_css_class(GTK_WIDGET(ctx->sidecar_frame_label), "uv-source-detail");
+    gtk_widget_set_margin_top(GTK_WIDGET(ctx->sidecar_frame_label), 6);
+    gtk_widget_set_margin_bottom(GTK_WIDGET(ctx->sidecar_frame_label), 6);
+    gtk_widget_set_margin_start(GTK_WIDGET(ctx->sidecar_frame_label), 8);
+    gtk_widget_set_margin_end(GTK_WIDGET(ctx->sidecar_frame_label), 8);
+    gtk_frame_set_child(GTK_FRAME(frame_frame), GTK_WIDGET(ctx->sidecar_frame_label));
+
+    /* Encoder rate-control frame. */
+    GtkWidget *enc_frame = gtk_frame_new("Encoder rate control");
+    gtk_widget_set_hexpand(enc_frame, TRUE);
+    gtk_box_append(GTK_BOX(page), enc_frame);
+    ctx->sidecar_encoder_label = GTK_LABEL(gtk_label_new(""));
+    gtk_label_set_xalign(ctx->sidecar_encoder_label, 0.0);
+    gtk_label_set_wrap(ctx->sidecar_encoder_label, TRUE);
+    gtk_label_set_selectable(ctx->sidecar_encoder_label, TRUE);
+    gtk_widget_add_css_class(GTK_WIDGET(ctx->sidecar_encoder_label), "uv-source-detail");
+    gtk_widget_set_margin_top(GTK_WIDGET(ctx->sidecar_encoder_label), 6);
+    gtk_widget_set_margin_bottom(GTK_WIDGET(ctx->sidecar_encoder_label), 6);
+    gtk_widget_set_margin_start(GTK_WIDGET(ctx->sidecar_encoder_label), 8);
+    gtk_widget_set_margin_end(GTK_WIDGET(ctx->sidecar_encoder_label), 8);
+    gtk_frame_set_child(GTK_FRAME(enc_frame), GTK_WIDGET(ctx->sidecar_encoder_label));
+
+    /* Counters frame. */
+    GtkWidget *counters_frame = gtk_frame_new("Lifetime counters");
+    gtk_widget_set_hexpand(counters_frame, TRUE);
+    gtk_box_append(GTK_BOX(page), counters_frame);
+    ctx->sidecar_counters_label = GTK_LABEL(gtk_label_new(""));
+    gtk_label_set_xalign(ctx->sidecar_counters_label, 0.0);
+    gtk_label_set_wrap(ctx->sidecar_counters_label, TRUE);
+    gtk_label_set_selectable(ctx->sidecar_counters_label, TRUE);
+    gtk_widget_add_css_class(GTK_WIDGET(ctx->sidecar_counters_label), "uv-source-detail");
+    gtk_widget_set_margin_top(GTK_WIDGET(ctx->sidecar_counters_label), 6);
+    gtk_widget_set_margin_bottom(GTK_WIDGET(ctx->sidecar_counters_label), 6);
+    gtk_widget_set_margin_start(GTK_WIDGET(ctx->sidecar_counters_label), 8);
+    gtk_widget_set_margin_end(GTK_WIDGET(ctx->sidecar_counters_label), 8);
+    gtk_frame_set_child(GTK_FRAME(counters_frame), GTK_WIDGET(ctx->sidecar_counters_label));
+
+    /* Encoder transport queue frame. */
+    GtkWidget *trans_frame = gtk_frame_new("Encoder transport queue");
+    gtk_widget_set_hexpand(trans_frame, TRUE);
+    gtk_widget_set_tooltip_text(trans_frame,
+                                "Optional encoder-side queue snapshot. Only some waybeam_venc "
+                                "transports emit this trailer.");
+    gtk_box_append(GTK_BOX(page), trans_frame);
+    ctx->sidecar_transport_label = GTK_LABEL(gtk_label_new(""));
+    gtk_label_set_xalign(ctx->sidecar_transport_label, 0.0);
+    gtk_label_set_wrap(ctx->sidecar_transport_label, TRUE);
+    gtk_label_set_selectable(ctx->sidecar_transport_label, TRUE);
+    gtk_widget_add_css_class(GTK_WIDGET(ctx->sidecar_transport_label), "uv-source-detail");
+    gtk_widget_set_margin_top(GTK_WIDGET(ctx->sidecar_transport_label), 6);
+    gtk_widget_set_margin_bottom(GTK_WIDGET(ctx->sidecar_transport_label), 6);
+    gtk_widget_set_margin_start(GTK_WIDGET(ctx->sidecar_transport_label), 8);
+    gtk_widget_set_margin_end(GTK_WIDGET(ctx->sidecar_transport_label), 8);
+    gtk_frame_set_child(GTK_FRAME(trans_frame), GTK_WIDGET(ctx->sidecar_transport_label));
+
+    /* Prime widget state from the current config. */
+    if (ctx->sidecar_port_spin) {
+        guint port = ctx->current_cfg.sidecar_port ? ctx->current_cfg.sidecar_port : 5602;
+        gtk_spin_button_set_value(ctx->sidecar_port_spin, port);
+    }
+    if (ctx->sidecar_enable_toggle) {
+        ctx->sidecar_toggle_suppress = TRUE;
+        gtk_toggle_button_set_active(ctx->sidecar_enable_toggle, ctx->current_cfg.sidecar_enabled);
+        ctx->sidecar_toggle_suppress = FALSE;
+        update_sidecar_toggle_label(ctx, ctx->current_cfg.sidecar_enabled);
     }
 
     return page;
@@ -2994,6 +4114,11 @@ static GtkWidget *build_frame_block_page(GuiContext *ctx) {
     GtkWidget *distribution_stats = gtk_label_new(default_stats);
     gtk_label_set_xalign(GTK_LABEL(distribution_stats), 1.0);
     gtk_widget_set_hexpand(distribution_stats, TRUE);
+    gtk_label_set_single_line_mode(GTK_LABEL(distribution_stats), TRUE);
+    gtk_label_set_width_chars(GTK_LABEL(distribution_stats), 56);
+    gtk_label_set_max_width_chars(GTK_LABEL(distribution_stats), 56);
+    gtk_label_set_ellipsize(GTK_LABEL(distribution_stats), PANGO_ELLIPSIZE_END);
+    gtk_widget_add_css_class(distribution_stats, "numeric");
     gtk_box_append(GTK_BOX(distribution_label_box), distribution_stats);
 
     gtk_frame_set_label_widget(GTK_FRAME(distribution_frame), distribution_label_box);
@@ -3021,11 +4146,19 @@ static GtkWidget *build_frame_block_page(GuiContext *ctx) {
     GtkWidget *lateness_live = gtk_label_new("Live: --");
     gtk_label_set_xalign(GTK_LABEL(lateness_live), 1.0);
     gtk_widget_set_valign(lateness_live, GTK_ALIGN_CENTER);
+    gtk_label_set_single_line_mode(GTK_LABEL(lateness_live), TRUE);
+    gtk_label_set_width_chars(GTK_LABEL(lateness_live), 18);
+    gtk_label_set_max_width_chars(GTK_LABEL(lateness_live), 18);
+    gtk_widget_add_css_class(lateness_live, "numeric");
     gtk_box_append(GTK_BOX(lateness_label_box), lateness_live);
 
     GtkWidget *lateness_max = gtk_label_new("Max: --");
     gtk_label_set_xalign(GTK_LABEL(lateness_max), 1.0);
     gtk_widget_set_valign(lateness_max, GTK_ALIGN_CENTER);
+    gtk_label_set_single_line_mode(GTK_LABEL(lateness_max), TRUE);
+    gtk_label_set_width_chars(GTK_LABEL(lateness_max), 18);
+    gtk_label_set_max_width_chars(GTK_LABEL(lateness_max), 18);
+    gtk_widget_add_css_class(lateness_max, "numeric");
     gtk_box_append(GTK_BOX(lateness_label_box), lateness_max);
 
     gtk_frame_set_label_widget(GTK_FRAME(lateness_frame), lateness_label_box);
@@ -3057,11 +4190,19 @@ static GtkWidget *build_frame_block_page(GuiContext *ctx) {
     GtkWidget *size_live = gtk_label_new("Live: --");
     gtk_label_set_xalign(GTK_LABEL(size_live), 1.0);
     gtk_widget_set_valign(size_live, GTK_ALIGN_CENTER);
+    gtk_label_set_single_line_mode(GTK_LABEL(size_live), TRUE);
+    gtk_label_set_width_chars(GTK_LABEL(size_live), 18);
+    gtk_label_set_max_width_chars(GTK_LABEL(size_live), 18);
+    gtk_widget_add_css_class(size_live, "numeric");
     gtk_box_append(GTK_BOX(size_label_box), size_live);
 
     GtkWidget *size_max = gtk_label_new("Max: --");
     gtk_label_set_xalign(GTK_LABEL(size_max), 1.0);
     gtk_widget_set_valign(size_max, GTK_ALIGN_CENTER);
+    gtk_label_set_single_line_mode(GTK_LABEL(size_max), TRUE);
+    gtk_label_set_width_chars(GTK_LABEL(size_max), 18);
+    gtk_label_set_max_width_chars(GTK_LABEL(size_max), 18);
+    gtk_widget_add_css_class(size_max, "numeric");
     gtk_box_append(GTK_BOX(size_label_box), size_max);
 
     gtk_frame_set_label_widget(GTK_FRAME(size_frame), size_label_box);
@@ -3115,12 +4256,14 @@ static void stats_range_changed(GObject *dropdown, GParamSpec *pspec, gpointer u
     guint selected = gtk_drop_down_get_selected(GTK_DROP_DOWN(dropdown));
     double seconds = 300.0;
     switch (selected) {
-        case 0: seconds = 60.0; break;
-        case 1: seconds = 300.0; break;
-        case 2: seconds = 600.0; break;
+        case 0: seconds = 30.0; break;
+        case 1: seconds = 60.0; break;
+        case 2: seconds = 300.0; break;
+        case 3: seconds = 600.0; break;
         default: break;
     }
     ctx->stats_range_seconds = seconds;
+    update_stats_metric_labels(ctx);
     for (int i = 0; i < STATS_METRIC_COUNT; i++) {
         if (ctx->stats_charts[i]) {
             gtk_widget_queue_draw(GTK_WIDGET(ctx->stats_charts[i]));
@@ -3135,11 +4278,6 @@ static void stats_chart_draw(GtkDrawingArea *area, cairo_t *cr, int width, int h
     if (metric_val < 0 || metric_val >= STATS_METRIC_COUNT) return;
     StatsMetric metric = (StatsMetric)metric_val;
 
-    GtkLabel *live_value_label = GTK_LABEL(g_object_get_data(G_OBJECT(area), "stats-live-label"));
-    GtkLabel *max_value_label = GTK_LABEL(g_object_get_data(G_OBJECT(area), "stats-max-label"));
-    const char *default_live = "Live: --";
-    const char *default_max = "Max: --";
-
     cairo_save(cr);
     cairo_set_source_rgb(cr, 0.10, 0.10, 0.12);
     cairo_paint(cr);
@@ -3149,8 +4287,6 @@ static void stats_chart_draw(GtkDrawingArea *area, cairo_t *cr, int width, int h
     cairo_stroke(cr);
 
     if (!ctx->stats_history || ctx->stats_history->len == 0) {
-        if (live_value_label) gtk_label_set_text(live_value_label, default_live);
-        if (max_value_label) gtk_label_set_text(max_value_label, default_max);
         cairo_set_source_rgb(cr, 0.7, 0.7, 0.7);
         cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
         cairo_set_font_size(cr, 12.0);
@@ -3174,18 +4310,18 @@ static void stats_chart_draw(GtkDrawingArea *area, cairo_t *cr, int width, int h
         start_index = len > 0 ? len - 1 : 0;
     }
 
-    double min_val = G_MAXDOUBLE;
     double max_val = -G_MAXDOUBLE;
+    double sum_val = 0.0;
+    guint  sum_count = 0;
     for (guint i = start_index; i < len; i++) {
         double v = stats_metric_value(&samples[i], metric);
         if (!isfinite(v)) continue;
-        if (v < min_val) min_val = v;
         if (v > max_val) max_val = v;
+        sum_val += v;
+        sum_count++;
     }
 
-    if (min_val == G_MAXDOUBLE || max_val == -G_MAXDOUBLE) {
-        if (live_value_label) gtk_label_set_text(live_value_label, default_live);
-        if (max_value_label) gtk_label_set_text(max_value_label, default_max);
+    if (max_val == -G_MAXDOUBLE) {
         cairo_set_source_rgb(cr, 0.7, 0.7, 0.7);
         cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
         cairo_set_font_size(cr, 12.0);
@@ -3196,19 +4332,12 @@ static void stats_chart_draw(GtkDrawingArea *area, cairo_t *cr, int width, int h
     }
 
     double axis_min = 0.0;
-    double axis_max = max_val;
-    if (!isfinite(axis_max) || axis_max < axis_min) {
-        axis_max = axis_min;
-    }
-    if (axis_max == axis_min) {
-        double delta = axis_max > 1.0 ? axis_max * 0.05 : 1.0;
-        axis_max += delta;
-    }
+    double axis_max = nice_axis_max(max_val > 0.0 ? max_val : 1.0);
 
     const double left_margin = 64.0;
     const double right_margin = 12.0;
     const double top_margin = 12.0;
-    const double bottom_margin = 24.0;
+    const double bottom_margin = 28.0;
     double plot_width = MAX(1.0, width - (left_margin + right_margin));
     double plot_height = MAX(1.0, height - (top_margin + bottom_margin));
     double plot_left = left_margin;
@@ -3235,10 +4364,11 @@ static void stats_chart_draw(GtkDrawingArea *area, cairo_t *cr, int width, int h
 
         char label[64];
         if (metric == STATS_METRIC_RATE) {
-            double value_mbps = value / 1e6;
-            g_snprintf(label, sizeof(label), "%.2f", value_mbps);
+            g_snprintf(label, sizeof(label), "%.1f", value / 1e6);
+        } else if (axis_max >= 100.0) {
+            g_snprintf(label, sizeof(label), "%.0f", value);
         } else {
-            g_snprintf(label, sizeof(label), "%.2f", value);
+            g_snprintf(label, sizeof(label), "%.1f", value);
         }
 
         cairo_text_extents_t label_extents;
@@ -3249,6 +4379,52 @@ static void stats_chart_draw(GtkDrawingArea *area, cairo_t *cr, int width, int h
         cairo_show_text(cr, label);
     }
 
+    /* X-axis time labels: rightmost is "now", others step back in seconds.
+     * Using fixed labels (not relative to the latest sample) keeps the
+     * positions stable across redraws. */
+    cairo_set_source_rgba(cr, 0.7, 0.7, 0.75, 0.85);
+    cairo_set_font_size(cr, 10.0);
+    const int x_tick_count = 4;
+    for (int i = 0; i <= x_tick_count; i++) {
+        double fraction = (double)i / (double)x_tick_count;
+        double x = plot_left + fraction * plot_width;
+        double secs_ago = range * (1.0 - fraction);
+        char tlabel[24];
+        if (secs_ago < 1.0) {
+            g_strlcpy(tlabel, "now", sizeof(tlabel));
+        } else if (secs_ago >= 60.0) {
+            g_snprintf(tlabel, sizeof(tlabel), "-%.0fm", secs_ago / 60.0);
+        } else {
+            g_snprintf(tlabel, sizeof(tlabel), "-%.0fs", secs_ago);
+        }
+        cairo_text_extents_t te;
+        cairo_text_extents(cr, tlabel, &te);
+        double tx = x - te.width * 0.5 - te.x_bearing;
+        if (tx < plot_left) tx = plot_left;
+        if (tx + te.width > plot_right) tx = plot_right - te.width;
+        cairo_move_to(cr, tx, plot_bottom + 14.0);
+        cairo_show_text(cr, tlabel);
+    }
+
+    /* Average line — faint, dashed. */
+    if (sum_count > 1) {
+        double avg = sum_val / (double)sum_count;
+        double y_ratio = (avg - axis_min) / (axis_max - axis_min);
+        if (y_ratio >= 0.0 && y_ratio <= 1.0) {
+            double y = plot_bottom - y_ratio * plot_height;
+            cairo_save(cr);
+            double dashes[] = {3.0, 4.0};
+            cairo_set_dash(cr, dashes, 2, 0);
+            cairo_set_line_width(cr, 1.0);
+            cairo_set_source_rgba(cr, 1.0, 0.85, 0.4, 0.6);
+            cairo_move_to(cr, plot_left, y);
+            cairo_line_to(cr, plot_right, y);
+            cairo_stroke(cr);
+            cairo_restore(cr);
+        }
+    }
+
+    /* Data path. */
     cairo_set_source_rgb(cr, 0.3, 0.7, 1.0);
     cairo_set_line_width(cr, 1.5);
     gboolean path_started = FALSE;
@@ -3259,12 +4435,10 @@ static void stats_chart_draw(GtkDrawingArea *area, cairo_t *cr, int width, int h
         if (x_ratio > 1.0) x_ratio = 1.0;
         double x = plot_left + x_ratio * plot_width;
         double value = stats_metric_value(sample, metric);
+        if (!isfinite(value)) { path_started = FALSE; continue; }
         double y_ratio = (value - axis_min) / (axis_max - axis_min);
-        if (y_ratio < 0.0) {
-            y_ratio = 0.0;
-        } else if (y_ratio > 1.0) {
-            y_ratio = 1.0;
-        }
+        if (y_ratio < 0.0) y_ratio = 0.0;
+        if (y_ratio > 1.0) y_ratio = 1.0;
         double y = plot_bottom - y_ratio * plot_height;
         if (!path_started) {
             cairo_move_to(cr, x, y);
@@ -3275,53 +4449,58 @@ static void stats_chart_draw(GtkDrawingArea *area, cairo_t *cr, int width, int h
     }
     cairo_stroke(cr);
 
-    double latest_value = NAN;
-    for (gint i = (gint)len - 1; i >= (gint)start_index; i--) {
-        double candidate = stats_metric_value(&samples[i], metric);
-        if (isfinite(candidate)) {
-            latest_value = candidate;
-            break;
-        }
-    }
-
-    if (!isfinite(latest_value)) {
-        if (live_value_label) {
-            gtk_label_set_text(live_value_label, default_live);
-        }
-    } else if (metric == STATS_METRIC_RATE) {
-        double latest_mbps = latest_value / 1e6;
-        char latest_text[64];
-        g_snprintf(latest_text, sizeof(latest_text), "Live: %.2f Mbps", latest_mbps);
-        if (live_value_label) gtk_label_set_text(live_value_label, latest_text);
-    } else {
-        char latest_text[64];
-        g_snprintf(latest_text, sizeof(latest_text), "Live: %.2f", latest_value);
-        if (live_value_label) gtk_label_set_text(live_value_label, latest_text);
-    }
-
-    if (isfinite(max_val)) {
-        char max_text[64];
-        if (metric == STATS_METRIC_RATE) {
-            double max_mbps = max_val / 1e6;
-            g_snprintf(max_text, sizeof(max_text), "Max: %.2f Mbps", max_mbps);
-        } else {
-            g_snprintf(max_text, sizeof(max_text), "Max: %.2f", max_val);
-        }
-        if (max_value_label) gtk_label_set_text(max_value_label, max_text);
-    } else {
-        if (max_value_label) gtk_label_set_text(max_value_label, default_max);
-    }
-
     cairo_restore(cr);
 }
 
+static gboolean accel_request_idr(GtkWidget *widget, GVariant *args, gpointer user_data) {
+    (void)widget;
+    (void)args;
+    on_idr_button_clicked(NULL, user_data);
+    return TRUE;
+}
+
+static gboolean accel_restart(GtkWidget *widget, GVariant *args, gpointer user_data) {
+    (void)widget;
+    (void)args;
+    on_refresh_button_clicked(NULL, user_data);
+    return TRUE;
+}
+
+static gboolean accel_next_source(GtkWidget *widget, GVariant *args, gpointer user_data) {
+    (void)widget;
+    (void)args;
+    on_next_button_clicked(NULL, user_data);
+    return TRUE;
+}
+
+static void install_window_accelerators(GuiContext *ctx, GtkWidget *window) {
+    GtkShortcutController *controller = GTK_SHORTCUT_CONTROLLER(gtk_shortcut_controller_new());
+    gtk_shortcut_controller_set_scope(controller, GTK_SHORTCUT_SCOPE_GLOBAL);
+
+    gtk_shortcut_controller_add_shortcut(controller,
+        gtk_shortcut_new(gtk_shortcut_trigger_parse_string("<Control>i"),
+                         gtk_callback_action_new(accel_request_idr, ctx, NULL)));
+    gtk_shortcut_controller_add_shortcut(controller,
+        gtk_shortcut_new(gtk_shortcut_trigger_parse_string("<Control>r"),
+                         gtk_callback_action_new(accel_restart, ctx, NULL)));
+    gtk_shortcut_controller_add_shortcut(controller,
+        gtk_shortcut_new(gtk_shortcut_trigger_parse_string("<Control>n"),
+                         gtk_callback_action_new(accel_next_source, ctx, NULL)));
+
+    gtk_widget_add_controller(window, GTK_EVENT_CONTROLLER(controller));
+}
+
 static void build_ui(GuiContext *ctx) {
+    install_app_css();
+
     GtkWidget *window = gtk_application_window_new(ctx->app);
     ctx->window = GTK_WINDOW(window);
     gtk_window_set_title(ctx->window, "UDP H.265 Viewer");
-    gtk_window_set_default_size(ctx->window, 900, 680);
+    gtk_window_set_default_size(ctx->window, 1080, 760);
     gtk_window_set_resizable(ctx->window, TRUE);
     g_signal_connect(window, "close-request", G_CALLBACK(on_window_close_request), ctx);
+
+    install_window_accelerators(ctx, window);
 
     ctx->notebook = GTK_NOTEBOOK(gtk_notebook_new());
     gtk_window_set_child(ctx->window, GTK_WIDGET(ctx->notebook));
@@ -3337,6 +4516,12 @@ static void build_ui(GuiContext *ctx) {
 
     GtkWidget *frame_page = build_frame_block_page(ctx);
     gtk_notebook_append_page(ctx->notebook, frame_page, gtk_label_new("Frame Blocks"));
+
+    GtkWidget *audio_page = build_audio_page(ctx);
+    gtk_notebook_append_page(ctx->notebook, audio_page, gtk_label_new("Audio"));
+
+    GtkWidget *sidecar_page = build_sidecar_page(ctx);
+    gtk_notebook_append_page(ctx->notebook, sidecar_page, gtk_label_new("Sidecar"));
 
     g_signal_connect(ctx->notebook, "switch-page", G_CALLBACK(on_notebook_switch_page), ctx);
 
@@ -3422,6 +4607,9 @@ static void on_app_shutdown(GApplication *app, gpointer user_data) {
     ctx->audio_toggle = NULL;
     ctx->audio_payload_spin = NULL;
     ctx->audio_jitter_spin = NULL;
+    ctx->audio_port_mode_dropdown = NULL;
+    ctx->audio_port_spin = NULL;
+    ctx->audio_status_label = NULL;
     ctx->jitter_drop_toggle = NULL;
     ctx->jitter_do_lost_toggle = NULL;
     ctx->jitter_post_drop_toggle = NULL;
@@ -3465,6 +4653,17 @@ static void on_app_shutdown(GApplication *app, gpointer user_data) {
     ctx->notebook = NULL;
     ctx->paintable_bound = FALSE;
     ctx->window = NULL;
+    ctx->idr_button = NULL;
+    ctx->idr_port_spin = NULL;
+    ctx->stats_pause_toggle = NULL;
+    ctx->stream_detail_label = NULL;
+    ctx->sidecar_enable_toggle = NULL;
+    ctx->sidecar_port_spin = NULL;
+    ctx->sidecar_status_label = NULL;
+    ctx->sidecar_frame_label = NULL;
+    ctx->sidecar_encoder_label = NULL;
+    ctx->sidecar_counters_label = NULL;
+    ctx->sidecar_transport_label = NULL;
 }
 
 int uv_gui_run(UvViewer **viewer, UvViewerConfig *cfg, const char *program_name) {

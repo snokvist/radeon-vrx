@@ -53,6 +53,21 @@ typedef struct {
 
     struct UvFrameBlockState *frame_block;
     uint64_t frame_block_accum_bytes;
+
+    /* HEVC stream composition counters (computed from RTP payload). */
+    uint64_t hevc_idr_count;
+    uint64_t hevc_cra_count;
+    uint64_t hevc_trail_count;
+    uint64_t hevc_vps_count;
+    uint64_t hevc_sps_count;
+    uint64_t hevc_pps_count;
+    uint64_t hevc_aud_count;
+    uint64_t hevc_sei_count;
+    uint64_t hevc_other_nal_count;
+    uint64_t rtp_ap_packets;
+    uint64_t rtp_fu_packets;
+    gint64   last_keyframe_us;   /* g_get_monotonic_time of most recent IDR/CRA */
+    gint64   prev_keyframe_us;   /* one before that, for interval calculation */
 } UvRelaySource;
 
 typedef struct {
@@ -66,6 +81,7 @@ typedef struct {
     int selected_index;
 
     GstAppSrc *appsrc;
+    GstAppSrc *audio_appsrc; /* optional, used for shared-port audio demux */
 
     struct {
         gboolean enabled;
@@ -83,6 +99,62 @@ typedef struct {
     GMutex lock;
     struct _UvViewer *viewer;
 } RelayController;
+
+#define UV_SIDECAR_AVG_WINDOW 64u
+
+typedef struct {
+    int fd;                          /* UDP socket (-1 = closed) */
+    guint16 local_port;              /* bound port (0 = unknown) */
+    GThread *thread;
+    volatile sig_atomic_t running;
+
+    GMutex lock;
+
+    gboolean enabled;                /* config snapshot */
+    guint16 encoder_port;            /* config: encoder's sidecar UDP port */
+
+    char target_addr[UV_VIEWER_ADDR_MAX]; /* current encoder IP (selected source) */
+    gboolean target_valid;
+
+    gint64 last_frame_us;
+    gint64 last_subscribe_us;        /* monotonic of last SUBSCRIBE we sent */
+
+    /* Accumulators. */
+    uint64_t frames_received;
+    uint64_t idr_inserted_count;
+    uint64_t scene_change_count;
+    uint64_t keyframes_count;
+
+    /* Last frame snapshot. */
+    uint32_t last_ssrc;
+    uint64_t last_frame_id;
+    uint32_t last_rtp_timestamp;
+    uint16_t last_seq_count;
+    uint32_t last_frame_size_bytes;
+    uint8_t  last_frame_type;
+    uint8_t  last_qp;
+    uint8_t  last_complexity;
+    uint8_t  last_scene_change;
+    uint8_t  last_gop_state;
+    uint8_t  last_idr_inserted;
+    uint16_t last_frames_since_idr;
+
+    /* Sliding window for averages. */
+    uint8_t  qp_window[UV_SIDECAR_AVG_WINDOW];
+    uint8_t  cx_window[UV_SIDECAR_AVG_WINDOW];
+    guint    window_head;
+    guint    window_count;
+
+    /* Latest transport trailer (if seen). */
+    gboolean transport_info_seen;
+    uint8_t  encoder_fill_pct;
+    uint8_t  encoder_in_pressure;
+    uint32_t encoder_transport_drops;
+    uint32_t encoder_pressure_drops;
+    uint32_t encoder_packets_sent;
+
+    struct _UvViewer *viewer;
+} SidecarController;
 
 typedef struct {
     guint64 frames_total;
@@ -126,6 +198,8 @@ typedef struct {
     guint audio_payload_type;
     guint audio_clock_rate;
     guint audio_jitter_latency_ms;
+    gboolean audio_use_separate_port;
+    guint audio_listen_port;
 
     struct _UvViewer *viewer;
 
@@ -150,11 +224,14 @@ typedef struct {
 
     GstElement *queue_audio_in;
     GstElement *capsfilter_rtp_audio;
+    GstElement *audio_udpsrc;            /* used when audio_use_separate_port */
+    GstElement *audio_appsrc_element;    /* used when sharing the video UDP port */
     GstElement *audio_jitter;
     GstElement *audio_depay;
     GstElement *audio_decoder;
     GstElement *audio_convert;
     GstElement *audio_resample;
+    GstElement *audio_queue_sink; /* downstream leaky queue, drops stale audio */
     GstElement *audio_sink;
 
     GThread *loop_thread;
@@ -182,6 +259,7 @@ struct _UvViewer {
     PipelineController pipeline;
     DecoderStats decoder;
     QoSDatabase qos;
+    SidecarController sidecar;
 
     GMutex state_lock;
     gboolean started;
@@ -210,6 +288,7 @@ gboolean relay_controller_select_next(RelayController *rc, GError **error);
 int      relay_controller_selected(const RelayController *rc);
 void     relay_controller_snapshot(RelayController *rc, UvViewerStats *stats, int clock_rate);
 void     relay_controller_set_appsrc(RelayController *rc, GstAppSrc *appsrc);
+void     relay_controller_set_audio_appsrc(RelayController *rc, GstAppSrc *audio_appsrc);
 void     relay_controller_set_push_enabled(RelayController *rc, gboolean enabled);
 void     relay_controller_frame_block_configure(RelayController *rc, gboolean enabled, gboolean snapshot_mode);
 void     relay_controller_frame_block_pause(RelayController *rc, gboolean paused);
@@ -224,11 +303,21 @@ void     relay_controller_frame_block_set_size_thresholds(RelayController *rc,
                                                           double yellow_kb,
                                                           double orange_kb);
 
+gboolean sidecar_controller_init(SidecarController *sc, struct _UvViewer *viewer);
+void     sidecar_controller_deinit(SidecarController *sc);
+gboolean sidecar_controller_start(SidecarController *sc);
+void     sidecar_controller_stop(SidecarController *sc);
+void     sidecar_controller_snapshot(SidecarController *sc, UvViewerStats *stats);
+void     sidecar_controller_set_target(SidecarController *sc, const char *address);
+
+gboolean relay_controller_get_selected_address(RelayController *rc, char *out, size_t outlen);
+
 gboolean pipeline_controller_init(PipelineController *pc, struct _UvViewer *viewer, GError **error);
 void     pipeline_controller_deinit(PipelineController *pc);
 gboolean pipeline_controller_start(PipelineController *pc, GError **error);
 void     pipeline_controller_stop(PipelineController *pc);
 GstAppSrc *pipeline_controller_get_appsrc(PipelineController *pc);
+GstAppSrc *pipeline_controller_get_audio_appsrc(PipelineController *pc);
 void     pipeline_controller_snapshot(PipelineController *pc, UvViewerStats *stats);
 gboolean pipeline_controller_update(PipelineController *pc, const UvPipelineOverrides *overrides, GError **error);
 GstElement *pipeline_controller_get_sink(PipelineController *pc);

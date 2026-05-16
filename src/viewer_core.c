@@ -31,9 +31,14 @@ void uv_viewer_config_init(UvViewerConfig *cfg) {
     cfg->audio_enabled = FALSE;
     cfg->audio_payload_type = 98;
     cfg->audio_clock_rate = 48000;
-    cfg->audio_jitter_latency_ms = 8;
+    cfg->audio_jitter_latency_ms = 40;
+    cfg->audio_use_separate_port = FALSE;
+    cfg->audio_listen_port = 5601;
     cfg->decoder_preference = UV_DECODER_AUTO;
     cfg->video_sink_preference = UV_VIDEO_SINK_AUTO;
+    cfg->idr_http_port = 80;
+    cfg->sidecar_enabled = FALSE;
+    cfg->sidecar_port = 5602;
 }
 
 UvViewer *uv_viewer_new(const UvViewerConfig *cfg) {
@@ -53,12 +58,14 @@ UvViewer *uv_viewer_new(const UvViewerConfig *cfg) {
         g_free(viewer);
         return NULL;
     }
+    sidecar_controller_init(&viewer->sidecar, viewer);
     return viewer;
 }
 
 void uv_viewer_free(UvViewer *viewer) {
     if (!viewer) return;
     uv_viewer_stop(viewer);
+    sidecar_controller_deinit(&viewer->sidecar);
     relay_controller_deinit(&viewer->relay);
     pipeline_controller_deinit(&viewer->pipeline);
     uv_internal_qos_db_clear(&viewer->qos);
@@ -83,12 +90,16 @@ bool uv_viewer_start(UvViewer *viewer, GError **error) {
 
     if (!pipeline_controller_start(&viewer->pipeline, error)) return FALSE;
     relay_controller_set_appsrc(&viewer->relay, pipeline_controller_get_appsrc(&viewer->pipeline));
+    relay_controller_set_audio_appsrc(&viewer->relay,
+                                      pipeline_controller_get_audio_appsrc(&viewer->pipeline));
     if (!relay_controller_start(&viewer->relay)) {
         pipeline_controller_stop(&viewer->pipeline);
         g_set_error(error, g_quark_from_static_string("uv-viewer"), 100,
                     "Failed to start relay thread");
         return FALSE;
     }
+
+    sidecar_controller_start(&viewer->sidecar);
 
     g_mutex_lock(&viewer->state_lock);
     viewer->started = TRUE;
@@ -106,6 +117,7 @@ void uv_viewer_stop(UvViewer *viewer) {
     viewer->started = FALSE;
     g_mutex_unlock(&viewer->state_lock);
 
+    sidecar_controller_stop(&viewer->sidecar);
     relay_controller_stop(&viewer->relay);
     pipeline_controller_stop(&viewer->pipeline);
 }
@@ -127,6 +139,7 @@ bool uv_viewer_restart_pipeline(UvViewer *viewer, GError **error) {
      * guarantees no concurrent access for the rest of the rebuild. */
     relay_controller_stop(&viewer->relay);
     relay_controller_set_appsrc(&viewer->relay, NULL);
+    relay_controller_set_audio_appsrc(&viewer->relay, NULL);
 
     /* Tear the pipeline all the way down so build_pipeline runs again. */
     pipeline_controller_deinit(&viewer->pipeline);
@@ -155,6 +168,8 @@ bool uv_viewer_restart_pipeline(UvViewer *viewer, GError **error) {
     }
 
     relay_controller_set_appsrc(&viewer->relay, pipeline_controller_get_appsrc(&viewer->pipeline));
+    relay_controller_set_audio_appsrc(&viewer->relay,
+                                      pipeline_controller_get_audio_appsrc(&viewer->pipeline));
     if (!relay_controller_start(&viewer->relay)) {
         g_set_error(error, g_quark_from_static_string("uv-viewer"), 100,
                     "Failed to restart relay thread");
@@ -193,6 +208,22 @@ int uv_viewer_get_selected_source(const UvViewer *viewer) {
 bool uv_viewer_update_pipeline(UvViewer *viewer, const UvPipelineOverrides *overrides, GError **error) {
     if (!viewer) return FALSE;
     return pipeline_controller_update(&viewer->pipeline, overrides, error);
+}
+
+void uv_viewer_set_sidecar_enabled(UvViewer *viewer, bool enabled, guint port) {
+    if (!viewer) return;
+    gboolean was = viewer->config.sidecar_enabled;
+    guint old_port = viewer->config.sidecar_port;
+    if (port > 0 && port <= 65535) viewer->config.sidecar_port = port;
+    viewer->config.sidecar_enabled = enabled ? TRUE : FALSE;
+
+    gboolean port_changed = (port > 0 && port != old_port);
+    if (was && (!enabled || port_changed)) {
+        sidecar_controller_stop(&viewer->sidecar);
+    }
+    if (enabled && (!was || port_changed)) {
+        sidecar_controller_start(&viewer->sidecar);
+    }
 }
 
 void uv_viewer_frame_block_configure(UvViewer *viewer, gboolean enabled, gboolean snapshot_mode) {
@@ -246,6 +277,8 @@ void uv_viewer_stats_init(UvViewerStats *stats) {
     stats->frame_block.frame_size_kb = g_array_new(FALSE, TRUE, sizeof(double));
     stats->frame_block.real_frames = 0;
     stats->frame_block.missing_frames = 0;
+    memset(&stats->sidecar, 0, sizeof(stats->sidecar));
+    stats->sidecar.seconds_since_last_frame = -1.0;
 }
 
 void uv_viewer_stats_clear(UvViewerStats *stats) {
@@ -283,6 +316,15 @@ bool uv_viewer_get_stats(UvViewer *viewer, UvViewerStats *stats) {
     relay_controller_snapshot(&viewer->relay, stats, viewer->config.clock_rate);
     pipeline_controller_snapshot(&viewer->pipeline, stats);
     uv_internal_qos_db_snapshot(&viewer->qos, stats);
+
+    /* Keep the sidecar pointed at whichever source the user is currently
+     * locked on. Cheaper than wiring an event into every selection path. */
+    if (viewer->config.sidecar_enabled) {
+        char sel[UV_VIEWER_ADDR_MAX] = {0};
+        gboolean have = relay_controller_get_selected_address(&viewer->relay, sel, sizeof(sel));
+        sidecar_controller_set_target(&viewer->sidecar, have ? sel : NULL);
+    }
+    sidecar_controller_snapshot(&viewer->sidecar, stats);
     return TRUE;
 }
 
