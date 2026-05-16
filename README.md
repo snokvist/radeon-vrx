@@ -13,6 +13,7 @@ The UDP H.265 Viewer (`udp-h265-viewer`) is a GTK 4 desktop application built ar
 - Detailed stats panes: per-source counters, pipeline QoS, decoder FPS, queue depth, and frame block analysis snapshots.
 - Request a fresh IDR keyframe from the currently locked source with a single click (or `Ctrl+I`) — useful to recover after a freeze or after joining mid-stream. Targets the encoder's `/request/idr` HTTP endpoint (compatible with [OpenIPC waybeam_venc](https://github.com/OpenIPC/waybeam_venc)).
 - **HEVC stream composition counters** parsed live from the RTP payload (RFC 7798): IDR/CRA/trailing-slice/VPS/SPS/PPS/AUD/SEI counts, RFC 7798 aggregation (AP) and fragmentation (FU) packet counts, fragmentation percentage, time since the most recent keyframe, and the gap between the two most recent keyframes. Surfaces intra-refresh / GDR streams as "long time since keyframe" with steady bitrate.
+- **Optional encoder-side telemetry** via the waybeam_venc RTP sidecar protocol (`--sidecar`, default UDP 5602). Subscribes to the locked source's sidecar channel and surfaces per-frame ground-truth metrics that the receiver can't infer from the RTP stream alone: frame type (P/I/IDR), QP, scene-complexity (0-255), scene-change flag, GOP state, IDR-insertion events, frames-since-IDR, plus the encoder-side transport queue fill / backpressure flag / drop counters when the encoder also emits the transport trailer.
 - Keyboard shortcuts for the most common actions: `Ctrl+I` request IDR, `Ctrl+R` restart pipeline, `Ctrl+N` select next source.
 - Headless resilience: if no display sink is available the pipeline falls back to `fakesink` so you can still capture diagnostics.
 
@@ -97,6 +98,8 @@ gst-launch-1.0 videotestsrc ! video/x-raw,framerate=30/1 ! x265enc tune=zerolate
 | `--audio-jitter ms` | `8` | Latency window (milliseconds) for the audio jitter buffer. |
 | `--decoder auto|intel|nvidia|vaapi|software` | `auto` | Choose the preferred decoder backend. |
 | `--idr-port N` | `80` | TCP port used by the GUI's "Request IDR" button (and `Ctrl+I`) to reach the encoder's `/request/idr` endpoint on the currently locked source's IP. |
+| `--sidecar` / `--no-sidecar` | `--no-sidecar` | Subscribe to the encoder's RTP sidecar telemetry channel for per-frame QP, complexity, scene-change, and IDR-insertion data. |
+| `--sidecar-port N` | `5602` | UDP port on the encoder side that hosts the sidecar listener. |
 | `--help` / `-h` | — | Print usage information and exit. |
 
 ## Using the GUI

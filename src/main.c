@@ -10,7 +10,7 @@ static void print_usage(const char *argv0) {
                " [--audio] [--no-audio] [--audio-payload PT] [--audio-clockrate Hz]"
                " [--audio-jitter ms] [--decoder auto|intel|nvidia|vaapi|software]"
                " [--video-sink auto|gtk4|wayland|gl|xv|autovideo|fakesink]"
-               " [--idr-port N]\n",
+               " [--idr-port N] [--sidecar] [--no-sidecar] [--sidecar-port N]\n",
                argv0);
 }
 
@@ -160,6 +160,17 @@ static gboolean parse_args(int argc, char **argv, UvViewerConfig *cfg) {
                 return FALSE;
             }
             cfg->idr_http_port = (guint)port;
+        } else if (!strcmp(argv[i], "--sidecar")) {
+            cfg->sidecar_enabled = TRUE;
+        } else if (!strcmp(argv[i], "--no-sidecar")) {
+            cfg->sidecar_enabled = FALSE;
+        } else if (!strcmp(argv[i], "--sidecar-port") && i + 1 < argc) {
+            int port = atoi(argv[++i]);
+            if (port < 1 || port > 65535) {
+                g_printerr("Invalid sidecar port: %s\n", argv[i]);
+                return FALSE;
+            }
+            cfg->sidecar_port = (guint)port;
         } else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
             print_usage(argv[0]);
             return FALSE;

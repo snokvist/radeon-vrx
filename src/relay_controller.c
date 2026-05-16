@@ -229,6 +229,20 @@ static void addr_to_str(const struct sockaddr_in *sa, char *out, size_t outlen) 
     g_strlcpy(out, ip, outlen);
 }
 
+gboolean relay_controller_get_selected_address(RelayController *rc, char *out, size_t outlen) {
+    if (!rc || !out || outlen == 0) return FALSE;
+    gboolean found = FALSE;
+    g_mutex_lock(&rc->lock);
+    int idx = rc->selected_index;
+    if (idx >= 0 && idx < (int)rc->sources_count && rc->sources[idx].in_use) {
+        addr_to_str(&rc->sources[idx].addr, out, outlen);
+        found = TRUE;
+    }
+    g_mutex_unlock(&rc->lock);
+    if (!found && outlen > 0) out[0] = '\0';
+    return found;
+}
+
 static void relay_source_clear_stats(UvRelaySource *src, gboolean reset_totals) {
     if (!src) return;
     if (reset_totals) {

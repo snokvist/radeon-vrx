@@ -51,6 +51,8 @@ typedef struct {
     UvDecoderPreference decoder_preference;
     UvVideoSinkPreference video_sink_preference;
     guint idr_http_port; // TCP port for the encoder's /request/idr endpoint (default: 80)
+    gboolean sidecar_enabled; // subscribe to the encoder's RTP sidecar telemetry
+    guint sidecar_port;       // UDP port of the encoder's sidecar listener (default: 5602)
 } UvViewerConfig;
 
 typedef struct {
@@ -146,6 +148,57 @@ typedef struct {
     GArray *frame_size_kb; // double values for current snapshot (size width*height)
 } UvFrameBlockStats;
 
+/* Encoder-side telemetry received over the waybeam_venc RTP sidecar
+ * protocol (UDP). Subscribed when sidecar_enabled is TRUE and a source
+ * is locked; ground truth for things the receiver can only infer from
+ * the RTP stream (QP, scene complexity, IDR insertion decisions, etc.). */
+typedef enum {
+    UV_SIDECAR_FRAME_P = 0,
+    UV_SIDECAR_FRAME_I = 1,
+    UV_SIDECAR_FRAME_IDR = 2
+} UvSidecarFrameType;
+
+typedef struct {
+    gboolean enabled;            /* config: sidecar feature is on */
+    gboolean socket_bound;       /* probe socket is open */
+    gboolean subscribed;         /* a frame arrived within the last few seconds */
+    char target_address[UV_VIEWER_ADDR_MAX]; /* encoder IP we're talking to */
+    guint16 target_port;         /* encoder sidecar UDP port */
+    guint16 local_port;          /* probe-side ephemeral port */
+
+    uint64_t frames_received;
+    uint64_t idr_inserted_count;
+    uint64_t scene_change_count;
+    uint64_t keyframes_count;    /* frames flagged I or IDR */
+    double seconds_since_last_frame; /* -1 if none seen yet */
+
+    /* Most recent frame metadata (FRAME + optional ENC_INFO trailer). */
+    uint32_t last_ssrc;
+    uint64_t last_frame_id;
+    uint32_t last_rtp_timestamp;
+    uint16_t last_seq_count;
+    uint32_t last_frame_size_bytes;
+    uint8_t  last_frame_type;        /* UvSidecarFrameType */
+    uint8_t  last_qp;
+    uint8_t  last_complexity;        /* 0..255 */
+    uint8_t  last_scene_change;      /* 0/1 */
+    uint8_t  last_gop_state;
+    uint8_t  last_idr_inserted;      /* 0/1 */
+    uint16_t last_frames_since_idr;
+
+    /* Moving averages across most recent ~64 frames. */
+    double avg_qp;
+    double avg_complexity;
+
+    /* Optional transport-info trailer (encoder-side output queue). */
+    gboolean transport_info_seen;
+    uint8_t  encoder_fill_pct;        /* 0..100 */
+    uint8_t  encoder_in_pressure;     /* 0/1 backpressure latched */
+    uint32_t encoder_transport_drops; /* lifetime */
+    uint32_t encoder_pressure_drops;  /* lifetime */
+    uint32_t encoder_packets_sent;    /* lifetime */
+} UvSidecarStats;
+
 typedef struct {
     GArray *sources;      // UvSourceStats elements
     GArray *qos_entries;  // UvNamedQoSStats elements
@@ -156,6 +209,7 @@ typedef struct {
     UvQueueStats queue0;
     gboolean frame_block_valid;
     UvFrameBlockStats frame_block;
+    UvSidecarStats sidecar;
 } UvViewerStats;
 
 typedef struct {

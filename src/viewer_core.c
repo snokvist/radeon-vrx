@@ -35,6 +35,8 @@ void uv_viewer_config_init(UvViewerConfig *cfg) {
     cfg->decoder_preference = UV_DECODER_AUTO;
     cfg->video_sink_preference = UV_VIDEO_SINK_AUTO;
     cfg->idr_http_port = 80;
+    cfg->sidecar_enabled = FALSE;
+    cfg->sidecar_port = 5602;
 }
 
 UvViewer *uv_viewer_new(const UvViewerConfig *cfg) {
@@ -54,12 +56,14 @@ UvViewer *uv_viewer_new(const UvViewerConfig *cfg) {
         g_free(viewer);
         return NULL;
     }
+    sidecar_controller_init(&viewer->sidecar, viewer);
     return viewer;
 }
 
 void uv_viewer_free(UvViewer *viewer) {
     if (!viewer) return;
     uv_viewer_stop(viewer);
+    sidecar_controller_deinit(&viewer->sidecar);
     relay_controller_deinit(&viewer->relay);
     pipeline_controller_deinit(&viewer->pipeline);
     uv_internal_qos_db_clear(&viewer->qos);
@@ -91,6 +95,8 @@ bool uv_viewer_start(UvViewer *viewer, GError **error) {
         return FALSE;
     }
 
+    sidecar_controller_start(&viewer->sidecar);
+
     g_mutex_lock(&viewer->state_lock);
     viewer->started = TRUE;
     g_mutex_unlock(&viewer->state_lock);
@@ -107,6 +113,7 @@ void uv_viewer_stop(UvViewer *viewer) {
     viewer->started = FALSE;
     g_mutex_unlock(&viewer->state_lock);
 
+    sidecar_controller_stop(&viewer->sidecar);
     relay_controller_stop(&viewer->relay);
     pipeline_controller_stop(&viewer->pipeline);
 }
@@ -247,6 +254,8 @@ void uv_viewer_stats_init(UvViewerStats *stats) {
     stats->frame_block.frame_size_kb = g_array_new(FALSE, TRUE, sizeof(double));
     stats->frame_block.real_frames = 0;
     stats->frame_block.missing_frames = 0;
+    memset(&stats->sidecar, 0, sizeof(stats->sidecar));
+    stats->sidecar.seconds_since_last_frame = -1.0;
 }
 
 void uv_viewer_stats_clear(UvViewerStats *stats) {
@@ -284,6 +293,15 @@ bool uv_viewer_get_stats(UvViewer *viewer, UvViewerStats *stats) {
     relay_controller_snapshot(&viewer->relay, stats, viewer->config.clock_rate);
     pipeline_controller_snapshot(&viewer->pipeline, stats);
     uv_internal_qos_db_snapshot(&viewer->qos, stats);
+
+    /* Keep the sidecar pointed at whichever source the user is currently
+     * locked on. Cheaper than wiring an event into every selection path. */
+    if (viewer->config.sidecar_enabled) {
+        char sel[UV_VIEWER_ADDR_MAX] = {0};
+        gboolean have = relay_controller_get_selected_address(&viewer->relay, sel, sizeof(sel));
+        sidecar_controller_set_target(&viewer->sidecar, have ? sel : NULL);
+    }
+    sidecar_controller_snapshot(&viewer->sidecar, stats);
     return TRUE;
 }
 

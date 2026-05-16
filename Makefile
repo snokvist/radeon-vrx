@@ -22,6 +22,7 @@ SRCS := \
 	src/pipeline_builder.c \
 	src/stats.c \
 	src/logging.c \
+	src/sidecar.c \
 	src/gui_shell.c
 
 OBJS := $(SRCS:.c=.o)
