@@ -12,6 +12,7 @@ The UDP H.265 Viewer (`udp-h265-viewer`) is a GTK 4 desktop application built ar
 - Multiple decoder backends (auto, Intel VA-API, NVIDIA NVDEC, generic VA-API, software) that can be forced via CLI.
 - Detailed stats panes: per-source counters, pipeline QoS, decoder FPS, queue depth, and frame block analysis snapshots.
 - Request a fresh IDR keyframe from the currently locked source with a single click (or `Ctrl+I`) — useful to recover after a freeze or after joining mid-stream. Targets the encoder's `/request/idr` HTTP endpoint (compatible with [OpenIPC waybeam_venc](https://github.com/OpenIPC/waybeam_venc)).
+- **HEVC stream composition counters** parsed live from the RTP payload (RFC 7798): IDR/CRA/trailing-slice/VPS/SPS/PPS/AUD/SEI counts, RFC 7798 aggregation (AP) and fragmentation (FU) packet counts, fragmentation percentage, time since the most recent keyframe, and the gap between the two most recent keyframes. Surfaces intra-refresh / GDR streams as "long time since keyframe" with steady bitrate.
 - Keyboard shortcuts for the most common actions: `Ctrl+I` request IDR, `Ctrl+R` restart pipeline, `Ctrl+N` select next source.
 - Headless resilience: if no display sink is available the pipeline falls back to `fakesink` so you can still capture diagnostics.
 

@@ -70,6 +70,24 @@ typedef struct {
     double rtp_marker_fps;
     double rfc3550_jitter_ms;
     double seconds_since_last_seen;
+
+    /* HEVC NAL composition counts (since source first seen). Detected from
+     * the RTP payload header; works for waybeam_venc and any RFC 7798
+     * packetiser. Counts NAL *units* (one per FU-start, walks aggregation
+     * packets). */
+    uint64_t hevc_idr_count;        /* NAL 19 (IDR_W_RADL) + 20 (IDR_N_LP) */
+    uint64_t hevc_cra_count;        /* NAL 21 (clean random access) */
+    uint64_t hevc_trail_count;      /* NAL 0 (TRAIL_N) + 1 (TRAIL_R) */
+    uint64_t hevc_vps_count;        /* NAL 32 */
+    uint64_t hevc_sps_count;        /* NAL 33 */
+    uint64_t hevc_pps_count;        /* NAL 34 */
+    uint64_t hevc_aud_count;        /* NAL 35 access unit delimiter */
+    uint64_t hevc_sei_count;        /* NAL 39 prefix SEI + 40 suffix SEI */
+    uint64_t hevc_other_nal_count;
+    uint64_t rtp_ap_packets;        /* RFC 7798 aggregation packets (type 48) */
+    uint64_t rtp_fu_packets;        /* RFC 7798 fragmentation packets (type 49) */
+    double seconds_since_keyframe;  /* time since last IDR/CRA; -1 if none seen */
+    double last_keyframe_interval_seconds; /* gap between two most recent keyframes; -1 if unknown */
 } UvSourceStats;
 
 typedef struct {

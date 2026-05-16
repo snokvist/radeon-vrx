@@ -262,6 +262,19 @@ static void relay_source_clear_stats(UvRelaySource *src, gboolean reset_totals) 
         frame_block_state_reset(src->frame_block);
     }
     src->frame_block_accum_bytes = 0;
+    src->hevc_idr_count = 0;
+    src->hevc_cra_count = 0;
+    src->hevc_trail_count = 0;
+    src->hevc_vps_count = 0;
+    src->hevc_sps_count = 0;
+    src->hevc_pps_count = 0;
+    src->hevc_aud_count = 0;
+    src->hevc_sei_count = 0;
+    src->hevc_other_nal_count = 0;
+    src->rtp_ap_packets = 0;
+    src->rtp_fu_packets = 0;
+    src->last_keyframe_us = 0;
+    src->prev_keyframe_us = 0;
 }
 
 static bool relay_add_or_find(RelayController *rc, const struct sockaddr_in *from, socklen_t fromlen, int *out_idx) {
@@ -468,6 +481,80 @@ static void frame_block_process_packet(RelayController *rc,
     }
 }
 
+/* Bump the matching counter for an HEVC NAL unit type. NAL types 19/20/21
+ * also stamp the keyframe arrival time so the GUI can derive
+ * seconds-since-keyframe and the most-recent IDR interval. */
+static void hevc_count_nal_type(UvRelaySource *s, uint8_t nal_type, gint64 arrival_us) {
+    switch (nal_type) {
+        case 0:  case 1:   s->hevc_trail_count++; break;
+        case 19: case 20:
+            s->hevc_idr_count++;
+            s->prev_keyframe_us = s->last_keyframe_us;
+            s->last_keyframe_us = arrival_us;
+            break;
+        case 21:
+            s->hevc_cra_count++;
+            s->prev_keyframe_us = s->last_keyframe_us;
+            s->last_keyframe_us = arrival_us;
+            break;
+        case 32: s->hevc_vps_count++; break;
+        case 33: s->hevc_sps_count++; break;
+        case 34: s->hevc_pps_count++; break;
+        case 35: s->hevc_aud_count++; break;
+        case 39: case 40: s->hevc_sei_count++; break;
+        default: s->hevc_other_nal_count++; break;
+    }
+}
+
+/* Parse the HEVC payload of a single unique RTP packet (RFC 7798) and
+ * fold its NAL units into the per-source counters. Only called once per
+ * unique sequence number so duplicates / retransmits don't inflate the
+ * NAL totals. */
+static void hevc_parse_payload_stats(UvRelaySource *s,
+                                     const unsigned char *payload,
+                                     size_t payload_len,
+                                     gint64 arrival_us) {
+    if (payload_len < 2) return;
+    uint8_t b0 = payload[0];
+    uint8_t nal_type = (uint8_t)((b0 >> 1) & 0x3F);
+
+    if (nal_type == 49) {
+        /* Fragmentation Unit. Only the start fragment carries the real NAL
+         * type — middle / end fragments would otherwise double-count. */
+        s->rtp_fu_packets++;
+        if (payload_len < 3) return;
+        uint8_t fu = payload[2];
+        gboolean start = (fu & 0x80) != 0;
+        if (!start) return;
+        hevc_count_nal_type(s, (uint8_t)(fu & 0x3F), arrival_us);
+        return;
+    }
+
+    if (nal_type == 48) {
+        /* Aggregation Packet: 2-byte size prefix + NAL, repeated. */
+        s->rtp_ap_packets++;
+        size_t pos = 2; /* skip PayloadHdr */
+        while (pos + 2 <= payload_len) {
+            uint16_t nalu_size = (uint16_t)((payload[pos] << 8) | payload[pos + 1]);
+            pos += 2;
+            if (nalu_size < 2 || pos + nalu_size > payload_len) break;
+            uint8_t inner = (uint8_t)((payload[pos] >> 1) & 0x3F);
+            hevc_count_nal_type(s, inner, arrival_us);
+            pos += nalu_size;
+        }
+        return;
+    }
+
+    if (nal_type == 50) {
+        /* PACI: payload content information — rare. Count as other. */
+        s->hevc_other_nal_count++;
+        return;
+    }
+
+    /* Single NAL unit packet: nal_type IS the actual NAL type. */
+    hevc_count_nal_type(s, nal_type, arrival_us);
+}
+
 static inline void rtp_update_stats(RelayController *rc,
                                     UvRelaySource *s,
                                     const unsigned char *p,
@@ -514,6 +601,24 @@ static inline void rtp_update_stats(RelayController *rc,
     }
 
     gint64 arrival_us = g_get_monotonic_time();
+
+    if (unique_packet) {
+        /* Locate the start of the RTP payload: 12-byte fixed header plus
+         * 4 bytes per CSRC entry, plus a variable-length extension header
+         * if the X bit is set. Stays defensive in case the sender adds
+         * either. */
+        size_t hdr = 12u + 4u * (size_t)(p[0] & 0x0F);
+        if (len >= hdr && (p[0] & 0x10)) {
+            if (len < hdr + 4u) goto skip_nal_parse;
+            uint16_t ext_words = (uint16_t)((p[hdr + 2] << 8) | p[hdr + 3]);
+            hdr += 4u + 4u * (size_t)ext_words;
+        }
+        if (len > hdr + 1u) {
+            hevc_parse_payload_stats(s, p + hdr, len - hdr, arrival_us);
+        }
+    }
+skip_nal_parse:
+
     uint32_t arrival_ts = rtp_now_ts_from_us(clock_rate, arrival_us);
     uint32_t transit = arrival_ts - ts;
     if (!s->jitter_initialized) {
@@ -861,6 +966,30 @@ void relay_controller_snapshot(RelayController *rc, UvViewerStats *stats, int cl
         }
         src->prev_bytes = src->rx_bytes;
         src->prev_timestamp_us = now_us;
+
+        s.hevc_idr_count       = src->hevc_idr_count;
+        s.hevc_cra_count       = src->hevc_cra_count;
+        s.hevc_trail_count     = src->hevc_trail_count;
+        s.hevc_vps_count       = src->hevc_vps_count;
+        s.hevc_sps_count       = src->hevc_sps_count;
+        s.hevc_pps_count       = src->hevc_pps_count;
+        s.hevc_aud_count       = src->hevc_aud_count;
+        s.hevc_sei_count       = src->hevc_sei_count;
+        s.hevc_other_nal_count = src->hevc_other_nal_count;
+        s.rtp_ap_packets       = src->rtp_ap_packets;
+        s.rtp_fu_packets       = src->rtp_fu_packets;
+        if (src->last_keyframe_us > 0) {
+            s.seconds_since_keyframe = (double)(now_us - src->last_keyframe_us) / 1e6;
+        } else {
+            s.seconds_since_keyframe = -1.0;
+        }
+        if (src->last_keyframe_us > 0 && src->prev_keyframe_us > 0
+            && src->last_keyframe_us > src->prev_keyframe_us) {
+            s.last_keyframe_interval_seconds =
+                (double)(src->last_keyframe_us - src->prev_keyframe_us) / 1e6;
+        } else {
+            s.last_keyframe_interval_seconds = -1.0;
+        }
 
         g_array_append_val(stats->sources, s);
 

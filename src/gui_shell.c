@@ -134,6 +134,8 @@ typedef struct {
     GtkLabel *stats_source_label;
     GtkToggleButton *stats_pause_toggle;
     gboolean stats_paused;
+
+    GtkLabel *stream_detail_label;
 } GuiContext;
 
 typedef struct {
@@ -1930,6 +1932,9 @@ static void refresh_stats(GuiContext *ctx) {
         if (ctx->source_detail_label) {
             gtk_label_set_text(ctx->source_detail_label, "No sources discovered yet.");
         }
+        if (ctx->stream_detail_label) {
+            gtk_label_set_text(ctx->stream_detail_label, "");
+        }
         update_idr_button_sensitivity(ctx);
     } else {
         guint existing_items = 0;
@@ -2067,12 +2072,64 @@ static void refresh_stats(GuiContext *ctx) {
                 } else {
                     gtk_label_set_text(ctx->source_detail_label, detail);
                 }
+
+                if (ctx->stream_detail_label) {
+                    uint64_t kf_total = detail_source->hevc_idr_count + detail_source->hevc_cra_count;
+                    uint64_t total_pkts = detail_source->rtp_unique_packets;
+                    double frag_pct = (total_pkts > 0)
+                                    ? (100.0 * (double)detail_source->rtp_fu_packets / (double)total_pkts)
+                                    : 0.0;
+                    char kf_age_buf[24];
+                    if (detail_source->seconds_since_keyframe < 0.0) {
+                        g_strlcpy(kf_age_buf, "n/a", sizeof(kf_age_buf));
+                    } else if (detail_source->seconds_since_keyframe >= 60.0) {
+                        g_snprintf(kf_age_buf, sizeof(kf_age_buf), "%.0fm%.0fs",
+                                   floor(detail_source->seconds_since_keyframe / 60.0),
+                                   fmod(detail_source->seconds_since_keyframe, 60.0));
+                    } else {
+                        g_snprintf(kf_age_buf, sizeof(kf_age_buf), "%.1fs",
+                                   detail_source->seconds_since_keyframe);
+                    }
+                    char kf_gap_buf[24];
+                    if (detail_source->last_keyframe_interval_seconds < 0.0) {
+                        g_strlcpy(kf_gap_buf, "—", sizeof(kf_gap_buf));
+                    } else {
+                        g_snprintf(kf_gap_buf, sizeof(kf_gap_buf), "%.2fs",
+                                   detail_source->last_keyframe_interval_seconds);
+                    }
+                    char stream_detail[384];
+                    g_snprintf(stream_detail, sizeof(stream_detail),
+                               "HEVC  IDR=%" G_GUINT64_FORMAT "  CRA=%" G_GUINT64_FORMAT
+                               "  trail=%" G_GUINT64_FORMAT "  VPS/SPS/PPS=%" G_GUINT64_FORMAT
+                               "/%" G_GUINT64_FORMAT "/%" G_GUINT64_FORMAT
+                               "  SEI=%" G_GUINT64_FORMAT "  AUD=%" G_GUINT64_FORMAT
+                               "  •  AP=%" G_GUINT64_FORMAT "  FU=%" G_GUINT64_FORMAT
+                               " (%.1f%% frag)"
+                               "  •  KF total=%" G_GUINT64_FORMAT "  last %s ago  Δ %s",
+                               detail_source->hevc_idr_count,
+                               detail_source->hevc_cra_count,
+                               detail_source->hevc_trail_count,
+                               detail_source->hevc_vps_count,
+                               detail_source->hevc_sps_count,
+                               detail_source->hevc_pps_count,
+                               detail_source->hevc_sei_count,
+                               detail_source->hevc_aud_count,
+                               detail_source->rtp_ap_packets,
+                               detail_source->rtp_fu_packets,
+                               frag_pct,
+                               kf_total,
+                               kf_age_buf,
+                               kf_gap_buf);
+                    gtk_label_set_text(ctx->stream_detail_label, stream_detail);
+                }
             } else if (waiting_for_switch) {
                 char message[128];
                 g_snprintf(message, sizeof(message), "Switching to source %u...", detail_index);
                 gtk_label_set_text(ctx->source_detail_label, message);
+                if (ctx->stream_detail_label) gtk_label_set_text(ctx->stream_detail_label, "");
             } else {
                 gtk_label_set_text(ctx->source_detail_label, "Select a source to view details.");
+                if (ctx->stream_detail_label) gtk_label_set_text(ctx->stream_detail_label, "");
             }
         }
 
@@ -2102,15 +2159,32 @@ static void refresh_stats(GuiContext *ctx) {
     if (viewer_selected_source && ctx->stats_source_label) {
         char rate_buf[48];
         format_bitrate(viewer_selected_source->inbound_bitrate_bps, rate_buf, sizeof(rate_buf));
-        char banner[224];
+        uint64_t kf_total = viewer_selected_source->hevc_idr_count
+                          + viewer_selected_source->hevc_cra_count;
+        char kf_age_buf[24];
+        if (viewer_selected_source->seconds_since_keyframe < 0.0) {
+            g_strlcpy(kf_age_buf, "n/a", sizeof(kf_age_buf));
+        } else if (viewer_selected_source->seconds_since_keyframe >= 60.0) {
+            g_snprintf(kf_age_buf, sizeof(kf_age_buf), "%.0fm%.0fs",
+                       floor(viewer_selected_source->seconds_since_keyframe / 60.0),
+                       fmod(viewer_selected_source->seconds_since_keyframe, 60.0));
+        } else {
+            g_snprintf(kf_age_buf, sizeof(kf_age_buf), "%.1fs",
+                       viewer_selected_source->seconds_since_keyframe);
+        }
+        char banner[320];
         g_snprintf(banner, sizeof(banner),
-                   "Source %s  •  %s  •  jitter %.2f ms  •  input %.1f fps  •  decoder %.1f fps  •  lost %" G_GUINT64_FORMAT,
+                   "Source %s  •  %s  •  jitter %.2f ms  •  input %.1f fps  •  decoder %.1f fps"
+                   "  •  lost %" G_GUINT64_FORMAT
+                   "  •  KF %" G_GUINT64_FORMAT " (last %s)",
                    viewer_selected_source->address,
                    rate_buf,
                    viewer_selected_source->rfc3550_jitter_ms,
                    viewer_selected_source->rtp_marker_fps,
                    stats.decoder.instantaneous_fps,
-                   viewer_selected_source->rtp_lost_packets);
+                   viewer_selected_source->rtp_lost_packets,
+                   kf_total,
+                   kf_age_buf);
         gtk_label_set_text(ctx->stats_source_label, banner);
     } else if (ctx->stats_source_label) {
         gtk_label_set_text(ctx->stats_source_label, "No source locked.");
@@ -2983,6 +3057,18 @@ static GtkWidget *build_monitor_page(GuiContext *ctx) {
     gtk_label_set_selectable(ctx->source_detail_label, TRUE);
     gtk_widget_add_css_class(GTK_WIDGET(ctx->source_detail_label), "uv-source-detail");
     gtk_box_append(GTK_BOX(sources_box), GTK_WIDGET(ctx->source_detail_label));
+
+    ctx->stream_detail_label = GTK_LABEL(gtk_label_new(""));
+    gtk_label_set_xalign(ctx->stream_detail_label, 0.0);
+    gtk_label_set_wrap(ctx->stream_detail_label, TRUE);
+    gtk_label_set_selectable(ctx->stream_detail_label, TRUE);
+    gtk_widget_add_css_class(GTK_WIDGET(ctx->stream_detail_label), "uv-source-detail");
+    gtk_widget_add_css_class(GTK_WIDGET(ctx->stream_detail_label), "uv-info");
+    gtk_widget_set_tooltip_text(GTK_WIDGET(ctx->stream_detail_label),
+                                "HEVC NAL-unit counts decoded from the RTP payload. "
+                                "'KF' is the most recent keyframe (IDR or CRA). "
+                                "Long KF gap with low SPS/PPS rate suggests intra-refresh / GDR mode.");
+    gtk_box_append(GTK_BOX(sources_box), GTK_WIDGET(ctx->stream_detail_label));
 
     GtkWidget *button_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
     gtk_widget_add_css_class(button_box, "uv-action-bar");
@@ -4036,6 +4122,7 @@ static void on_app_shutdown(GApplication *app, gpointer user_data) {
     ctx->idr_port_spin = NULL;
     ctx->stats_source_label = NULL;
     ctx->stats_pause_toggle = NULL;
+    ctx->stream_detail_label = NULL;
 }
 
 int uv_gui_run(UvViewer **viewer, UvViewerConfig *cfg, const char *program_name) {

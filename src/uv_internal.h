@@ -53,6 +53,21 @@ typedef struct {
 
     struct UvFrameBlockState *frame_block;
     uint64_t frame_block_accum_bytes;
+
+    /* HEVC stream composition counters (computed from RTP payload). */
+    uint64_t hevc_idr_count;
+    uint64_t hevc_cra_count;
+    uint64_t hevc_trail_count;
+    uint64_t hevc_vps_count;
+    uint64_t hevc_sps_count;
+    uint64_t hevc_pps_count;
+    uint64_t hevc_aud_count;
+    uint64_t hevc_sei_count;
+    uint64_t hevc_other_nal_count;
+    uint64_t rtp_ap_packets;
+    uint64_t rtp_fu_packets;
+    gint64   last_keyframe_us;   /* g_get_monotonic_time of most recent IDR/CRA */
+    gint64   prev_keyframe_us;   /* one before that, for interval calculation */
 } UvRelaySource;
 
 typedef struct {
