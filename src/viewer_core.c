@@ -31,7 +31,7 @@ void uv_viewer_config_init(UvViewerConfig *cfg) {
     cfg->audio_enabled = FALSE;
     cfg->audio_payload_type = 98;
     cfg->audio_clock_rate = 48000;
-    cfg->audio_jitter_latency_ms = 8;
+    cfg->audio_jitter_latency_ms = 40;
     cfg->audio_use_separate_port = FALSE;
     cfg->audio_listen_port = 5601;
     cfg->decoder_preference = UV_DECODER_AUTO;
@@ -90,6 +90,8 @@ bool uv_viewer_start(UvViewer *viewer, GError **error) {
 
     if (!pipeline_controller_start(&viewer->pipeline, error)) return FALSE;
     relay_controller_set_appsrc(&viewer->relay, pipeline_controller_get_appsrc(&viewer->pipeline));
+    relay_controller_set_audio_appsrc(&viewer->relay,
+                                      pipeline_controller_get_audio_appsrc(&viewer->pipeline));
     if (!relay_controller_start(&viewer->relay)) {
         pipeline_controller_stop(&viewer->pipeline);
         g_set_error(error, g_quark_from_static_string("uv-viewer"), 100,
@@ -137,6 +139,7 @@ bool uv_viewer_restart_pipeline(UvViewer *viewer, GError **error) {
      * guarantees no concurrent access for the rest of the rebuild. */
     relay_controller_stop(&viewer->relay);
     relay_controller_set_appsrc(&viewer->relay, NULL);
+    relay_controller_set_audio_appsrc(&viewer->relay, NULL);
 
     /* Tear the pipeline all the way down so build_pipeline runs again. */
     pipeline_controller_deinit(&viewer->pipeline);
@@ -165,6 +168,8 @@ bool uv_viewer_restart_pipeline(UvViewer *viewer, GError **error) {
     }
 
     relay_controller_set_appsrc(&viewer->relay, pipeline_controller_get_appsrc(&viewer->pipeline));
+    relay_controller_set_audio_appsrc(&viewer->relay,
+                                      pipeline_controller_get_audio_appsrc(&viewer->pipeline));
     if (!relay_controller_start(&viewer->relay)) {
         g_set_error(error, g_quark_from_static_string("uv-viewer"), 100,
                     "Failed to restart relay thread");

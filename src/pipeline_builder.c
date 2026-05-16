@@ -434,12 +434,38 @@ static gboolean build_pipeline(PipelineController *pc, GError **error) {
                              "auto-multicast", TRUE,
                              NULL);
             }
+        } else {
+            /* Shared-port mode: the relay thread demuxes by RTP payload
+             * type and pushes audio packets into this appsrc, mirroring
+             * waybeam-hub's two-decoder pattern. Without this, audio
+             * packets used to flow through the video tee into the H.265
+             * decoder — producing the green-frame symptom. */
+            pc->audio_appsrc_element = gst_element_factory_make("appsrc", "audio_appsrc");
+            if (pc->audio_appsrc_element) {
+                GstCaps *caps_audio = gst_caps_new_simple("application/x-rtp",
+                                                          "media",         G_TYPE_STRING, "audio",
+                                                          "encoding-name", G_TYPE_STRING, "OPUS",
+                                                          "payload",       G_TYPE_INT,    (gint)pc->audio_payload_type,
+                                                          "clock-rate",    G_TYPE_INT,    (gint)pc->audio_clock_rate,
+                                                          NULL);
+                g_object_set(pc->audio_appsrc_element,
+                             "is-live", TRUE,
+                             "format", GST_FORMAT_TIME,
+                             "stream-type", GST_APP_STREAM_TYPE_STREAM,
+                             "do-timestamp", TRUE,
+                             "max-bytes", (guint64)(1024 * 1024),
+                             "caps", caps_audio,
+                             NULL);
+                gst_app_src_set_latency(GST_APP_SRC(pc->audio_appsrc_element), 0, 0);
+                gst_caps_unref(caps_audio);
+            }
         }
         pc->audio_jitter = gst_element_factory_make("rtpjitterbuffer", "jbuf_audio");
         pc->audio_depay = gst_element_factory_make("rtpopusdepay", "depay_audio");
         pc->audio_decoder = gst_element_factory_make("opusdec", "opus_decoder");
         pc->audio_convert = gst_element_factory_make("audioconvert", "audio_convert");
         pc->audio_resample = gst_element_factory_make("audioresample", "audio_resample");
+        pc->audio_queue_sink = gst_element_factory_make("queue", "audio_queue_sink");
         pc->audio_sink = gst_element_factory_make("autoaudiosink", "audio_sink");
         pc->audio_sink_is_fakesink = FALSE;
         if (!pc->audio_sink) pc->audio_sink = gst_element_factory_make("pulsesink", "audio_sink");
@@ -505,19 +531,23 @@ static gboolean build_pipeline(PipelineController *pc, GError **error) {
     }
 
     if (pc->audio_enabled) {
-        gboolean separate_ok = !pc->audio_use_separate_port || pc->audio_udpsrc != NULL;
+        gboolean source_ok = pc->audio_use_separate_port
+                           ? (pc->audio_udpsrc != NULL)
+                           : (pc->audio_appsrc_element != NULL);
         if (!pc->queue_audio_in || !pc->capsfilter_rtp_audio || !pc->audio_jitter ||
             !pc->audio_depay || !pc->audio_decoder || !pc->audio_convert ||
-            !pc->audio_resample || !pc->audio_sink || !separate_ok) {
+            !pc->audio_resample || !pc->audio_queue_sink || !pc->audio_sink || !source_ok) {
             uv_log_warn("Audio pipeline requested but missing components; disabling audio");
             if (pc->queue_audio_in) { gst_object_unref(pc->queue_audio_in); pc->queue_audio_in = NULL; }
             if (pc->capsfilter_rtp_audio) { gst_object_unref(pc->capsfilter_rtp_audio); pc->capsfilter_rtp_audio = NULL; }
             if (pc->audio_udpsrc) { gst_object_unref(pc->audio_udpsrc); pc->audio_udpsrc = NULL; }
+            if (pc->audio_appsrc_element) { gst_object_unref(pc->audio_appsrc_element); pc->audio_appsrc_element = NULL; }
             if (pc->audio_jitter) { gst_object_unref(pc->audio_jitter); pc->audio_jitter = NULL; }
             if (pc->audio_depay) { gst_object_unref(pc->audio_depay); pc->audio_depay = NULL; }
             if (pc->audio_decoder) { gst_object_unref(pc->audio_decoder); pc->audio_decoder = NULL; }
             if (pc->audio_convert) { gst_object_unref(pc->audio_convert); pc->audio_convert = NULL; }
             if (pc->audio_resample) { gst_object_unref(pc->audio_resample); pc->audio_resample = NULL; }
+            if (pc->audio_queue_sink) { gst_object_unref(pc->audio_queue_sink); pc->audio_queue_sink = NULL; }
             if (pc->audio_sink) { gst_object_unref(pc->audio_sink); pc->audio_sink = NULL; }
             pc->audio_enabled = FALSE;
             pc->audio_sink_is_fakesink = FALSE;
@@ -615,12 +645,21 @@ static gboolean build_pipeline(PipelineController *pc, GError **error) {
     }
 
     if (pc->audio_enabled) {
+        /* Plain thread-boundary queue with generous limits. The previous
+         * leaky-upstream + 1-nanosecond cap was hostile to audio — every
+         * downstream stall dropped buffers, causing the clipping/delay the
+         * user reported. Audio decoding runs on this queue's task, so
+         * keeping it simple is the right move. */
         g_object_set(pc->queue_audio_in,
-                     "leaky", 1,
-                     "max-size-time", (guint64)1,
+                     "leaky", 0,
+                     "max-size-buffers", (guint)400,
+                     "max-size-bytes",   (guint)0,
+                     "max-size-time",    (guint64)GST_SECOND,
                      NULL);
+        guint jbuf_latency = pc->audio_jitter_latency_ms;
+        if (jbuf_latency == 0) jbuf_latency = 40; /* sensible default */
         g_object_set(pc->audio_jitter,
-                     "latency", (guint)MAX(pc->audio_jitter_latency_ms, 0u),
+                     "latency", jbuf_latency,
                      "drop-on-latency", viewer->config.jitter_drop_on_latency,
                      "do-lost", viewer->config.jitter_do_lost,
                      "post-drop-messages", viewer->config.jitter_post_drop_messages,
@@ -640,8 +679,28 @@ static gboolean build_pipeline(PipelineController *pc, GError **error) {
         g_object_set(pc->capsfilter_rtp_audio, "caps", caps_rtp_audio, NULL);
         gst_caps_unref(caps_rtp_audio);
 
+        /* Downstream-leaky queue right before the sink, capped at ~50 ms.
+         * Matches the waybeam-hub pattern: keep tail of buffer fresh and
+         * drop old ones rather than letting them build up. This is what
+         * gives audio low latency without clipping. */
+        if (pc->audio_queue_sink) {
+            g_object_set(pc->audio_queue_sink,
+                         "leaky", 2,                    /* downstream: drop oldest */
+                         "max-size-buffers", (guint)0,
+                         "max-size-bytes",   (guint)0,
+                         "max-size-time",    (guint64)(50 * GST_MSECOND),
+                         NULL);
+        }
         if (pc->audio_sink && !pc->audio_sink_is_fakesink) {
+            /* sync=FALSE so the audio sink doesn't preroll on the first
+             * buffer (which would stall the whole pipeline when no audio
+             * has arrived yet). async=FALSE so state changes complete
+             * immediately. The downstream leaky queue is what bounds the
+             * playback latency, not the sink clock. */
             g_object_set(pc->audio_sink, "sync", FALSE, NULL);
+            if (g_object_class_find_property(G_OBJECT_GET_CLASS(pc->audio_sink), "async")) {
+                g_object_set(pc->audio_sink, "async", FALSE, NULL);
+            }
         }
     }
 
@@ -662,6 +721,9 @@ static gboolean build_pipeline(PipelineController *pc, GError **error) {
         if (pc->audio_use_separate_port && pc->audio_udpsrc) {
             gst_bin_add(GST_BIN(pc->pipeline), pc->audio_udpsrc);
         }
+        if (!pc->audio_use_separate_port && pc->audio_appsrc_element) {
+            gst_bin_add(GST_BIN(pc->pipeline), pc->audio_appsrc_element);
+        }
         gst_bin_add_many(GST_BIN(pc->pipeline),
                          pc->queue_audio_in,
                          pc->capsfilter_rtp_audio,
@@ -670,6 +732,7 @@ static gboolean build_pipeline(PipelineController *pc, GError **error) {
                          pc->audio_decoder,
                          pc->audio_convert,
                          pc->audio_resample,
+                         pc->audio_queue_sink,
                          pc->audio_sink,
                          NULL);
     }
@@ -763,12 +826,21 @@ static gboolean build_pipeline(PipelineController *pc, GError **error) {
                 return FALSE;
             }
             uv_log_info("Audio: listening on UDP :%u (separate from video)", pc->audio_listen_port);
-        } else {
-            if (!gst_element_link(pc->tee, pc->queue_audio_in)) {
+        } else if (pc->audio_appsrc_element) {
+            /* Shared-port mode: the relay thread will route audio packets
+             * (PT == audio_payload_type) into this appsrc, leaving the
+             * H.265 decoder to see only its own payload. */
+            if (!gst_element_link(pc->audio_appsrc_element, pc->queue_audio_in)) {
                 g_set_error(error, g_quark_from_static_string("uv-viewer"), 14,
-                            "Failed to link tee to audio queue");
+                            "Failed to link audio appsrc to audio queue");
                 return FALSE;
             }
+            uv_log_info("Audio: shared with video port, demuxed by PT %u (relay-side)",
+                        pc->audio_payload_type);
+        } else {
+            g_set_error(error, g_quark_from_static_string("uv-viewer"), 14,
+                        "Audio enabled but no source available");
+            return FALSE;
         }
         if (!gst_element_link_many(pc->queue_audio_in,
                                    pc->capsfilter_rtp_audio,
@@ -777,6 +849,7 @@ static gboolean build_pipeline(PipelineController *pc, GError **error) {
                                    pc->audio_decoder,
                                    pc->audio_convert,
                                    pc->audio_resample,
+                                   pc->audio_queue_sink,
                                    pc->audio_sink,
                                    NULL)) {
             g_set_error(error, g_quark_from_static_string("uv-viewer"), 14,
@@ -808,6 +881,36 @@ static gboolean build_pipeline(PipelineController *pc, GError **error) {
     GstBus *bus = gst_element_get_bus(pc->pipeline);
     pc->bus_watch_id = gst_bus_add_watch(bus, bus_cb, pc);
     gst_object_unref(bus);
+
+    /* Seed the audio appsrc with a silent Opus packet so the downstream
+     * chain can negotiate caps and transition out of preroll even when no
+     * real audio has arrived yet. Without this primer, both the audio
+     * branch and the surrounding pipeline stall on the first state change.
+     * Pattern lifted from waybeam-hub's pixelpilot module. */
+    if (pc->audio_enabled && !pc->audio_use_separate_port && pc->audio_appsrc_element) {
+        static const guint8 silent_opus_payload[3] = { 0xF8, 0xFF, 0xFE };
+        guint8 primer[12 + sizeof(silent_opus_payload)];
+        memset(primer, 0, sizeof(primer));
+        primer[0]  = 0x80;                                  /* V=2 */
+        primer[1]  = (guint8)(0x80 | (pc->audio_payload_type & 0x7F)); /* M=1, PT */
+        primer[2]  = 0x00; primer[3] = 0x01;                /* seq=1 */
+        primer[4]  = 0x00; primer[5] = 0x00;
+        primer[6]  = 0x03; primer[7] = 0xC0;                /* ts=960 (20 ms @ 48 kHz) */
+        primer[8]  = 0x00; primer[9] = 0x00;
+        primer[10] = 0x00; primer[11] = 0x00;               /* ssrc=0 */
+        memcpy(primer + 12, silent_opus_payload, sizeof(silent_opus_payload));
+
+        GstBuffer *pb = gst_buffer_new_allocate(NULL, sizeof(primer), NULL);
+        if (pb) {
+            GstMapInfo map;
+            if (gst_buffer_map(pb, &map, GST_MAP_WRITE)) {
+                memcpy(map.data, primer, sizeof(primer));
+                gst_buffer_unmap(pb, &map);
+            }
+            GST_BUFFER_FLAG_SET(pb, GST_BUFFER_FLAG_LIVE);
+            gst_app_src_push_buffer(GST_APP_SRC(pc->audio_appsrc_element), pb);
+        }
+    }
 
     relay_controller_set_appsrc(&viewer->relay, GST_APP_SRC(pc->appsrc_element));
     return TRUE;
@@ -904,11 +1007,13 @@ void pipeline_controller_deinit(PipelineController *pc) {
     pc->queue_audio_in = NULL;
     pc->capsfilter_rtp_audio = NULL;
     pc->audio_udpsrc = NULL;
+    pc->audio_appsrc_element = NULL;
     pc->audio_jitter = NULL;
     pc->audio_depay = NULL;
     pc->audio_decoder = NULL;
     pc->audio_convert = NULL;
     pc->audio_resample = NULL;
+    pc->audio_queue_sink = NULL;
     pc->audio_sink = NULL;
     pc->audio_sink_is_fakesink = FALSE;
     pc->audio_probe_id = 0;
@@ -1050,6 +1155,10 @@ void pipeline_controller_stop(PipelineController *pc) {
 
 GstAppSrc *pipeline_controller_get_appsrc(PipelineController *pc) {
     return pc && pc->appsrc_element ? GST_APP_SRC(pc->appsrc_element) : NULL;
+}
+
+GstAppSrc *pipeline_controller_get_audio_appsrc(PipelineController *pc) {
+    return pc && pc->audio_appsrc_element ? GST_APP_SRC(pc->audio_appsrc_element) : NULL;
 }
 
 void pipeline_controller_snapshot(PipelineController *pc, UvViewerStats *stats) {

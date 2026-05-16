@@ -654,7 +654,25 @@ skip_nal_parse:
 }
 
 static GstFlowReturn relay_push_buffer(RelayController *rc, const unsigned char *buf, size_t len) {
-    if (!rc->appsrc) return GST_FLOW_ERROR;
+    /* Demux by RTP payload type. With audio sharing the video UDP port,
+     * forwarding every datagram to the video appsrc would feed Opus
+     * packets into the H.265 decoder (green frames). Match each packet
+     * against the configured video/audio PTs and dispatch accordingly;
+     * unknown PTs are dropped. Mirrors waybeam-hub's two-appsrc design. */
+    if (len < 12) return GST_FLOW_OK;
+    int pt = buf[1] & 0x7F;
+
+    GstAppSrc *dest = NULL;
+    if (rc->viewer) {
+        if (pt == rc->viewer->config.payload_type) {
+            dest = rc->appsrc;
+        } else if ((guint)pt == rc->viewer->config.audio_payload_type
+                   && rc->audio_appsrc) {
+            dest = rc->audio_appsrc;
+        }
+    }
+    if (!dest) return GST_FLOW_OK;
+
     GstBuffer *gbuf = gst_buffer_new_allocate(NULL, (gsize)len, NULL);
     if (!gbuf) return GST_FLOW_ERROR;
     GstMapInfo map;
@@ -663,7 +681,7 @@ static GstFlowReturn relay_push_buffer(RelayController *rc, const unsigned char 
         gst_buffer_unmap(gbuf, &map);
     }
     GST_BUFFER_FLAG_SET(gbuf, GST_BUFFER_FLAG_LIVE);
-    return gst_app_src_push_buffer(rc->appsrc, gbuf);
+    return gst_app_src_push_buffer(dest, gbuf);
 }
 
 static gpointer relay_thread_run(gpointer data) {
@@ -828,6 +846,7 @@ void relay_controller_deinit(RelayController *rc) {
     relay_controller_stop(rc);
     g_mutex_lock(&rc->lock);
     rc->appsrc = NULL;
+    rc->audio_appsrc = NULL;
     for (guint i = 0; i < rc->sources_count; i++) {
         frame_block_state_free(rc->sources[i].frame_block);
         rc->sources[i].frame_block = NULL;
@@ -1094,6 +1113,13 @@ void relay_controller_set_appsrc(RelayController *rc, GstAppSrc *appsrc) {
     if (!rc) return;
     g_mutex_lock(&rc->lock);
     rc->appsrc = appsrc;
+    g_mutex_unlock(&rc->lock);
+}
+
+void relay_controller_set_audio_appsrc(RelayController *rc, GstAppSrc *audio_appsrc) {
+    if (!rc) return;
+    g_mutex_lock(&rc->lock);
+    rc->audio_appsrc = audio_appsrc;
     g_mutex_unlock(&rc->lock);
 }
 

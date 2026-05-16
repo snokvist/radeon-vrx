@@ -200,6 +200,7 @@ static void on_sidecar_port_changed(GtkSpinButton *spin, gpointer user_data);
 static void update_sidecar_toggle_label(GuiContext *ctx, gboolean enabled);
 static GtkWidget *build_audio_page(GuiContext *ctx);
 static void on_audio_apply_clicked(GtkButton *btn, gpointer user_data);
+static void on_audio_restart_clicked(GtkButton *btn, gpointer user_data);
 static void on_audio_port_mode_changed(GObject *dropdown, GParamSpec *pspec, gpointer user_data);
 static void update_audio_status_label(GuiContext *ctx, const UvViewerStats *stats);
 static void viewer_event_callback(const UvViewerEvent *event, gpointer user_data);
@@ -2764,10 +2765,21 @@ static void on_frame_overlay_values_toggled(GtkCheckButton *button, gpointer use
     frame_block_queue_overlay_draws_force(ctx);
 }
 
+static gboolean gui_restart_with_config_ex(GuiContext *ctx,
+                                            const UvViewerConfig *cfg,
+                                            gboolean force_restart);
+
 static gboolean gui_restart_with_config(GuiContext *ctx, const UvViewerConfig *cfg) {
+    return gui_restart_with_config_ex(ctx, cfg, FALSE);
+}
+
+static gboolean gui_restart_with_config_ex(GuiContext *ctx,
+                                            const UvViewerConfig *cfg,
+                                            gboolean force_restart) {
     if (!ctx || !ctx->viewer || !cfg) return FALSE;
 
-    if (cfg->listen_port == ctx->current_cfg.listen_port &&
+    if (!force_restart &&
+        cfg->listen_port == ctx->current_cfg.listen_port &&
         cfg->sync_to_clock == ctx->current_cfg.sync_to_clock &&
         cfg->jitter_latency_ms == ctx->current_cfg.jitter_latency_ms &&
         cfg->queue_max_buffers == ctx->current_cfg.queue_max_buffers &&
@@ -2780,6 +2792,8 @@ static gboolean gui_restart_with_config(GuiContext *ctx, const UvViewerConfig *c
         cfg->audio_payload_type == ctx->current_cfg.audio_payload_type &&
         cfg->audio_clock_rate == ctx->current_cfg.audio_clock_rate &&
         cfg->audio_jitter_latency_ms == ctx->current_cfg.audio_jitter_latency_ms &&
+        cfg->audio_use_separate_port == ctx->current_cfg.audio_use_separate_port &&
+        cfg->audio_listen_port == ctx->current_cfg.audio_listen_port &&
         cfg->jitter_drop_on_latency == ctx->current_cfg.jitter_drop_on_latency &&
         cfg->jitter_do_lost == ctx->current_cfg.jitter_do_lost &&
         cfg->jitter_post_drop_messages == ctx->current_cfg.jitter_post_drop_messages) {
@@ -3526,47 +3540,70 @@ static void on_audio_port_mode_changed(GObject *dropdown, GParamSpec *pspec, gpo
     }
 }
 
-static void on_audio_apply_clicked(GtkButton *btn, gpointer user_data) {
-    (void)btn;
-    GuiContext *ctx = user_data;
-    if (!ctx) return;
+static void audio_collect_cfg_from_ui(GuiContext *ctx, UvViewerConfig *new_cfg) {
+    *new_cfg = ctx->current_cfg;
 
-    UvViewerConfig new_cfg = ctx->current_cfg;
-
-    new_cfg.audio_enabled = ctx->audio_toggle ? check_get(ctx->audio_toggle) : FALSE;
+    new_cfg->audio_enabled = ctx->audio_toggle ? check_get(ctx->audio_toggle) : FALSE;
     if (ctx->audio_payload_spin) {
         int v = gtk_spin_button_get_value_as_int(ctx->audio_payload_spin);
         if (v < 0) v = 0;
         if (v > 127) v = 127;
-        new_cfg.audio_payload_type = (guint)v;
+        new_cfg->audio_payload_type = (guint)v;
     }
     if (ctx->audio_jitter_spin) {
         int v = gtk_spin_button_get_value_as_int(ctx->audio_jitter_spin);
         if (v < 0) v = 0;
-        new_cfg.audio_jitter_latency_ms = (guint)v;
+        new_cfg->audio_jitter_latency_ms = (guint)v;
     }
     if (ctx->audio_port_mode_dropdown) {
         guint mode = gtk_drop_down_get_selected(ctx->audio_port_mode_dropdown);
-        new_cfg.audio_use_separate_port = (mode == 1);
+        new_cfg->audio_use_separate_port = (mode == 1);
     }
     if (ctx->audio_port_spin) {
         int v = gtk_spin_button_get_value_as_int(ctx->audio_port_spin);
         if (v < 1) v = 1;
         if (v > 65535) v = 65535;
-        new_cfg.audio_listen_port = (guint)v;
+        new_cfg->audio_listen_port = (guint)v;
     }
 
-    if (new_cfg.audio_use_separate_port &&
-        (gint)new_cfg.audio_listen_port == new_cfg.listen_port) {
+    if (new_cfg->audio_use_separate_port &&
+        (gint)new_cfg->audio_listen_port == new_cfg->listen_port) {
         update_status(ctx,
             "Audio: separate port would collide with video — keeping shared mode.");
-        new_cfg.audio_use_separate_port = FALSE;
+        new_cfg->audio_use_separate_port = FALSE;
     }
+}
+
+static void on_audio_apply_clicked(GtkButton *btn, gpointer user_data) {
+    (void)btn;
+    GuiContext *ctx = user_data;
+    if (!ctx) return;
+
+    UvViewerConfig new_cfg;
+    audio_collect_cfg_from_ui(ctx, &new_cfg);
 
     if (!gui_restart_with_config(ctx, &new_cfg)) {
         sync_settings_controls(ctx);
     } else {
         update_status(ctx, "Audio settings applied.");
+    }
+}
+
+static void on_audio_restart_clicked(GtkButton *btn, gpointer user_data) {
+    (void)btn;
+    GuiContext *ctx = user_data;
+    if (!ctx) return;
+
+    UvViewerConfig new_cfg;
+    audio_collect_cfg_from_ui(ctx, &new_cfg);
+
+    /* Force rebuild even if config matches current — that's the point of
+     * the explicit Restart button: kick a stuck audio chain without
+     * having to change a setting first. */
+    if (!gui_restart_with_config_ex(ctx, &new_cfg, TRUE)) {
+        sync_settings_controls(ctx);
+    } else {
+        update_status(ctx, "Audio pipeline restarted.");
     }
 }
 
@@ -3617,7 +3654,11 @@ static GtkWidget *build_audio_page(GuiContext *ctx) {
     GtkWidget *jitter_label = gtk_label_new("Jitter latency (ms):");
     gtk_label_set_xalign(GTK_LABEL(jitter_label), 0.0);
     gtk_grid_attach(GTK_GRID(grid), jitter_label, 0, 2, 1, 1);
-    ctx->audio_jitter_spin = GTK_SPIN_BUTTON(gtk_spin_button_new_with_range(0, 500, 1));
+    ctx->audio_jitter_spin = GTK_SPIN_BUTTON(gtk_spin_button_new_with_range(0, 2000, 5));
+    gtk_widget_set_tooltip_text(GTK_WIDGET(ctx->audio_jitter_spin),
+                                "rtpjitterbuffer latency for audio in ms. Opus packets are "
+                                "typically 20 ms apart, so anything below ~30 ms will under-"
+                                "run on most links. 40-100 ms is a sensible range.");
     gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(ctx->audio_jitter_spin), 1, 2, 1, 1);
 
     GtkWidget *mode_label = gtk_label_new("Port mode:");
@@ -3642,18 +3683,30 @@ static GtkWidget *build_audio_page(GuiContext *ctx) {
                                 "Must differ from the video listen port.");
     gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(ctx->audio_port_spin), 1, 4, 1, 1);
 
-    /* Apply button. */
+    /* Apply / Restart buttons. */
+    GtkWidget *button_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_box_append(GTK_BOX(page), button_row);
+
     GtkWidget *apply_btn = gtk_button_new_with_label("Apply Audio Settings");
     gtk_widget_add_css_class(apply_btn, "suggested-action");
     gtk_widget_set_tooltip_text(apply_btn,
                                 "Rebuild the pipeline with the new audio config. "
                                 "Video keeps running on its existing listen port.");
     g_signal_connect(apply_btn, "clicked", G_CALLBACK(on_audio_apply_clicked), ctx);
-    gtk_box_append(GTK_BOX(page), apply_btn);
+    gtk_box_append(GTK_BOX(button_row), apply_btn);
+
+    GtkWidget *restart_btn = gtk_button_new_with_label("Restart Audio");
+    gtk_widget_set_tooltip_text(restart_btn,
+                                "Force a pipeline rebuild with the current audio settings "
+                                "even if nothing changed — kicks the audio branch out of "
+                                "a glitch (stuck jitter buffer, silent after a network "
+                                "blip) without touching any config.");
+    g_signal_connect(restart_btn, "clicked", G_CALLBACK(on_audio_restart_clicked), ctx);
+    gtk_box_append(GTK_BOX(button_row), restart_btn);
 
     GtkWidget *hint = gtk_label_new(
-        "Applying restarts the GStreamer pipeline so the audio branch can be "
-        "added, removed, or rebound to a new port.");
+        "Apply restarts the GStreamer pipeline with the values above. "
+        "Restart Audio does the same rebuild but with no config changes.");
     gtk_label_set_xalign(GTK_LABEL(hint), 0.0);
     gtk_label_set_wrap(GTK_LABEL(hint), TRUE);
     gtk_widget_add_css_class(hint, "uv-info");

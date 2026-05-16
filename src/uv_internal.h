@@ -81,6 +81,7 @@ typedef struct {
     int selected_index;
 
     GstAppSrc *appsrc;
+    GstAppSrc *audio_appsrc; /* optional, used for shared-port audio demux */
 
     struct {
         gboolean enabled;
@@ -224,11 +225,13 @@ typedef struct {
     GstElement *queue_audio_in;
     GstElement *capsfilter_rtp_audio;
     GstElement *audio_udpsrc;            /* used when audio_use_separate_port */
+    GstElement *audio_appsrc_element;    /* used when sharing the video UDP port */
     GstElement *audio_jitter;
     GstElement *audio_depay;
     GstElement *audio_decoder;
     GstElement *audio_convert;
     GstElement *audio_resample;
+    GstElement *audio_queue_sink; /* downstream leaky queue, drops stale audio */
     GstElement *audio_sink;
 
     GThread *loop_thread;
@@ -285,6 +288,7 @@ gboolean relay_controller_select_next(RelayController *rc, GError **error);
 int      relay_controller_selected(const RelayController *rc);
 void     relay_controller_snapshot(RelayController *rc, UvViewerStats *stats, int clock_rate);
 void     relay_controller_set_appsrc(RelayController *rc, GstAppSrc *appsrc);
+void     relay_controller_set_audio_appsrc(RelayController *rc, GstAppSrc *audio_appsrc);
 void     relay_controller_set_push_enabled(RelayController *rc, gboolean enabled);
 void     relay_controller_frame_block_configure(RelayController *rc, gboolean enabled, gboolean snapshot_mode);
 void     relay_controller_frame_block_pause(RelayController *rc, gboolean paused);
@@ -313,6 +317,7 @@ void     pipeline_controller_deinit(PipelineController *pc);
 gboolean pipeline_controller_start(PipelineController *pc, GError **error);
 void     pipeline_controller_stop(PipelineController *pc);
 GstAppSrc *pipeline_controller_get_appsrc(PipelineController *pc);
+GstAppSrc *pipeline_controller_get_audio_appsrc(PipelineController *pc);
 void     pipeline_controller_snapshot(PipelineController *pc, UvViewerStats *stats);
 gboolean pipeline_controller_update(PipelineController *pc, const UvPipelineOverrides *overrides, GError **error);
 GstElement *pipeline_controller_get_sink(PipelineController *pc);
