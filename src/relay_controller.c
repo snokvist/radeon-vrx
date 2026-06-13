@@ -243,6 +243,14 @@ gboolean relay_controller_get_selected_address(RelayController *rc, char *out, s
     return found;
 }
 
+/* RFC 3550 sequence-validity constants. A forward gap below MAX_DROPOUT is a
+ * normal loss burst; a backward step within MAX_MISORDER is genuine reordering.
+ * Anything else means the sender's sequence space jumped — typically a Wi-Fi
+ * link recovering after the encoder restarted with a fresh (often reset) seq. */
+#define UV_RTP_MAX_DROPOUT   3000u
+#define UV_RTP_MAX_MISORDER  100u
+#define UV_RTP_BAD_SEQ_NONE  0xffffffffu
+
 static void relay_source_clear_stats(UvRelaySource *src, gboolean reset_totals) {
     if (!src) return;
     if (reset_totals) {
@@ -256,9 +264,9 @@ static void relay_source_clear_stats(UvRelaySource *src, gboolean reset_totals) 
     src->prev_timestamp_us = 0;
     src->rtp_initialized = FALSE;
     src->rtp_cycles = 0;
-    src->rtp_last_seq = 0;
     src->rtp_first_ext_seq = 0;
     src->rtp_max_ext_seq = 0;
+    src->rtp_bad_seq = UV_RTP_BAD_SEQ_NONE;
     src->rtp_unique_packets = 0;
     src->rtp_duplicate_packets = 0;
     src->rtp_reordered_packets = 0;
@@ -318,14 +326,39 @@ static bool relay_add_or_find(RelayController *rc, const struct sockaddr_in *fro
     return TRUE;
 }
 
-static inline uint32_t rtp_ext_seq(UvRelaySource *s, uint16_t seq16) {
-    if (s->rtp_initialized) {
-        if (seq16 < s->rtp_last_seq && (uint16_t)(s->rtp_last_seq - seq16) > 30000) {
-            s->rtp_cycles += 1u << 16;
-        }
+/* Compute the 32-bit extended sequence for a 16-bit RTP seq, advancing the
+ * cycle counter on a normal wrap. Measures the delta against the running max
+ * (not just the previous packet) so a reset sequence space is recognised as a
+ * discontinuity via *jumped rather than masquerading as a flood of reorders. */
+static inline uint32_t rtp_ext_seq(UvRelaySource *s, uint16_t seq16, gboolean *jumped) {
+    *jumped = FALSE;
+    uint16_t max_seq16 = (uint16_t)(s->rtp_max_ext_seq & 0xffffu);
+    uint16_t udelta = (uint16_t)(seq16 - max_seq16);
+    if (udelta < UV_RTP_MAX_DROPOUT) {
+        if (seq16 < max_seq16) s->rtp_cycles += 1u << 16; /* in-order wrap */
+    } else if (udelta <= (uint16_t)(0x10000u - UV_RTP_MAX_MISORDER)) {
+        *jumped = TRUE; /* large gap or reset: sequence space is discontinuous */
     }
-    s->rtp_last_seq = seq16;
+    /* else: small step backwards — a genuine duplicate or reordered packet. */
     return s->rtp_cycles + seq16;
+}
+
+/* Rebase RTP tracking onto a fresh sequence space after a confirmed restart so
+ * loss/reorder counters describe the recovered stream instead of spiking. */
+static inline void rtp_resync(UvRelaySource *s, uint16_t seq16) {
+    s->rtp_cycles = 0;
+    s->rtp_first_ext_seq = seq16;
+    s->rtp_max_ext_seq = seq16;
+    s->rtp_bad_seq = UV_RTP_BAD_SEQ_NONE;
+    s->rtp_unique_packets = 0;
+    s->rtp_duplicate_packets = 0;
+    s->rtp_reordered_packets = 0;
+    for (guint i = 0; i < UV_RTP_WIN_SIZE; ++i) {
+        s->rtp_seq_slot[i] = UV_RTP_SLOT_EMPTY;
+    }
+    s->jitter_initialized = FALSE;
+    s->jitter_prev_transit = 0;
+    s->jitter_value = 0.0;
 }
 
 static inline uint32_t rtp_now_ts_from_us(int clock_rate, gint64 us) {
@@ -369,6 +402,38 @@ static double source_marker_window_fps(const UvRelaySource *src, gint64 now_us) 
 
     if (count < 2 || last_us <= first_us) return 0.0;
     return ((double)(count - 1u) * (double)G_USEC_PER_SEC) / (double)(last_us - first_us);
+}
+
+/* Map the per-source counters shared by the relay snapshot and event paths into
+ * UvSourceStats. Caller-specific fields (selected, inbound_bitrate_bps, the frame
+ * block) are filled by the caller. now_us is the reference time for age/FPS. */
+void uv_internal_populate_source_stats(const UvRelaySource *src, int clock_rate,
+                                       gint64 now_us, UvSourceStats *out) {
+    if (!src || !out) return;
+    addr_to_str(&src->addr, out->address, sizeof(out->address));
+    out->rx_packets = src->rx_packets;
+    out->rx_bytes = src->rx_bytes;
+    out->forwarded_packets = src->forwarded_packets;
+    out->forwarded_bytes = src->forwarded_bytes;
+    out->rtp_unique_packets = src->rtp_unique_packets;
+    if (src->rtp_initialized) {
+        out->rtp_expected_packets = (uint64_t)(src->rtp_max_ext_seq - src->rtp_first_ext_seq + 1);
+        if (out->rtp_expected_packets > out->rtp_unique_packets) {
+            out->rtp_lost_packets = out->rtp_expected_packets - out->rtp_unique_packets;
+        }
+    }
+    out->rtp_duplicate_packets = src->rtp_duplicate_packets;
+    out->rtp_reordered_packets = src->rtp_reordered_packets;
+    out->rtp_marker_frames = src->rtp_marker_frames;
+    out->rtp_marker_fps = source_marker_window_fps(src, now_us);
+    if (src->jitter_value > 0.0) {
+        out->rfc3550_jitter_ms = (src->jitter_value * 1000.0) / (double)MAX(clock_rate, 1);
+    }
+    if (src->last_seen_us > 0) {
+        out->seconds_since_last_seen = (double)(now_us - src->last_seen_us) / 1e6;
+    } else {
+        out->seconds_since_last_seen = -1.0;
+    }
 }
 
 static void frame_block_process_packet(RelayController *rc,
@@ -591,11 +656,26 @@ static inline void rtp_update_stats(RelayController *rc,
     uint16_t seq = (uint16_t)((p[2] << 8) | p[3]);
     uint32_t ts  = (uint32_t)((p[4] << 24) | (p[5] << 16) | (p[6] << 8) | p[7]);
 
-    uint32_t ext = rtp_ext_seq(s, seq);
+    gboolean jumped = FALSE;
+    uint32_t ext = rtp_ext_seq(s, seq, &jumped);
     if (!s->rtp_initialized) {
         s->rtp_initialized = TRUE;
+        s->rtp_bad_seq = UV_RTP_BAD_SEQ_NONE;
         s->rtp_first_ext_seq = ext;
         s->rtp_max_ext_seq   = ext;
+    } else if (jumped) {
+        /* Confirm a restart with two consecutive in-sequence packets (RFC 3550
+         * bad_seq probation) so a lone stray/corrupt seq can't wipe the stats.
+         * The packet is still forwarded downstream; only stats accounting waits. */
+        if (s->rtp_bad_seq != UV_RTP_BAD_SEQ_NONE && seq == (uint16_t)s->rtp_bad_seq) {
+            rtp_resync(s, seq);
+            ext = seq;
+        } else {
+            s->rtp_bad_seq = (uint16_t)(seq + 1);
+            return;
+        }
+    } else {
+        s->rtp_bad_seq = UV_RTP_BAD_SEQ_NONE;
     }
 
     guint idx = ext % UV_RTP_WIN_SIZE;
@@ -662,6 +742,9 @@ static GstFlowReturn relay_push_buffer(RelayController *rc, const unsigned char 
     if (len < 12) return GST_FLOW_OK;
     int pt = buf[1] & 0x7F;
 
+    /* Pick the destination appsrc and hold a ref across the push under the lock,
+     * so a concurrent set_appsrc()/teardown can't free it out from under us. */
+    g_mutex_lock(&rc->lock);
     GstAppSrc *dest = NULL;
     if (rc->viewer) {
         if (pt == rc->viewer->config.payload_type) {
@@ -671,17 +754,23 @@ static GstFlowReturn relay_push_buffer(RelayController *rc, const unsigned char 
             dest = rc->audio_appsrc;
         }
     }
+    if (dest) gst_object_ref(dest);
+    g_mutex_unlock(&rc->lock);
     if (!dest) return GST_FLOW_OK;
 
+    GstFlowReturn ret = GST_FLOW_ERROR;
     GstBuffer *gbuf = gst_buffer_new_allocate(NULL, (gsize)len, NULL);
-    if (!gbuf) return GST_FLOW_ERROR;
-    GstMapInfo map;
-    if (gst_buffer_map(gbuf, &map, GST_MAP_WRITE)) {
-        memcpy(map.data, buf, len);
-        gst_buffer_unmap(gbuf, &map);
+    if (gbuf) {
+        GstMapInfo map;
+        if (gst_buffer_map(gbuf, &map, GST_MAP_WRITE)) {
+            memcpy(map.data, buf, len);
+            gst_buffer_unmap(gbuf, &map);
+        }
+        GST_BUFFER_FLAG_SET(gbuf, GST_BUFFER_FLAG_LIVE);
+        ret = gst_app_src_push_buffer(dest, gbuf);
     }
-    GST_BUFFER_FLAG_SET(gbuf, GST_BUFFER_FLAG_LIVE);
-    return gst_app_src_push_buffer(dest, gbuf);
+    gst_object_unref(dest);
+    return ret;
 }
 
 static gpointer relay_thread_run(gpointer data) {
@@ -966,31 +1055,8 @@ void relay_controller_snapshot(RelayController *rc, UvViewerStats *stats, int cl
         UvRelaySource *src = &rc->sources[i];
         if (!src->in_use) continue;
         UvSourceStats s = {0};
-        addr_to_str(&src->addr, s.address, sizeof(s.address));
+        uv_internal_populate_source_stats(src, clock_rate, now_us, &s);
         s.selected = (rc->selected_index == (int)i);
-        s.rx_packets = src->rx_packets;
-        s.rx_bytes = src->rx_bytes;
-        s.forwarded_packets = src->forwarded_packets;
-        s.forwarded_bytes = src->forwarded_bytes;
-        s.rtp_unique_packets = src->rtp_unique_packets;
-        if (src->rtp_initialized) {
-            s.rtp_expected_packets = (uint64_t)(src->rtp_max_ext_seq - src->rtp_first_ext_seq + 1);
-            if (s.rtp_expected_packets > s.rtp_unique_packets) {
-                s.rtp_lost_packets = s.rtp_expected_packets - s.rtp_unique_packets;
-            }
-        }
-        s.rtp_duplicate_packets = src->rtp_duplicate_packets;
-        s.rtp_reordered_packets = src->rtp_reordered_packets;
-        s.rtp_marker_frames = src->rtp_marker_frames;
-        s.rtp_marker_fps = source_marker_window_fps(src, now_us);
-        if (src->jitter_value > 0.0) {
-            s.rfc3550_jitter_ms = (src->jitter_value * 1000.0) / (double)MAX(clock_rate, 1);
-        }
-        if (src->last_seen_us > 0) {
-            s.seconds_since_last_seen = (double)(now_us - src->last_seen_us) / 1e6;
-        } else {
-            s.seconds_since_last_seen = -1.0;
-        }
 
         if (src->prev_timestamp_us != 0 && now_us > src->prev_timestamp_us && src->rx_bytes >= src->prev_bytes) {
             uint64_t dbytes = src->rx_bytes - src->prev_bytes;

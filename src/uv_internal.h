@@ -35,9 +35,9 @@ typedef struct {
 
     bool     rtp_initialized;
     uint32_t rtp_cycles;
-    uint16_t rtp_last_seq;
     uint32_t rtp_first_ext_seq;
     uint32_t rtp_max_ext_seq;
+    uint32_t rtp_bad_seq;
     uint64_t rtp_unique_packets;
     uint64_t rtp_duplicate_packets;
     uint64_t rtp_reordered_packets;
@@ -278,6 +278,7 @@ void uv_internal_qos_db_update(QoSDatabase *db, GstMessage *msg);
 void uv_internal_qos_db_snapshot(QoSDatabase *db, UvViewerStats *stats);
 
 void uv_internal_emit_event(struct _UvViewer *viewer, UvViewerEventKind kind, int source_index, const UvRelaySource *source, GError *error);
+void uv_internal_populate_source_stats(const UvRelaySource *src, int clock_rate, gint64 now_us, UvSourceStats *out);
 
 gboolean relay_controller_init(RelayController *rc, struct _UvViewer *viewer);
 void     relay_controller_deinit(RelayController *rc);
