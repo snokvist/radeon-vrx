@@ -9,12 +9,6 @@ static void qos_stats_free(gpointer data) {
     g_free(data);
 }
 
-static void addr_to_str(const struct sockaddr_in *sa, char *out, size_t outlen) {
-    char ip[INET_ADDRSTRLEN] = {0};
-    inet_ntop(AF_INET, &sa->sin_addr, ip, sizeof(ip));
-    g_strlcpy(out, ip, outlen);
-}
-
 void uv_internal_decoder_stats_reset(DecoderStats *stats) {
     if (!stats) return;
     g_mutex_lock(&stats->lock);
@@ -134,33 +128,6 @@ void uv_internal_qos_db_snapshot(QoSDatabase *db, UvViewerStats *stats) {
     g_mutex_unlock(&db->lock);
 }
 
-static void populate_source_snapshot(const UvRelaySource *src, int clock_rate, UvSourceStats *out) {
-    if (!src || !out) return;
-    addr_to_str(&src->addr, out->address, sizeof(out->address));
-    out->rx_packets = src->rx_packets;
-    out->rx_bytes = src->rx_bytes;
-    out->forwarded_packets = src->forwarded_packets;
-    out->forwarded_bytes = src->forwarded_bytes;
-    out->rtp_unique_packets = src->rtp_unique_packets;
-    if (src->rtp_initialized) {
-        out->rtp_expected_packets = (uint64_t)(src->rtp_max_ext_seq - src->rtp_first_ext_seq + 1);
-        if (out->rtp_expected_packets > out->rtp_unique_packets) {
-            out->rtp_lost_packets = out->rtp_expected_packets - out->rtp_unique_packets;
-        }
-    }
-    out->rtp_duplicate_packets = src->rtp_duplicate_packets;
-    out->rtp_reordered_packets = src->rtp_reordered_packets;
-    out->rtp_marker_frames = src->rtp_marker_frames;
-    if (src->jitter_value > 0.0) {
-        out->rfc3550_jitter_ms = (src->jitter_value * 1000.0) / (double)MAX(clock_rate, 1);
-    }
-    if (src->last_seen_us > 0) {
-        out->seconds_since_last_seen = (double)(g_get_monotonic_time() - src->last_seen_us) / 1e6;
-    } else {
-        out->seconds_since_last_seen = -1.0;
-    }
-}
-
 void uv_internal_emit_event(struct _UvViewer *viewer, UvViewerEventKind kind, int source_index, const UvRelaySource *source, GError *error) {
     if (!viewer || !viewer->event_cb) return;
     UvViewerEvent event = {
@@ -169,7 +136,8 @@ void uv_internal_emit_event(struct _UvViewer *viewer, UvViewerEventKind kind, in
         .error = error
     };
     if (source) {
-        populate_source_snapshot(source, viewer->config.clock_rate, &event.source_snapshot);
+        uv_internal_populate_source_stats(source, viewer->config.clock_rate,
+                                          g_get_monotonic_time(), &event.source_snapshot);
         int current = relay_controller_selected(&viewer->relay);
         event.source_snapshot.selected = (source_index >= 0 && current == source_index);
     }

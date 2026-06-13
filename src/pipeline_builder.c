@@ -997,7 +997,6 @@ void pipeline_controller_deinit(PipelineController *pc) {
     }
     pc->video_convert = NULL;
     pc->video_hw_convert = NULL;
-    pc->video_hw_convert = NULL;
     pc->videorate = NULL;
     pc->videorate_caps = NULL;
     pc->queue_postrate = NULL;

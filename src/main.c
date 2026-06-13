@@ -187,7 +187,7 @@ static gboolean parse_args(int argc, char **argv, UvViewerConfig *cfg) {
             cfg->sidecar_port = (guint)port;
         } else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
             print_usage(argv[0]);
-            return FALSE;
+            exit(EXIT_SUCCESS);
         } else {
             g_printerr("Unknown option: %s\n", argv[i]);
             print_usage(argv[0]);
