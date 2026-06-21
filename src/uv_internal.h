@@ -72,8 +72,9 @@ typedef struct {
     uint32_t last_marker_ts;
     double   frame_period_ms;      /* EWMA of marker-to-marker RTP-ts period */
 
-    /* Per-frame ring for the cadence timeline. */
-    UvReleaseFrame frame_ring[UV_RELEASE_FRAME_RING];
+    /* Per-frame ring for the cadence timeline. Lazily allocated only while
+     * frame_release is enabled on the selected source (NULL otherwise). */
+    UvReleaseFrame *frame_ring;    /* UV_RELEASE_FRAME_RING entries when non-NULL */
     guint    frame_ring_head;
     guint    frame_ring_count;
 
@@ -87,7 +88,7 @@ typedef struct {
     guint         chunk_bytes;
     guint         chunk_frames;        /* distinct RTP timestamps in this chunk */
     uint32_t      chunk_last_ts;
-    UvReleaseChunk release_ring[UV_RELEASE_CHUNK_RING];
+    UvReleaseChunk *release_ring;      /* UV_RELEASE_CHUNK_RING entries, lazy (NULL off) */
     guint         release_head;        /* next write slot */
     guint         release_count;       /* filled entries (<= ring size) */
     guint64       release_total;       /* lifetime chunks since reset */

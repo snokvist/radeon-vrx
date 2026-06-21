@@ -355,6 +355,8 @@ static void relay_source_clear_stats(UvRelaySource *src, gboolean reset_totals) 
     src->chunk_bytes = 0;
     src->chunk_frames = 0;
     src->chunk_last_ts = 0;
+    if (src->release_ring) { g_free(src->release_ring); src->release_ring = NULL; }
+    if (src->frame_ring)   { g_free(src->frame_ring);   src->frame_ring = NULL; }
     src->release_head = 0;
     src->release_count = 0;
     src->release_total = 0;
@@ -519,6 +521,7 @@ void uv_internal_populate_source_stats(const UvRelaySource *src, int clock_rate,
 
 /* Push a completed frame into the per-source cadence ring (oldest overwritten). */
 static void frame_ring_push(UvRelaySource *src, const UvReleaseFrame *frec) {
+    if (!src->frame_ring) return;
     src->frame_ring[src->frame_ring_head] = *frec;
     src->frame_ring_head = (src->frame_ring_head + 1u) % UV_RELEASE_FRAME_RING;
     if (src->frame_ring_count < UV_RELEASE_FRAME_RING) src->frame_ring_count++;
@@ -716,9 +719,28 @@ static void frame_block_process_packet(RelayController *rc,
     src->frame_open = FALSE;
 }
 
+/* Lazily (de)allocate the per-source rings. Only the selected source with
+ * frame_release enabled holds them, so the steady-state footprint is ~one
+ * source's worth (~60 KB) instead of ~15 MB across all 256 slots. */
+static void release_rings_alloc(UvRelaySource *src) {
+    if (!src->release_ring) src->release_ring = g_new0(UvReleaseChunk, UV_RELEASE_CHUNK_RING);
+    if (!src->frame_ring)   src->frame_ring   = g_new0(UvReleaseFrame, UV_RELEASE_FRAME_RING);
+}
+
+static void release_rings_free(UvRelaySource *src) {
+    if (src->release_ring) { g_free(src->release_ring); src->release_ring = NULL; }
+    if (src->frame_ring)   { g_free(src->frame_ring);   src->frame_ring = NULL; }
+    src->release_head = 0;
+    src->release_count = 0;
+    src->frame_ring_head = 0;
+    src->frame_ring_count = 0;
+    src->chunk_open = FALSE;
+}
+
 /* Push a finalized release burst into the per-source ring (oldest overwritten). */
 static void release_ring_push(UvRelaySource *src, gint64 t_us, guint pkts,
                               guint frames, guint bytes, double gap_ms) {
+    if (!src->release_ring) return;
     UvReleaseChunk *rec = &src->release_ring[src->release_head];
     rec->t_us = t_us;
     rec->pkts = pkts;
@@ -771,12 +793,23 @@ static void release_process_packet(RelayController *rc, UvRelaySource *src,
     if (!rc || !src) return;
 
     gboolean track = is_selected && (rc->frame_block.enabled || rc->frame_release.enabled);
+    gboolean ring_on = is_selected && rc->frame_release.enabled;
     if (!track) {
+        /* Feature off / not selected: drop in-flight state and release the
+         * rings. The trailing in-flight burst (if any) is intentionally not
+         * flushed — during steady capture the ring lags by at most one burst,
+         * which closes on the next gap; at a transition the source's view is
+         * discarded anyway. */
         src->chunk_open = FALSE;
         src->frame_open = FALSE;
         src->last_pkt_us = 0;
+        release_rings_free(src);
         return;
     }
+
+    /* Rings exist only while the cadence/burst capture is on for this source. */
+    if (ring_on && !src->release_ring) release_rings_alloc(src);
+    else if (!ring_on && src->release_ring) release_rings_free(src);
 
     if (rc->frame_release.reset_requested) {
         release_state_clear(src);
@@ -1235,6 +1268,7 @@ void relay_controller_deinit(RelayController *rc) {
     for (guint i = 0; i < rc->sources_count; i++) {
         frame_block_state_free(rc->sources[i].frame_block);
         rc->sources[i].frame_block = NULL;
+        release_rings_free(&rc->sources[i]);
     }
     rc->sources_count = 0;
     rc->selected_index = -1;
@@ -1531,7 +1565,7 @@ void relay_controller_snapshot(RelayController *rc, UvViewerStats *stats, int cl
                 ? (double)src->release_overlap / (double)src->release_total : 0.0;
             if (!fr->chunks) fr->chunks = g_array_new(FALSE, TRUE, sizeof(UvReleaseChunk));
             g_array_set_size(fr->chunks, 0);
-            guint rc_count = src->release_count;
+            guint rc_count = src->release_ring ? src->release_count : 0;
             guint rc_start = (src->release_head + UV_RELEASE_CHUNK_RING - rc_count) % UV_RELEASE_CHUNK_RING;
             guint64 sum_pkts = 0, sum_frames = 0;
             for (guint i = 0; i < rc_count; i++) {
@@ -1552,7 +1586,7 @@ void relay_controller_snapshot(RelayController *rc, UvViewerStats *stats, int cl
             /* Per-frame ring → cadence timeline. */
             if (!fr->frames) fr->frames = g_array_new(FALSE, TRUE, sizeof(UvReleaseFrame));
             g_array_set_size(fr->frames, 0);
-            guint fr_count = src->frame_ring_count;
+            guint fr_count = src->frame_ring ? src->frame_ring_count : 0;
             guint fr_start = (src->frame_ring_head + UV_RELEASE_FRAME_RING - fr_count) % UV_RELEASE_FRAME_RING;
             for (guint i = 0; i < fr_count; i++) {
                 UvReleaseFrame f = src->frame_ring[(fr_start + i) % UV_RELEASE_FRAME_RING];
