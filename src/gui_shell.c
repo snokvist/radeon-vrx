@@ -199,6 +199,11 @@ typedef struct {
     double frame_release_period_ms;
     guint frame_release_window_s; // cadence timeline window in seconds
     GtkDropDown *frame_release_window_dropdown;
+    GtkDrawingArea *frame_release_overview_area;
+    guint frame_release_sel_start;  // first frame index of the detail selection
+    guint frame_release_sel_count;  // number of frames in the selection
+    gboolean frame_release_follow;  // TRUE = detail tracks the newest frames
+    GtkToggleButton *frame_release_follow_toggle;
 } GuiContext;
 
 typedef struct {
@@ -2270,11 +2275,113 @@ static void frame_release_update_summary(GuiContext *ctx) {
     g_string_free(s, TRUE);
 }
 
-/* Cadence (Gantt-style) view of completed frames over wall-clock time.
+/* Status color of a single frame, shared by the overview and detail panes.
+ * Severity order (worst first): overlap (red) > late (amber) > on-time (green). */
+static void frame_release_frame_color(const UvReleaseFrame *f, double period_ms,
+                                      double *r, double *g, double *b) {
+    if (!f) { *r = 0.20; *g = 0.74; *b = 0.30; return; }
+    if (f->overlap) {
+        *r = 0.86; *g = 0.16; *b = 0.18;                       /* cross-frame burst */
+    } else if (period_ms > 0.0 && f->lateness_ms > 0.5 * period_ms) {
+        *r = 0.96; *g = 0.55; *b = 0.18;                       /* late */
+    } else {
+        *r = 0.20; *g = 0.74; *b = 0.30;                       /* on time */
+    }
+}
+
+/* Severity rank for downsampled worst-of-pixel coloring (higher = worse). */
+static int frame_release_frame_severity(const UvReleaseFrame *f, double period_ms) {
+    if (!f) return 0;
+    if (f->overlap) return 2;
+    if (period_ms > 0.0 && f->lateness_ms > 0.5 * period_ms) return 1;
+    return 0;
+}
+
+/* Overview health strip: maps every cached frame across the full width and
+ * colors each pixel by the WORST status of the frames that fall in it, so red
+ * clusters survive heavy downsampling (len can exceed the pixel width). The
+ * translucent selection rectangle marks the slice the detail pane shows. */
+static void frame_release_overview_draw(GtkDrawingArea *area, cairo_t *cr,
+                                        int width, int height, gpointer user_data) {
+    (void)area;
+    GuiContext *ctx = user_data;
+
+    cairo_save(cr);
+    cairo_set_source_rgb(cr, 0.10, 0.10, 0.12);
+    cairo_rectangle(cr, 0, 0, width, height);
+    cairo_fill(cr);
+    cairo_restore(cr);
+
+    if (!ctx || width <= 0 || height <= 0) return;
+
+    cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
+
+    GArray *frames = ctx->frame_release_frames;
+    guint len = frames ? frames->len : 0;
+    if (len == 0) {
+        cairo_set_source_rgb(cr, 0.7, 0.7, 0.7);
+        cairo_set_font_size(cr, 12.0);
+        cairo_move_to(cr, 10.0, height / 2.0 + 4.0);
+        cairo_show_text(cr, ctx->frame_release_active
+                            ? "Waiting for frame cadence..."
+                            : "Frame release capture disabled.");
+        return;
+    }
+
+    double period_ms = ctx->frame_release_period_ms;
+    double w = (double)width;
+
+    /* Accumulate the worst severity per column, then paint each column once. */
+    for (int px = 0; px < width; px++) {
+        guint i0 = (guint)((double)px / w * (double)len);
+        guint i1 = (guint)((double)(px + 1) / w * (double)len);
+        if (i1 <= i0) i1 = i0 + 1;
+        if (i1 > len) i1 = len;
+
+        int worst = -1;
+        for (guint i = i0; i < i1; i++) {
+            const UvReleaseFrame *f = &g_array_index(frames, UvReleaseFrame, i);
+            int sev = frame_release_frame_severity(f, period_ms);
+            if (sev > worst) worst = sev;
+        }
+        if (worst < 0) continue;
+
+        double r, g, b;
+        if (worst >= 2)      { r = 0.86; g = 0.16; b = 0.18; }
+        else if (worst >= 1) { r = 0.96; g = 0.55; b = 0.18; }
+        else                 { r = 0.20; g = 0.74; b = 0.30; }
+        cairo_set_source_rgb(cr, r, g, b);
+        cairo_rectangle(cr, (double)px, 0.0, 1.0, (double)height);
+        cairo_fill(cr);
+    }
+
+    /* Selection rectangle (translucent fill + bright outline). */
+    guint sel_start = ctx->frame_release_sel_start;
+    guint sel_count = ctx->frame_release_sel_count;
+    if (sel_count > 0 && sel_start < len) {
+        guint sel_end = sel_start + sel_count;
+        if (sel_end > len) sel_end = len;
+        double sx0 = (double)sel_start / (double)len * w;
+        double sx1 = (double)sel_end / (double)len * w;
+        if (sx1 - sx0 < 2.0) sx1 = sx0 + 2.0;
+
+        cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 0.18);
+        cairo_rectangle(cr, sx0, 0.0, sx1 - sx0, (double)height);
+        cairo_fill(cr);
+
+        cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 0.85);
+        cairo_set_line_width(cr, 1.0);
+        cairo_rectangle(cr, sx0 + 0.5, 0.5, (sx1 - sx0) - 1.0, (double)height - 1.0);
+        cairo_stroke(cr);
+    }
+}
+
+/* Detail (Gantt-style) view of the SELECTED slice over wall-clock time.
  * X axis is time, newest at the right. Faint vertical gridlines mark the
  * expected frame cadence (frame_period_ms), phase-aligned to the newest
- * frame, so each cell is one "metronome tick". Each frame is a horizontal
- * bar from its first packet to its marker packet.
+ * frame, so each cell is one "metronome tick". Each frame is a single
+ * horizontal bar on one lane, from its first packet to its marker packet;
+ * the silence between bars is the inter-frame gap.
  *
  * Reading it: healthy = short green bars hugging the left edge of each
  * gridline cell with silence between them. Problems = bars drifting right
@@ -2297,7 +2404,13 @@ static void frame_release_timeline_draw(GtkDrawingArea *area, cairo_t *cr,
     cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
 
     GArray *frames = ctx->frame_release_frames;
-    if (!frames || frames->len == 0) {
+    guint len = frames ? frames->len : 0;
+    guint sel_start = ctx->frame_release_sel_start;
+    guint sel_count = ctx->frame_release_sel_count;
+    if (sel_start >= len) sel_count = 0;
+    else if (sel_start + sel_count > len) sel_count = len - sel_start;
+
+    if (len == 0 || sel_count == 0) {
         cairo_set_source_rgb(cr, 0.7, 0.7, 0.7);
         cairo_set_font_size(cr, 12.0);
         cairo_move_to(cr, 10.0, height / 2.0);
@@ -2307,15 +2420,16 @@ static void frame_release_timeline_draw(GtkDrawingArea *area, cairo_t *cr,
         return;
     }
 
-    guint window_s = ctx->frame_release_window_s ? ctx->frame_release_window_s : 2u;
     double period_ms = ctx->frame_release_period_ms;
 
-    const UvReleaseFrame *last = &g_array_index(frames, UvReleaseFrame, frames->len - 1);
+    const UvReleaseFrame *first = &g_array_index(frames, UvReleaseFrame, sel_start);
+    const UvReleaseFrame *last = &g_array_index(frames, UvReleaseFrame, sel_start + sel_count - 1);
+    gint64 t_start = first->first_us;
     gint64 t_end = last->marker_us;
-    gint64 span_us = (gint64)window_s * 1000000;
-    gint64 t_start = t_end - span_us;
     double span = (double)(t_end - t_start);
     if (span <= 0.0) span = 1.0;
+
+    gboolean labelled = (sel_count <= 40);
 
     /* Faint cadence gridlines, walking left from the newest frame. */
     if (period_ms > 0.0) {
@@ -2330,18 +2444,12 @@ static void frame_release_timeline_draw(GtkDrawingArea *area, cairo_t *cr,
         }
     }
 
-    /* Frame bars: rotate among 3 lanes by index so adjacent bars stay
-     * visually distinct. Lanes occupy the central 60% of the height. */
-    const double band_frac = 0.60;
-    double band_top = (double)height * (1.0 - band_frac) / 2.0;
-    double band_h = (double)height * band_frac;
-    const guint lane_count = 3;
-    double lane_h = band_h / (double)lane_count;
-    double bar_h = lane_h * 0.7;
+    /* Single lane, centered vertically. */
+    const double bar_h = 18.0;
+    double y = ((double)height - bar_h) / 2.0;
 
-    for (guint i = 0; i < frames->len; i++) {
+    for (guint i = sel_start; i < sel_start + sel_count; i++) {
         const UvReleaseFrame *f = &g_array_index(frames, UvReleaseFrame, i);
-        if (f->marker_us < t_start) continue;
 
         double x0 = (double)(f->first_us - t_start) / span * (double)width;
         double x1 = (double)(f->marker_us - t_start) / span * (double)width;
@@ -2350,18 +2458,27 @@ static void frame_release_timeline_draw(GtkDrawingArea *area, cairo_t *cr,
         double bw = x1 - x0;
         if (bw < 2.0) bw = 2.0;        /* keep tight single-burst frames visible */
 
-        if (f->overlap) {
-            cairo_set_source_rgb(cr, 0.86, 0.16, 0.18);            /* cross-frame burst */
-        } else if (period_ms > 0.0 && f->lateness_ms > 0.5 * period_ms) {
-            cairo_set_source_rgb(cr, 0.96, 0.55, 0.18);            /* late */
-        } else {
-            cairo_set_source_rgb(cr, 0.20, 0.74, 0.30);            /* on time */
-        }
-
-        guint lane = i % lane_count;
-        double y = band_top + (double)lane * lane_h + (lane_h - bar_h) / 2.0;
+        double r, g, b;
+        frame_release_frame_color(f, period_ms, &r, &g, &b);
+        cairo_set_source_rgb(cr, r, g, b);
         cairo_rectangle(cr, x0, y, bw, bar_h);
         cairo_fill(cr);
+
+        if (labelled) {
+            /* Thin marker tick at the frame's marker time. */
+            cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 0.55);
+            cairo_set_line_width(cr, 1.0);
+            cairo_move_to(cr, x1, y - 4.0);
+            cairo_line_to(cr, x1, y + bar_h + 4.0);
+            cairo_stroke(cr);
+
+            char lbl[48];
+            g_snprintf(lbl, sizeof(lbl), "%.1fms %up", f->lateness_ms, f->pkts);
+            cairo_set_source_rgb(cr, 0.82, 0.82, 0.85);
+            cairo_set_font_size(cr, 9.0);
+            cairo_move_to(cr, x0, y + bar_h + 14.0);
+            cairo_show_text(cr, lbl);
+        }
     }
 
     /* Baseline axis along the bottom. */
@@ -2371,18 +2488,18 @@ static void frame_release_timeline_draw(GtkDrawingArea *area, cairo_t *cr,
     cairo_line_to(cr, (double)width, (double)height - 0.5);
     cairo_stroke(cr);
 
-    /* Right-aligned "now" / "-Ns" time ticks if there is room. */
+    /* Left/right time ticks span the selection: left = -<span>s, right = newest. */
     if (width > 120) {
         cairo_set_source_rgb(cr, 0.70, 0.70, 0.73);
         cairo_set_font_size(cr, 10.0);
         cairo_text_extents_t ext;
-        const char *now_lbl = "now";
+        const char *now_lbl = "now-ish";
         cairo_text_extents(cr, now_lbl, &ext);
         cairo_move_to(cr, (double)width - ext.width - 4.0, (double)height - 4.0);
         cairo_show_text(cr, now_lbl);
 
-        char past_lbl[16];
-        g_snprintf(past_lbl, sizeof(past_lbl), "-%us", window_s);
+        char past_lbl[24];
+        g_snprintf(past_lbl, sizeof(past_lbl), "-%.1fs", span / 1.0e6);
         cairo_move_to(cr, 4.0, (double)height - 4.0);
         cairo_show_text(cr, past_lbl);
     }
@@ -2508,7 +2625,40 @@ static void refresh_frame_release(GuiContext *ctx, const UvViewerStats *stats) {
         }
     }
 
+    /* Maintain the detail selection over the freshly cached frame array. */
+    guint n = ctx->frame_release_frames ? ctx->frame_release_frames->len : 0;
+    if (n == 0) {
+        ctx->frame_release_sel_start = 0;
+        ctx->frame_release_sel_count = 0;
+    } else if (ctx->frame_release_follow) {
+        double period_ms = ctx->frame_release_period_ms;
+        guint window_s = ctx->frame_release_window_s ? ctx->frame_release_window_s : 2u;
+        guint want;
+        if (period_ms > 0.0) {
+            want = (guint)((double)window_s * 1000.0 / period_ms + 0.5);
+        } else {
+            want = 120u;  /* sane default when cadence not yet known */
+        }
+        if (want < 4u) want = 4u;
+        if (want > n) want = n;
+        ctx->frame_release_sel_count = want;
+        ctx->frame_release_sel_start = n - want;
+    } else {
+        /* Frozen selection: clamp into the valid range. NOTE: while not
+         * following AND live, new frames keep arriving, so a frozen window
+         * drifts relative to the newest frame — pausing capture is the
+         * intended inspect workflow. */
+        if (ctx->frame_release_sel_start >= n) ctx->frame_release_sel_start = n - 1;
+        if (ctx->frame_release_sel_count < 4u) ctx->frame_release_sel_count = 4u;
+        if (ctx->frame_release_sel_start + ctx->frame_release_sel_count > n) {
+            ctx->frame_release_sel_count = n - ctx->frame_release_sel_start;
+        }
+    }
+
     frame_release_update_summary(ctx);
+    if (ctx->frame_release_overview_area) {
+        gtk_widget_queue_draw(GTK_WIDGET(ctx->frame_release_overview_area));
+    }
     if (ctx->frame_release_timeline_area) {
         gtk_widget_queue_draw(GTK_WIDGET(ctx->frame_release_timeline_area));
     }
@@ -2560,7 +2710,10 @@ static void on_frame_release_reset_clicked(GtkButton *button, gpointer user_data
     ctx->frame_release_avg_frames = 0.0;
     ctx->frame_release_period_ms = 0.0;
     memset(ctx->frame_release_hist, 0, sizeof(ctx->frame_release_hist));
+    ctx->frame_release_sel_start = 0;
+    ctx->frame_release_sel_count = 0;
     frame_release_update_summary(ctx);
+    if (ctx->frame_release_overview_area) gtk_widget_queue_draw(GTK_WIDGET(ctx->frame_release_overview_area));
     if (ctx->frame_release_timeline_area) gtk_widget_queue_draw(GTK_WIDGET(ctx->frame_release_timeline_area));
     if (ctx->frame_release_hist_area) gtk_widget_queue_draw(GTK_WIDGET(ctx->frame_release_hist_area));
 }
@@ -2584,9 +2737,99 @@ static void on_frame_release_window_changed(GObject *dropdown, GParamSpec *pspec
     guint sel = gtk_drop_down_get_selected(GTK_DROP_DOWN(dropdown));
     if (sel >= G_N_ELEMENTS(window_seconds)) sel = 1u;
     ctx->frame_release_window_s = window_seconds[sel];
+    /* Window now means "follow window length": the next refresh recomputes the
+     * selection while following. Just queue redraws here. */
+    if (ctx->frame_release_overview_area) {
+        gtk_widget_queue_draw(GTK_WIDGET(ctx->frame_release_overview_area));
+    }
     if (ctx->frame_release_timeline_area) {
         gtk_widget_queue_draw(GTK_WIDGET(ctx->frame_release_timeline_area));
     }
+}
+
+static void on_frame_release_follow_toggled(GtkToggleButton *button, gpointer user_data) {
+    GuiContext *ctx = user_data;
+    if (!ctx || !GTK_IS_TOGGLE_BUTTON(button)) return;
+    ctx->frame_release_follow = gtk_toggle_button_get_active(button);
+    /* The next refresh applies the new mode; redraw immediately for feedback. */
+    if (ctx->frame_release_overview_area) {
+        gtk_widget_queue_draw(GTK_WIDGET(ctx->frame_release_overview_area));
+    }
+    if (ctx->frame_release_timeline_area) {
+        gtk_widget_queue_draw(GTK_WIDGET(ctx->frame_release_timeline_area));
+    }
+}
+
+/* Translate an overview x-pixel range into a frame-index selection. */
+static void frame_release_set_selection_from_px(GuiContext *ctx, double px_lo,
+                                                double px_hi, int width) {
+    if (!ctx || width <= 0) return;
+    guint len = ctx->frame_release_frames ? ctx->frame_release_frames->len : 0;
+    if (len == 0) return;
+
+    if (px_lo > px_hi) { double t = px_lo; px_lo = px_hi; px_hi = t; }
+    double w = (double)width;
+    if (px_lo < 0.0) px_lo = 0.0;
+    if (px_hi > w) px_hi = w;
+
+    const guint min_count = 4u;
+    guint i_lo = (guint)(px_lo / w * (double)len);
+    guint i_hi = (guint)(px_hi / w * (double)len);
+    if (i_lo >= len) i_lo = len - 1;
+    if (i_hi > len) i_hi = len;
+
+    guint count = (i_hi > i_lo) ? (i_hi - i_lo) : 0;
+    if (px_hi - px_lo < 3.0 || count < min_count) {
+        /* Treat as a click: a default-width window centered on the point. */
+        guint def = (len < 60u) ? len : 60u;
+        guint center = (guint)((px_lo + px_hi) * 0.5 / w * (double)len);
+        if (center >= len) center = len - 1;
+        guint half = def / 2u;
+        i_lo = (center > half) ? (center - half) : 0u;
+        count = def;
+        if (i_lo + count > len) {
+            i_lo = (len > count) ? (len - count) : 0u;
+            count = len - i_lo;
+        }
+    }
+    if (count < min_count) count = (len < min_count) ? len : min_count;
+    if (i_lo + count > len) i_lo = len - count;
+
+    ctx->frame_release_sel_start = i_lo;
+    ctx->frame_release_sel_count = count;
+    ctx->frame_release_follow = FALSE;
+    if (ctx->frame_release_follow_toggle) {
+        gtk_toggle_button_set_active(ctx->frame_release_follow_toggle, FALSE);
+    }
+    if (ctx->frame_release_overview_area) {
+        gtk_widget_queue_draw(GTK_WIDGET(ctx->frame_release_overview_area));
+    }
+    if (ctx->frame_release_timeline_area) {
+        gtk_widget_queue_draw(GTK_WIDGET(ctx->frame_release_timeline_area));
+    }
+}
+
+static void on_frame_release_overview_drag_begin(GtkGestureDrag *gesture,
+                                                 double start_x, double start_y,
+                                                 gpointer user_data) {
+    (void)start_y;
+    GuiContext *ctx = user_data;
+    if (!ctx || !ctx->frame_release_overview_area) return;
+    int width = gtk_widget_get_width(GTK_WIDGET(ctx->frame_release_overview_area));
+    frame_release_set_selection_from_px(ctx, start_x, start_x, width);
+    (void)gesture;
+}
+
+static void on_frame_release_overview_drag_update(GtkGestureDrag *gesture,
+                                                  double offset_x, double offset_y,
+                                                  gpointer user_data) {
+    (void)offset_y;
+    GuiContext *ctx = user_data;
+    if (!ctx || !ctx->frame_release_overview_area) return;
+    double start_x = 0.0, start_y = 0.0;
+    gtk_gesture_drag_get_start_point(gesture, &start_x, &start_y);
+    int width = gtk_widget_get_width(GTK_WIDGET(ctx->frame_release_overview_area));
+    frame_release_set_selection_from_px(ctx, start_x, start_x + offset_x, width);
 }
 
 static void refresh_stats(GuiContext *ctx) {
@@ -4977,6 +5220,13 @@ static GtkWidget *build_frame_release_page(GuiContext *ctx) {
     gtk_box_append(GTK_BOX(window_box), GTK_WIDGET(ctx->frame_release_window_dropdown));
     gtk_box_append(GTK_BOX(controls), window_box);
 
+    ctx->frame_release_follow_toggle =
+        GTK_TOGGLE_BUTTON(gtk_toggle_button_new_with_label("Follow latest"));
+    gtk_toggle_button_set_active(ctx->frame_release_follow_toggle, ctx->frame_release_follow);
+    g_signal_connect(ctx->frame_release_follow_toggle, "toggled",
+                     G_CALLBACK(on_frame_release_follow_toggled), ctx);
+    gtk_box_append(GTK_BOX(controls), GTK_WIDGET(ctx->frame_release_follow_toggle));
+
     GtkWidget *help = gtk_label_new("?");
     gtk_widget_add_css_class(help, "dim-label");
     gtk_widget_set_tooltip_text(help,
@@ -4987,18 +5237,44 @@ static GtkWidget *build_frame_release_page(GuiContext *ctx) {
         "one burst from the next.");
     gtk_box_append(GTK_BOX(controls), help);
 
-    /* Release timeline drawing area. */
+    /* Overview health strip (whole capture, drag to select). */
+    GtkWidget *overview_frame = gtk_frame_new(NULL);
+    gtk_widget_set_hexpand(overview_frame, TRUE);
+    gtk_widget_set_vexpand(overview_frame, FALSE);
+
+    GtkWidget *overview_title = gtk_label_new("Overview (whole capture — drag to select)");
+    gtk_label_set_xalign(GTK_LABEL(overview_title), 0.0);
+    gtk_frame_set_label_widget(GTK_FRAME(overview_frame), overview_title);
+
+    GtkWidget *overview_area = gtk_drawing_area_new();
+    ctx->frame_release_overview_area = GTK_DRAWING_AREA(overview_area);
+    gtk_widget_set_size_request(overview_area, 900, 46);
+    gtk_widget_set_hexpand(overview_area, TRUE);
+    gtk_widget_set_vexpand(overview_area, FALSE);
+    gtk_drawing_area_set_draw_func(ctx->frame_release_overview_area, frame_release_overview_draw, ctx, NULL);
+
+    GtkGesture *overview_drag = gtk_gesture_drag_new();
+    g_signal_connect(overview_drag, "drag-begin",
+                     G_CALLBACK(on_frame_release_overview_drag_begin), ctx);
+    g_signal_connect(overview_drag, "drag-update",
+                     G_CALLBACK(on_frame_release_overview_drag_update), ctx);
+    gtk_widget_add_controller(overview_area, GTK_EVENT_CONTROLLER(overview_drag));
+
+    gtk_frame_set_child(GTK_FRAME(overview_frame), overview_area);
+    gtk_box_append(GTK_BOX(content), overview_frame);
+
+    /* Detail (selected range) — single-lane Gantt of the selection. */
     GtkWidget *timeline_frame = gtk_frame_new(NULL);
     gtk_widget_set_hexpand(timeline_frame, TRUE);
     gtk_widget_set_vexpand(timeline_frame, TRUE);
 
-    GtkWidget *timeline_title = gtk_label_new("Cadence Timeline (newest at right)");
+    GtkWidget *timeline_title = gtk_label_new("Detail (selected range)");
     gtk_label_set_xalign(GTK_LABEL(timeline_title), 0.0);
     gtk_frame_set_label_widget(GTK_FRAME(timeline_frame), timeline_title);
 
     GtkWidget *timeline_area = gtk_drawing_area_new();
     ctx->frame_release_timeline_area = GTK_DRAWING_AREA(timeline_area);
-    gtk_widget_set_size_request(timeline_area, 900, 300);
+    gtk_widget_set_size_request(timeline_area, 900, 260);
     gtk_widget_set_hexpand(timeline_area, TRUE);
     gtk_widget_set_vexpand(timeline_area, TRUE);
     gtk_drawing_area_set_draw_func(ctx->frame_release_timeline_area, frame_release_timeline_draw, ctx, NULL);
@@ -5455,6 +5731,8 @@ static void on_app_shutdown(GApplication *app, gpointer user_data) {
     ctx->frame_release_reset_button = NULL;
     ctx->frame_release_gap_spin = NULL;
     ctx->frame_release_window_dropdown = NULL;
+    ctx->frame_release_follow_toggle = NULL;
+    ctx->frame_release_overview_area = NULL;
     ctx->frame_release_timeline_area = NULL;
     ctx->frame_release_hist_area = NULL;
     ctx->frame_release_summary_label = NULL;
@@ -5541,6 +5819,9 @@ int uv_gui_run(UvViewer **viewer, UvViewerConfig *cfg, const char *program_name)
     ctx->frame_release_period_ms = 0.0;
     ctx->frame_release_window_s = 2u;
     ctx->frame_release_gap_us = 500.0;
+    ctx->frame_release_follow = TRUE;
+    ctx->frame_release_sel_start = 0;
+    ctx->frame_release_sel_count = 0;
     ctx->frame_block_missing = 0;
     ctx->frame_block_real_samples = 0;
     ctx->known_source_count = 0;
