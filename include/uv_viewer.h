@@ -148,7 +148,56 @@ typedef struct {
     guint color_counts_size[4];
     GArray *lateness_ms;   // double values for current snapshot (size width*height)
     GArray *frame_size_kb; // double values for current snapshot (size width*height)
+
+    /* Additional per-frame metrics (appended for the FEC chunk-release work).
+     * span_ms     = wall-clock from the frame's first RTP packet to its marker
+     *               packet (how long all of the frame's packets took to land).
+     * chunks_per_frame = number of distinct release bursts (FEC blocks) the
+     *               frame's packets were spread across (1 = single clean burst).
+     * Same grid layout / sentinels as lateness_ms / frame_size_kb. */
+    double thresholds_span_ms[3];
+    double thresholds_chunks[3];
+    double min_span_ms;
+    double max_span_ms;
+    double avg_span_ms;
+    double min_chunks;
+    double max_chunks;
+    double avg_chunks;
+    guint color_counts_span[4];
+    guint color_counts_chunks[4];
+    GArray *span_ms;          // double values, size width*height
+    GArray *chunks_per_frame; // double values, size width*height
 } UvFrameBlockStats;
+
+/* Frame-release (FEC chunk) telemetry. wfb-ng releases RTP packets in
+ * Reed-Solomon block-aligned bursts; a burst boundary does not align to a
+ * frame boundary, so a single burst can carry the tail of one frame and the
+ * head of the next ("overlap") which downstream turns into a frame drop.
+ * A "chunk" here is a run of packets whose inter-arrival gap stayed below the
+ * configured gap threshold (i.e. one release burst). */
+#define UV_RELEASE_FRAMES_BUCKETS 4u  /* histogram: 1, 2, 3, 4+ frames touched */
+
+typedef struct {
+    gint64   t_us;      // monotonic time the chunk closed
+    guint    pkts;      // packets in the burst
+    guint    frames;    // distinct frames (RTP timestamps) the burst touched
+    guint    bytes;     // payload+header bytes in the burst
+    double   gap_ms;    // idle gap before this burst started
+    gboolean overlap;   // TRUE when frames >= 2 (cross-frame burst => drop risk)
+} UvReleaseChunk;
+
+typedef struct {
+    gboolean active;
+    gboolean paused;
+    double   gap_us;              // current chunk-gap threshold (burst separator)
+    guint64  total_chunks;        // lifetime, since last reset
+    guint64  overlap_chunks;      // lifetime chunks with frames >= 2
+    double   overlap_rate;        // overlap_chunks / total_chunks (0..1)
+    double   avg_pkts_per_chunk;
+    double   avg_frames_per_chunk;
+    guint    hist_frames[UV_RELEASE_FRAMES_BUCKETS]; // over retained ring window
+    GArray  *chunks;             // UvReleaseChunk, oldest-first, most recent last
+} UvReleaseStats;
 
 /* Encoder-side telemetry received over the waybeam_venc RTP sidecar
  * protocol (UDP). Subscribed when sidecar_enabled is TRUE and a source
@@ -211,6 +260,8 @@ typedef struct {
     UvQueueStats queue0;
     gboolean frame_block_valid;
     UvFrameBlockStats frame_block;
+    gboolean frame_release_valid;
+    UvReleaseStats frame_release;
     UvSidecarStats sidecar;
 } UvViewerStats;
 
@@ -270,6 +321,21 @@ void uv_viewer_frame_block_set_size_thresholds(UvViewer *viewer,
                                                double green_kb,
                                                double yellow_kb,
                                                double orange_kb);
+void uv_viewer_frame_block_set_span_thresholds(UvViewer *viewer,
+                                               double green_ms,
+                                               double yellow_ms,
+                                               double orange_ms);
+void uv_viewer_frame_block_set_chunk_thresholds(UvViewer *viewer,
+                                                double green,
+                                                double yellow,
+                                                double orange);
+
+/* Frame-release (FEC chunk) tracking. Independent of the frame-block grid;
+ * shares the relay receive thread. */
+void uv_viewer_frame_release_configure(UvViewer *viewer, gboolean enabled);
+void uv_viewer_frame_release_pause(UvViewer *viewer, gboolean paused);
+void uv_viewer_frame_release_reset(UvViewer *viewer);
+void uv_viewer_frame_release_set_gap_us(UvViewer *viewer, double gap_us);
 
 void uv_viewer_stats_init(UvViewerStats *stats);
 void uv_viewer_stats_clear(UvViewerStats *stats);

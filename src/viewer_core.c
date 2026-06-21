@@ -262,6 +262,42 @@ void uv_viewer_frame_block_set_size_thresholds(UvViewer *viewer,
     relay_controller_frame_block_set_size_thresholds(&viewer->relay, green_kb, yellow_kb, orange_kb);
 }
 
+void uv_viewer_frame_block_set_span_thresholds(UvViewer *viewer,
+                                               double green_ms,
+                                               double yellow_ms,
+                                               double orange_ms) {
+    if (!viewer) return;
+    relay_controller_frame_block_set_span_thresholds(&viewer->relay, green_ms, yellow_ms, orange_ms);
+}
+
+void uv_viewer_frame_block_set_chunk_thresholds(UvViewer *viewer,
+                                                double green,
+                                                double yellow,
+                                                double orange) {
+    if (!viewer) return;
+    relay_controller_frame_block_set_chunk_thresholds(&viewer->relay, green, yellow, orange);
+}
+
+void uv_viewer_frame_release_configure(UvViewer *viewer, gboolean enabled) {
+    if (!viewer) return;
+    relay_controller_frame_release_configure(&viewer->relay, enabled);
+}
+
+void uv_viewer_frame_release_pause(UvViewer *viewer, gboolean paused) {
+    if (!viewer) return;
+    relay_controller_frame_release_pause(&viewer->relay, paused);
+}
+
+void uv_viewer_frame_release_reset(UvViewer *viewer) {
+    if (!viewer) return;
+    relay_controller_frame_release_reset(&viewer->relay);
+}
+
+void uv_viewer_frame_release_set_gap_us(UvViewer *viewer, double gap_us) {
+    if (!viewer) return;
+    relay_controller_frame_release_set_gap_us(&viewer->relay, gap_us);
+}
+
 void uv_viewer_stats_init(UvViewerStats *stats) {
     if (!stats) return;
     stats->sources = g_array_new(FALSE, TRUE, sizeof(UvSourceStats));
@@ -275,8 +311,13 @@ void uv_viewer_stats_init(UvViewerStats *stats) {
     memset(&stats->frame_block, 0, sizeof(stats->frame_block));
     stats->frame_block.lateness_ms = g_array_new(FALSE, TRUE, sizeof(double));
     stats->frame_block.frame_size_kb = g_array_new(FALSE, TRUE, sizeof(double));
+    stats->frame_block.span_ms = g_array_new(FALSE, TRUE, sizeof(double));
+    stats->frame_block.chunks_per_frame = g_array_new(FALSE, TRUE, sizeof(double));
     stats->frame_block.real_frames = 0;
     stats->frame_block.missing_frames = 0;
+    stats->frame_release_valid = FALSE;
+    memset(&stats->frame_release, 0, sizeof(stats->frame_release));
+    stats->frame_release.chunks = g_array_new(FALSE, TRUE, sizeof(UvReleaseChunk));
     memset(&stats->sidecar, 0, sizeof(stats->sidecar));
     stats->sidecar.seconds_since_last_frame = -1.0;
 }
@@ -304,8 +345,22 @@ void uv_viewer_stats_clear(UvViewerStats *stats) {
         g_array_unref(stats->frame_block.frame_size_kb);
         stats->frame_block.frame_size_kb = NULL;
     }
+    if (stats->frame_block.span_ms) {
+        g_array_unref(stats->frame_block.span_ms);
+        stats->frame_block.span_ms = NULL;
+    }
+    if (stats->frame_block.chunks_per_frame) {
+        g_array_unref(stats->frame_block.chunks_per_frame);
+        stats->frame_block.chunks_per_frame = NULL;
+    }
     stats->frame_block_valid = FALSE;
     memset(&stats->frame_block, 0, sizeof(stats->frame_block));
+    if (stats->frame_release.chunks) {
+        g_array_unref(stats->frame_release.chunks);
+        stats->frame_release.chunks = NULL;
+    }
+    stats->frame_release_valid = FALSE;
+    memset(&stats->frame_release, 0, sizeof(stats->frame_release));
 }
 
 bool uv_viewer_get_stats(UvViewer *viewer, UvViewerStats *stats) {
