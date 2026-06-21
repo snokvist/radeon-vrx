@@ -17,6 +17,7 @@ G_BEGIN_DECLS
 #define UV_SOURCE_FRAME_FPS_WINDOW_SAMPLES 512u
 #define UV_DECODER_FPS_WINDOW_SAMPLES 512u
 #define UV_RELEASE_CHUNK_RING 512u
+#define UV_RELEASE_FRAME_RING 1024u
 #define UV_RELEASE_DEFAULT_GAP_US 500.0
 
 struct UvFrameBlockState;
@@ -61,6 +62,20 @@ typedef struct {
     gboolean frame_open;
     gint64   frame_first_pkt_us;   /* arrival of the frame's first packet */
     guint    frame_chunk_count;    /* release bursts the frame spanned so far */
+    guint    frame_pkts;           /* packets in the current frame */
+    gboolean frame_overlap;        /* first packet joined the previous burst */
+
+    /* Independent marker-cadence baseline (decoupled from the frame-block grid
+     * state so the cadence ring works even when the grid is disabled). */
+    gboolean have_marker_baseline;
+    gint64   last_marker_us;
+    uint32_t last_marker_ts;
+    double   frame_period_ms;      /* EWMA of marker-to-marker RTP-ts period */
+
+    /* Per-frame ring for the cadence timeline. */
+    UvReleaseFrame frame_ring[UV_RELEASE_FRAME_RING];
+    guint    frame_ring_head;
+    guint    frame_ring_count;
 
     /* Release-burst (FEC chunk) accumulator + ring (Part B). A chunk is a run
      * of packets whose inter-arrival gap stayed below frame_release.gap_us. */
@@ -117,6 +132,7 @@ typedef struct {
         double thresholds_kb[3];
         double thresholds_span[3];   /* span_ms metric (computed at snapshot) */
         double thresholds_chunks[3]; /* chunks-per-frame metric */
+        double thresholds_fpc[3];    /* frames-per-chunk metric */
         gboolean reset_requested;
         gboolean thresholds_dirty_ms;
         gboolean thresholds_dirty_kb;
@@ -344,6 +360,10 @@ void     relay_controller_frame_block_set_chunk_thresholds(RelayController *rc,
                                                            double green,
                                                            double yellow,
                                                            double orange);
+void     relay_controller_frame_block_set_overlap_thresholds(RelayController *rc,
+                                                             double green,
+                                                             double yellow,
+                                                             double orange);
 void     relay_controller_frame_release_configure(RelayController *rc, gboolean enabled);
 void     relay_controller_frame_release_pause(RelayController *rc, gboolean paused);
 void     relay_controller_frame_release_reset(RelayController *rc);

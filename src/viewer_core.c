@@ -278,6 +278,14 @@ void uv_viewer_frame_block_set_chunk_thresholds(UvViewer *viewer,
     relay_controller_frame_block_set_chunk_thresholds(&viewer->relay, green, yellow, orange);
 }
 
+void uv_viewer_frame_block_set_overlap_thresholds(UvViewer *viewer,
+                                                  double green,
+                                                  double yellow,
+                                                  double orange) {
+    if (!viewer) return;
+    relay_controller_frame_block_set_overlap_thresholds(&viewer->relay, green, yellow, orange);
+}
+
 void uv_viewer_frame_release_configure(UvViewer *viewer, gboolean enabled) {
     if (!viewer) return;
     relay_controller_frame_release_configure(&viewer->relay, enabled);
@@ -313,11 +321,13 @@ void uv_viewer_stats_init(UvViewerStats *stats) {
     stats->frame_block.frame_size_kb = g_array_new(FALSE, TRUE, sizeof(double));
     stats->frame_block.span_ms = g_array_new(FALSE, TRUE, sizeof(double));
     stats->frame_block.chunks_per_frame = g_array_new(FALSE, TRUE, sizeof(double));
+    stats->frame_block.frames_per_chunk = g_array_new(FALSE, TRUE, sizeof(double));
     stats->frame_block.real_frames = 0;
     stats->frame_block.missing_frames = 0;
     stats->frame_release_valid = FALSE;
     memset(&stats->frame_release, 0, sizeof(stats->frame_release));
     stats->frame_release.chunks = g_array_new(FALSE, TRUE, sizeof(UvReleaseChunk));
+    stats->frame_release.frames = g_array_new(FALSE, TRUE, sizeof(UvReleaseFrame));
     memset(&stats->sidecar, 0, sizeof(stats->sidecar));
     stats->sidecar.seconds_since_last_frame = -1.0;
 }
@@ -353,11 +363,19 @@ void uv_viewer_stats_clear(UvViewerStats *stats) {
         g_array_unref(stats->frame_block.chunks_per_frame);
         stats->frame_block.chunks_per_frame = NULL;
     }
+    if (stats->frame_block.frames_per_chunk) {
+        g_array_unref(stats->frame_block.frames_per_chunk);
+        stats->frame_block.frames_per_chunk = NULL;
+    }
     stats->frame_block_valid = FALSE;
     memset(&stats->frame_block, 0, sizeof(stats->frame_block));
     if (stats->frame_release.chunks) {
         g_array_unref(stats->frame_release.chunks);
         stats->frame_release.chunks = NULL;
+    }
+    if (stats->frame_release.frames) {
+        g_array_unref(stats->frame_release.frames);
+        stats->frame_release.frames = NULL;
     }
     stats->frame_release_valid = FALSE;
     memset(&stats->frame_release, 0, sizeof(stats->frame_release));

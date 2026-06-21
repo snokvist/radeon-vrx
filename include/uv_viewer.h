@@ -167,6 +167,17 @@ typedef struct {
     guint color_counts_chunks[4];
     GArray *span_ms;          // double values, size width*height
     GArray *chunks_per_frame; // double values, size width*height
+
+    /* frames_per_chunk = the size of the release burst this frame's first
+     * packet landed in, in frames: 1 = the burst carried only this frame,
+     * 2 = it also carried the previous frame's tail (cross-frame burst). The
+     * dual of chunks_per_frame. Same grid layout / sentinels. */
+    double thresholds_fpc[3];
+    double min_fpc;
+    double max_fpc;
+    double avg_fpc;
+    guint color_counts_fpc[4];
+    GArray *frames_per_chunk; // double values, size width*height
 } UvFrameBlockStats;
 
 /* Frame-release (FEC chunk) telemetry. wfb-ng releases RTP packets in
@@ -186,10 +197,21 @@ typedef struct {
     gboolean overlap;   // TRUE when frames >= 2 (cross-frame burst => drop risk)
 } UvReleaseChunk;
 
+/* One completed frame, for the cadence timeline. Times are monotonic µs. */
+typedef struct {
+    gint64   first_us;     // arrival of the frame's first RTP packet
+    gint64   marker_us;    // arrival of the frame's marker (last) packet
+    guint    pkts;         // packets in the frame
+    guint    chunks;       // release bursts the frame spanned (chunks/frame)
+    double   lateness_ms;  // marker arrival vs expected cadence (>=0)
+    gboolean overlap;      // first packet shared a burst with the previous frame
+} UvReleaseFrame;
+
 typedef struct {
     gboolean active;
     gboolean paused;
     double   gap_us;              // current chunk-gap threshold (burst separator)
+    double   frame_period_ms;     // measured frame cadence (EWMA), 0 if unknown
     guint64  total_chunks;        // lifetime, since last reset
     guint64  overlap_chunks;      // lifetime chunks with frames >= 2
     double   overlap_rate;        // overlap_chunks / total_chunks (0..1)
@@ -197,6 +219,7 @@ typedef struct {
     double   avg_frames_per_chunk;
     guint    hist_frames[UV_RELEASE_FRAMES_BUCKETS]; // over retained ring window
     GArray  *chunks;             // UvReleaseChunk, oldest-first, most recent last
+    GArray  *frames;             // UvReleaseFrame, oldest-first (cadence timeline)
 } UvReleaseStats;
 
 /* Encoder-side telemetry received over the waybeam_venc RTP sidecar
@@ -329,6 +352,10 @@ void uv_viewer_frame_block_set_chunk_thresholds(UvViewer *viewer,
                                                 double green,
                                                 double yellow,
                                                 double orange);
+void uv_viewer_frame_block_set_overlap_thresholds(UvViewer *viewer,
+                                                  double green,
+                                                  double yellow,
+                                                  double orange);
 
 /* Frame-release (FEC chunk) tracking. Independent of the frame-block grid;
  * shares the relay receive thread. */

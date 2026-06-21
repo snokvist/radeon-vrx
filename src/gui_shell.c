@@ -21,6 +21,9 @@
 #define FRAME_BLOCK_DEFAULT_CHUNK_GREEN     1.0
 #define FRAME_BLOCK_DEFAULT_CHUNK_YELLOW    2.0
 #define FRAME_BLOCK_DEFAULT_CHUNK_ORANGE    3.0
+#define FRAME_BLOCK_DEFAULT_FPC_GREEN       1.0
+#define FRAME_BLOCK_DEFAULT_FPC_YELLOW      2.0
+#define FRAME_BLOCK_DEFAULT_FPC_ORANGE      3.0
 #define FRAME_BLOCK_MISSING_SENTINEL (-1.0)
 
 typedef enum {
@@ -135,11 +138,17 @@ typedef struct {
     double frame_block_avg_chunks;
     guint frame_block_color_counts_span[4];
     guint frame_block_color_counts_chunks[4];
+    double frame_block_thresholds_fpc[3];
+    double frame_block_min_fpc;
+    double frame_block_max_fpc;
+    double frame_block_avg_fpc;
+    guint frame_block_color_counts_fpc[4];
     GArray *frame_block_values_lateness; // doubles
     GArray *frame_block_values_size;     // doubles
     GArray *frame_block_values_span;     // doubles
     GArray *frame_block_values_chunks;   // doubles
-    guint frame_block_view; // 0=lateness, 1=size, 2=span, 3=chunks
+    GArray *frame_block_values_fpc;      // doubles (frames-per-chunk / burst overlap)
+    guint frame_block_view; // 0=lateness, 1=size, 2=span, 3=chunks, 4=frames-per-chunk
     guint frame_block_missing;
     guint frame_block_real_samples;
     gboolean audio_runtime_enabled;
@@ -186,6 +195,10 @@ typedef struct {
     double frame_release_avg_frames;
     guint frame_release_hist[UV_RELEASE_FRAMES_BUCKETS];
     GArray *frame_release_chunks; // UvReleaseChunk, oldest-first
+    GArray *frame_release_frames; // UvReleaseFrame, oldest-first (cadence timeline)
+    double frame_release_period_ms;
+    guint frame_release_window_s; // cadence timeline window in seconds
+    GtkDropDown *frame_release_window_dropdown;
 } GuiContext;
 
 typedef struct {
@@ -224,7 +237,8 @@ typedef struct {
 #define FRAME_BLOCK_VIEW_SIZE     1u
 #define FRAME_BLOCK_VIEW_SPAN     2u
 #define FRAME_BLOCK_VIEW_CHUNKS   3u
-#define FRAME_BLOCK_VIEW_COUNT    4u
+#define FRAME_BLOCK_VIEW_FPC      4u
+#define FRAME_BLOCK_VIEW_COUNT    5u
 #define FRAME_OVERLAY_METRIC_LATENESS 0u
 #define FRAME_OVERLAY_METRIC_SIZE     1u
 
@@ -425,6 +439,12 @@ static void frame_block_reset_local_buffers(GuiContext *ctx, guint width, guint 
             g_array_index(ctx->frame_block_values_chunks, double, i) = NAN;
         }
     }
+    if (ctx->frame_block_values_fpc) {
+        g_array_set_size(ctx->frame_block_values_fpc, capacity);
+        for (guint i = 0; i < ctx->frame_block_values_fpc->len; i++) {
+            g_array_index(ctx->frame_block_values_fpc, double, i) = NAN;
+        }
+    }
 }
 
 /* Per-view accessor helpers so the 4 metrics share one code path. */
@@ -433,6 +453,7 @@ static GArray *frame_block_view_values(GuiContext *ctx, guint view) {
         case FRAME_BLOCK_VIEW_SIZE:   return ctx->frame_block_values_size;
         case FRAME_BLOCK_VIEW_SPAN:   return ctx->frame_block_values_span;
         case FRAME_BLOCK_VIEW_CHUNKS: return ctx->frame_block_values_chunks;
+        case FRAME_BLOCK_VIEW_FPC:    return ctx->frame_block_values_fpc;
         case FRAME_BLOCK_VIEW_LATENESS:
         default:                      return ctx->frame_block_values_lateness;
     }
@@ -443,6 +464,7 @@ static double *frame_block_view_thresholds(GuiContext *ctx, guint view) {
         case FRAME_BLOCK_VIEW_SIZE:   return ctx->frame_block_thresholds_kb;
         case FRAME_BLOCK_VIEW_SPAN:   return ctx->frame_block_thresholds_span;
         case FRAME_BLOCK_VIEW_CHUNKS: return ctx->frame_block_thresholds_chunks;
+        case FRAME_BLOCK_VIEW_FPC:    return ctx->frame_block_thresholds_fpc;
         case FRAME_BLOCK_VIEW_LATENESS:
         default:                      return ctx->frame_block_thresholds_ms;
     }
@@ -453,6 +475,7 @@ static guint *frame_block_view_color_counts(GuiContext *ctx, guint view) {
         case FRAME_BLOCK_VIEW_SIZE:   return ctx->frame_block_color_counts_kb;
         case FRAME_BLOCK_VIEW_SPAN:   return ctx->frame_block_color_counts_span;
         case FRAME_BLOCK_VIEW_CHUNKS: return ctx->frame_block_color_counts_chunks;
+        case FRAME_BLOCK_VIEW_FPC:    return ctx->frame_block_color_counts_fpc;
         case FRAME_BLOCK_VIEW_LATENESS:
         default:                      return ctx->frame_block_color_counts_ms;
     }
@@ -463,6 +486,7 @@ static const char *frame_block_view_unit(guint view) {
         case FRAME_BLOCK_VIEW_SIZE:   return "KB";
         case FRAME_BLOCK_VIEW_SPAN:   return "ms";
         case FRAME_BLOCK_VIEW_CHUNKS: return "";
+        case FRAME_BLOCK_VIEW_FPC:    return "";
         case FRAME_BLOCK_VIEW_LATENESS:
         default:                      return "ms";
     }
@@ -472,7 +496,8 @@ static const char *frame_block_view_name(guint view) {
     switch (view) {
         case FRAME_BLOCK_VIEW_SIZE:   return "Size";
         case FRAME_BLOCK_VIEW_SPAN:   return "Span";
-        case FRAME_BLOCK_VIEW_CHUNKS: return "Chunks";
+        case FRAME_BLOCK_VIEW_CHUNKS: return "Frame split";
+        case FRAME_BLOCK_VIEW_FPC:    return "Frame overlap";
         case FRAME_BLOCK_VIEW_LATENESS:
         default:                      return "Lateness";
     }
@@ -483,6 +508,7 @@ static double frame_block_view_step(guint view) {
         case FRAME_BLOCK_VIEW_SIZE:   return 2.0;
         case FRAME_BLOCK_VIEW_SPAN:   return 0.5;
         case FRAME_BLOCK_VIEW_CHUNKS: return 1.0;
+        case FRAME_BLOCK_VIEW_FPC:    return 1.0;
         case FRAME_BLOCK_VIEW_LATENESS:
         default:                      return 0.5;
     }
@@ -492,6 +518,7 @@ static double frame_block_view_max(guint view) {
     switch (view) {
         case FRAME_BLOCK_VIEW_SIZE:   return 100000.0;
         case FRAME_BLOCK_VIEW_CHUNKS: return 64.0;
+        case FRAME_BLOCK_VIEW_FPC:    return 64.0;
         case FRAME_BLOCK_VIEW_SPAN:
         case FRAME_BLOCK_VIEW_LATENESS:
         default:                      return 1000.0;
@@ -499,7 +526,7 @@ static double frame_block_view_max(guint view) {
 }
 
 static guint frame_block_view_digits(guint view) {
-    return (view == FRAME_BLOCK_VIEW_CHUNKS) ? 0u : 1u;
+    return (view == FRAME_BLOCK_VIEW_CHUNKS || view == FRAME_BLOCK_VIEW_FPC) ? 0u : 1u;
 }
 
 static void frame_block_apply_thresholds(GuiContext *ctx) {
@@ -529,6 +556,9 @@ static void frame_block_apply_thresholds(GuiContext *ctx) {
             break;
         case FRAME_BLOCK_VIEW_CHUNKS:
             uv_viewer_frame_block_set_chunk_thresholds(ctx->viewer, green, yellow, orange);
+            break;
+        case FRAME_BLOCK_VIEW_FPC:
+            uv_viewer_frame_block_set_overlap_thresholds(ctx->viewer, green, yellow, orange);
             break;
         case FRAME_BLOCK_VIEW_LATENESS:
         default:
@@ -587,6 +617,11 @@ static void frame_block_update_summary(GuiContext *ctx) {
                     min_val = ctx->frame_block_min_chunks;
                     avg_val = ctx->frame_block_avg_chunks;
                     max_val = ctx->frame_block_max_chunks;
+                    break;
+                case FRAME_BLOCK_VIEW_FPC:
+                    min_val = ctx->frame_block_min_fpc;
+                    avg_val = ctx->frame_block_avg_fpc;
+                    max_val = ctx->frame_block_max_fpc;
                     break;
                 case FRAME_BLOCK_VIEW_LATENESS:
                 default:
@@ -2235,6 +2270,17 @@ static void frame_release_update_summary(GuiContext *ctx) {
     g_string_free(s, TRUE);
 }
 
+/* Cadence (Gantt-style) view of completed frames over wall-clock time.
+ * X axis is time, newest at the right. Faint vertical gridlines mark the
+ * expected frame cadence (frame_period_ms), phase-aligned to the newest
+ * frame, so each cell is one "metronome tick". Each frame is a horizontal
+ * bar from its first packet to its marker packet.
+ *
+ * Reading it: healthy = short green bars hugging the left edge of each
+ * gridline cell with silence between them. Problems = bars drifting right
+ * within a cell (late), bars spanning a gridline (frame straddles a tick),
+ * or red bars (this frame's first packet shared a release burst with the
+ * previous frame => cross-frame burst => drop risk). */
 static void frame_release_timeline_draw(GtkDrawingArea *area, cairo_t *cr,
                                         int width, int height, gpointer user_data) {
     (void)area;
@@ -2248,91 +2294,104 @@ static void frame_release_timeline_draw(GtkDrawingArea *area, cairo_t *cr,
 
     if (!ctx || width <= 0 || height <= 0) return;
 
-    GArray *chunks = ctx->frame_release_chunks;
-    if (!chunks || chunks->len == 0) {
+    cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
+
+    GArray *frames = ctx->frame_release_frames;
+    if (!frames || frames->len == 0) {
         cairo_set_source_rgb(cr, 0.7, 0.7, 0.7);
-        cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
         cairo_set_font_size(cr, 12.0);
         cairo_move_to(cr, 10.0, height / 2.0);
         cairo_show_text(cr, ctx->frame_release_active
-                            ? "Waiting for release chunks..."
+                            ? "Waiting for frame cadence..."
                             : "Frame release capture disabled.");
         return;
     }
 
-    /* Width of each band is proportional to pkts (min 2px). Walk newest
-     * (end of array) backwards, packing toward the right edge until we run
-     * out of horizontal space, then render left->right. */
-    const double min_band = 2.0;
-    const double pkt_scale = 1.5;   /* px per packet */
-    const double gap_scale = 0.6;   /* px per ms of idle gap */
-    const double max_gap_px = 16.0;
+    guint window_s = ctx->frame_release_window_s ? ctx->frame_release_window_s : 2u;
+    double period_ms = ctx->frame_release_period_ms;
 
-    guint count = chunks->len;
-    guint first = 0;             /* first index (oldest) we will draw */
-    double used = 0.0;
-    for (guint k = 0; k < count; k++) {
-        guint idx = count - 1 - k;
-        const UvReleaseChunk *c = &g_array_index(chunks, UvReleaseChunk, idx);
-        double bw = (double)c->pkts * pkt_scale;
-        if (bw < min_band) bw = min_band;
-        double gp = c->gap_ms * gap_scale;
-        if (gp < 0.0) gp = 0.0;
-        if (gp > max_gap_px) gp = max_gap_px;
-        double advance = bw + gp + 1.0; /* +1 inter-band gap */
-        if (used + advance > (double)width) {
-            first = idx + 1;
-            break;
+    const UvReleaseFrame *last = &g_array_index(frames, UvReleaseFrame, frames->len - 1);
+    gint64 t_end = last->marker_us;
+    gint64 span_us = (gint64)window_s * 1000000;
+    gint64 t_start = t_end - span_us;
+    double span = (double)(t_end - t_start);
+    if (span <= 0.0) span = 1.0;
+
+    /* Faint cadence gridlines, walking left from the newest frame. */
+    if (period_ms > 0.0) {
+        double period_us = period_ms * 1000.0;
+        cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 0.08);
+        cairo_set_line_width(cr, 1.0);
+        for (gint64 t = t_end; t >= t_start; t -= (gint64)period_us) {
+            double gx = (double)(t - t_start) / span * (double)width;
+            cairo_move_to(cr, gx, 0.0);
+            cairo_line_to(cr, gx, (double)height);
+            cairo_stroke(cr);
         }
-        used += advance;
-        first = idx;
     }
 
-    const double calm_shades[2][3] = {
-        {0.26, 0.45, 0.78},
-        {0.34, 0.60, 0.86}
-    };
-    const double overlap_shades[2][3] = {
-        {0.86, 0.16, 0.18},
-        {0.66, 0.10, 0.12}
-    };
+    /* Frame bars: rotate among 3 lanes by index so adjacent bars stay
+     * visually distinct. Lanes occupy the central 60% of the height. */
+    const double band_frac = 0.60;
+    double band_top = (double)height * (1.0 - band_frac) / 2.0;
+    double band_h = (double)height * band_frac;
+    const guint lane_count = 3;
+    double lane_h = band_h / (double)lane_count;
+    double bar_h = lane_h * 0.7;
 
-    double x = 0.0;
-    guint single_idx = 0; /* alternates for single-frame bands */
-    for (guint idx = first; idx < count; idx++) {
-        const UvReleaseChunk *c = &g_array_index(chunks, UvReleaseChunk, idx);
+    for (guint i = 0; i < frames->len; i++) {
+        const UvReleaseFrame *f = &g_array_index(frames, UvReleaseFrame, i);
+        if (f->marker_us < t_start) continue;
 
-        double gp = c->gap_ms * gap_scale;
-        if (gp < 0.0) gp = 0.0;
-        if (gp > max_gap_px) gp = max_gap_px;
-        x += gp;
+        double x0 = (double)(f->first_us - t_start) / span * (double)width;
+        double x1 = (double)(f->marker_us - t_start) / span * (double)width;
+        if (x0 < 0.0) x0 = 0.0;        /* clamp left edge into view */
+        if (x1 > (double)width) x1 = (double)width;
+        double bw = x1 - x0;
+        if (bw < 2.0) bw = 2.0;        /* keep tight single-burst frames visible */
 
-        double bw = (double)c->pkts * pkt_scale;
-        if (bw < min_band) bw = min_band;
-        if (x >= (double)width) break;
-        if (x + bw > (double)width) bw = (double)width - x;
-        if (bw <= 0.0) break;
-
-        if (c->overlap || c->frames >= 2) {
-            /* Cross-frame burst: red, split into sub-stripes per frame. */
-            guint sub = c->frames > 0 ? c->frames : 1;
-            double sub_w = bw / (double)sub;
-            for (guint s = 0; s < sub; s++) {
-                const double *col = overlap_shades[s & 1u];
-                cairo_set_source_rgb(cr, col[0], col[1], col[2]);
-                cairo_rectangle(cr, x + (double)s * sub_w, 0.0, sub_w, height);
-                cairo_fill(cr);
-            }
+        if (f->overlap) {
+            cairo_set_source_rgb(cr, 0.86, 0.16, 0.18);            /* cross-frame burst */
+        } else if (period_ms > 0.0 && f->lateness_ms > 0.5 * period_ms) {
+            cairo_set_source_rgb(cr, 0.96, 0.55, 0.18);            /* late */
         } else {
-            const double *col = calm_shades[single_idx & 1u];
-            single_idx++;
-            cairo_set_source_rgb(cr, col[0], col[1], col[2]);
-            cairo_rectangle(cr, x, 0.0, bw, height);
-            cairo_fill(cr);
+            cairo_set_source_rgb(cr, 0.20, 0.74, 0.30);            /* on time */
         }
 
-        x += bw + 1.0; /* 1px inter-band gap */
+        guint lane = i % lane_count;
+        double y = band_top + (double)lane * lane_h + (lane_h - bar_h) / 2.0;
+        cairo_rectangle(cr, x0, y, bw, bar_h);
+        cairo_fill(cr);
     }
+
+    /* Baseline axis along the bottom. */
+    cairo_set_source_rgb(cr, 0.45, 0.45, 0.48);
+    cairo_set_line_width(cr, 1.0);
+    cairo_move_to(cr, 0.0, (double)height - 0.5);
+    cairo_line_to(cr, (double)width, (double)height - 0.5);
+    cairo_stroke(cr);
+
+    /* Right-aligned "now" / "-Ns" time ticks if there is room. */
+    if (width > 120) {
+        cairo_set_source_rgb(cr, 0.70, 0.70, 0.73);
+        cairo_set_font_size(cr, 10.0);
+        cairo_text_extents_t ext;
+        const char *now_lbl = "now";
+        cairo_text_extents(cr, now_lbl, &ext);
+        cairo_move_to(cr, (double)width - ext.width - 4.0, (double)height - 4.0);
+        cairo_show_text(cr, now_lbl);
+
+        char past_lbl[16];
+        g_snprintf(past_lbl, sizeof(past_lbl), "-%us", window_s);
+        cairo_move_to(cr, 4.0, (double)height - 4.0);
+        cairo_show_text(cr, past_lbl);
+    }
+
+    /* Legend. */
+    cairo_set_source_rgb(cr, 0.80, 0.80, 0.83);
+    cairo_set_font_size(cr, 10.0);
+    cairo_move_to(cr, 6.0, 12.0);
+    cairo_show_text(cr, "green=on-time  amber=late  red=cross-frame burst");
 }
 
 static void frame_release_hist_draw(GtkDrawingArea *area, cairo_t *cr,
@@ -2408,6 +2467,7 @@ static void refresh_frame_release(GuiContext *ctx, const UvViewerStats *stats) {
         ctx->frame_release_overlap_rate = fr->overlap_rate;
         ctx->frame_release_avg_pkts = fr->avg_pkts_per_chunk;
         ctx->frame_release_avg_frames = fr->avg_frames_per_chunk;
+        ctx->frame_release_period_ms = fr->frame_period_ms;
         memcpy(ctx->frame_release_hist, fr->hist_frames, sizeof(ctx->frame_release_hist));
 
         if (!ctx->frame_release_chunks) {
@@ -2419,6 +2479,16 @@ static void refresh_frame_release(GuiContext *ctx, const UvViewerStats *stats) {
             memcpy(ctx->frame_release_chunks->data, fr->chunks->data,
                    sizeof(UvReleaseChunk) * n);
         }
+
+        if (!ctx->frame_release_frames) {
+            ctx->frame_release_frames = g_array_new(FALSE, TRUE, sizeof(UvReleaseFrame));
+        }
+        guint nf = fr->frames ? fr->frames->len : 0;
+        g_array_set_size(ctx->frame_release_frames, nf);
+        if (nf > 0) {
+            memcpy(ctx->frame_release_frames->data, fr->frames->data,
+                   sizeof(UvReleaseFrame) * nf);
+        }
     } else {
         ctx->frame_release_valid = FALSE;
         ctx->frame_release_active = FALSE;
@@ -2428,9 +2498,13 @@ static void refresh_frame_release(GuiContext *ctx, const UvViewerStats *stats) {
         ctx->frame_release_overlap_rate = 0.0;
         ctx->frame_release_avg_pkts = 0.0;
         ctx->frame_release_avg_frames = 0.0;
+        ctx->frame_release_period_ms = 0.0;
         memset(ctx->frame_release_hist, 0, sizeof(ctx->frame_release_hist));
         if (ctx->frame_release_chunks) {
             g_array_set_size(ctx->frame_release_chunks, 0);
+        }
+        if (ctx->frame_release_frames) {
+            g_array_set_size(ctx->frame_release_frames, 0);
         }
     }
 
@@ -2476,11 +2550,15 @@ static void on_frame_release_reset_clicked(GtkButton *button, gpointer user_data
     if (ctx->frame_release_chunks) {
         g_array_set_size(ctx->frame_release_chunks, 0);
     }
+    if (ctx->frame_release_frames) {
+        g_array_set_size(ctx->frame_release_frames, 0);
+    }
     ctx->frame_release_total_chunks = 0;
     ctx->frame_release_overlap_chunks = 0;
     ctx->frame_release_overlap_rate = 0.0;
     ctx->frame_release_avg_pkts = 0.0;
     ctx->frame_release_avg_frames = 0.0;
+    ctx->frame_release_period_ms = 0.0;
     memset(ctx->frame_release_hist, 0, sizeof(ctx->frame_release_hist));
     frame_release_update_summary(ctx);
     if (ctx->frame_release_timeline_area) gtk_widget_queue_draw(GTK_WIDGET(ctx->frame_release_timeline_area));
@@ -2494,6 +2572,20 @@ static void on_frame_release_gap_changed(GtkSpinButton *spin, gpointer user_data
     ctx->frame_release_gap_us = gap_us;
     if (ctx->viewer) {
         uv_viewer_frame_release_set_gap_us(ctx->viewer, gap_us);
+    }
+}
+
+static void on_frame_release_window_changed(GObject *dropdown, GParamSpec *pspec, gpointer user_data) {
+    (void)pspec;
+    GuiContext *ctx = user_data;
+    if (!ctx || !GTK_IS_DROP_DOWN(dropdown)) return;
+    /* Window selector is purely a display knob: no core call, just redraw. */
+    static const guint window_seconds[] = {1u, 2u, 5u, 10u};
+    guint sel = gtk_drop_down_get_selected(GTK_DROP_DOWN(dropdown));
+    if (sel >= G_N_ELEMENTS(window_seconds)) sel = 1u;
+    ctx->frame_release_window_s = window_seconds[sel];
+    if (ctx->frame_release_timeline_area) {
+        gtk_widget_queue_draw(GTK_WIDGET(ctx->frame_release_timeline_area));
     }
 }
 
@@ -2838,6 +2930,7 @@ static void refresh_stats(GuiContext *ctx) {
         memcpy(ctx->frame_block_thresholds_kb, fb->thresholds_size_kb, sizeof(ctx->frame_block_thresholds_kb));
         memcpy(ctx->frame_block_thresholds_span, fb->thresholds_span_ms, sizeof(ctx->frame_block_thresholds_span));
         memcpy(ctx->frame_block_thresholds_chunks, fb->thresholds_chunks, sizeof(ctx->frame_block_thresholds_chunks));
+        memcpy(ctx->frame_block_thresholds_fpc, fb->thresholds_fpc, sizeof(ctx->frame_block_thresholds_fpc));
         ctx->frame_block_min_ms = fb->min_lateness_ms;
         ctx->frame_block_max_ms = fb->max_lateness_ms;
         ctx->frame_block_avg_ms = fb->avg_lateness_ms;
@@ -2850,12 +2943,16 @@ static void refresh_stats(GuiContext *ctx) {
         ctx->frame_block_min_chunks = fb->min_chunks;
         ctx->frame_block_max_chunks = fb->max_chunks;
         ctx->frame_block_avg_chunks = fb->avg_chunks;
+        ctx->frame_block_min_fpc = fb->min_fpc;
+        ctx->frame_block_max_fpc = fb->max_fpc;
+        ctx->frame_block_avg_fpc = fb->avg_fpc;
         ctx->frame_block_real_samples = fb->real_frames;
         ctx->frame_block_missing = fb->missing_frames;
         memcpy(ctx->frame_block_color_counts_ms, fb->color_counts_lateness, sizeof(ctx->frame_block_color_counts_ms));
         memcpy(ctx->frame_block_color_counts_kb, fb->color_counts_size, sizeof(ctx->frame_block_color_counts_kb));
         memcpy(ctx->frame_block_color_counts_span, fb->color_counts_span, sizeof(ctx->frame_block_color_counts_span));
         memcpy(ctx->frame_block_color_counts_chunks, fb->color_counts_chunks, sizeof(ctx->frame_block_color_counts_chunks));
+        memcpy(ctx->frame_block_color_counts_fpc, fb->color_counts_fpc, sizeof(ctx->frame_block_color_counts_fpc));
 
         guint capacity = 0;
         if (fb->lateness_ms) capacity = fb->lateness_ms->len;
@@ -2876,10 +2973,14 @@ static void refresh_stats(GuiContext *ctx) {
         if (!ctx->frame_block_values_chunks) {
             ctx->frame_block_values_chunks = g_array_new(FALSE, TRUE, sizeof(double));
         }
+        if (!ctx->frame_block_values_fpc) {
+            ctx->frame_block_values_fpc = g_array_new(FALSE, TRUE, sizeof(double));
+        }
         g_array_set_size(ctx->frame_block_values_lateness, capacity);
         g_array_set_size(ctx->frame_block_values_size, capacity);
         g_array_set_size(ctx->frame_block_values_span, capacity);
         g_array_set_size(ctx->frame_block_values_chunks, capacity);
+        g_array_set_size(ctx->frame_block_values_fpc, capacity);
         if (fb->lateness_ms && fb->lateness_ms->len == capacity && capacity > 0) {
             memcpy(ctx->frame_block_values_lateness->data, fb->lateness_ms->data, sizeof(double) * capacity);
         } else {
@@ -2908,6 +3009,13 @@ static void refresh_stats(GuiContext *ctx) {
                 g_array_index(ctx->frame_block_values_chunks, double, i) = NAN;
             }
         }
+        if (fb->frames_per_chunk && fb->frames_per_chunk->len == capacity && capacity > 0) {
+            memcpy(ctx->frame_block_values_fpc->data, fb->frames_per_chunk->data, sizeof(double) * capacity);
+        } else {
+            for (guint i = 0; i < ctx->frame_block_values_fpc->len; i++) {
+                g_array_index(ctx->frame_block_values_fpc, double, i) = NAN;
+            }
+        }
 
         frame_block_sync_controls(ctx, fb);
     } else {
@@ -2928,12 +3036,16 @@ static void refresh_stats(GuiContext *ctx) {
         ctx->frame_block_min_chunks = 0.0;
         ctx->frame_block_max_chunks = 0.0;
         ctx->frame_block_avg_chunks = 0.0;
+        ctx->frame_block_min_fpc = 0.0;
+        ctx->frame_block_max_fpc = 0.0;
+        ctx->frame_block_avg_fpc = 0.0;
         ctx->frame_block_real_samples = 0;
         ctx->frame_block_missing = 0;
         memset(ctx->frame_block_color_counts_ms, 0, sizeof(ctx->frame_block_color_counts_ms));
         memset(ctx->frame_block_color_counts_kb, 0, sizeof(ctx->frame_block_color_counts_kb));
         memset(ctx->frame_block_color_counts_span, 0, sizeof(ctx->frame_block_color_counts_span));
         memset(ctx->frame_block_color_counts_chunks, 0, sizeof(ctx->frame_block_color_counts_chunks));
+        memset(ctx->frame_block_color_counts_fpc, 0, sizeof(ctx->frame_block_color_counts_fpc));
         if (ctx->frame_block_values_lateness) {
             g_array_set_size(ctx->frame_block_values_lateness, 0);
         }
@@ -2945,6 +3057,9 @@ static void refresh_stats(GuiContext *ctx) {
         }
         if (ctx->frame_block_values_chunks) {
             g_array_set_size(ctx->frame_block_values_chunks, 0);
+        }
+        if (ctx->frame_block_values_fpc) {
+            g_array_set_size(ctx->frame_block_values_fpc, 0);
         }
         frame_block_sync_controls(ctx, NULL);
     }
@@ -3228,16 +3343,21 @@ static void on_frame_block_reset_clicked(GtkButton *button, gpointer user_data) 
     ctx->frame_block_min_chunks = 0.0;
     ctx->frame_block_max_chunks = 0.0;
     ctx->frame_block_avg_chunks = 0.0;
+    ctx->frame_block_min_fpc = 0.0;
+    ctx->frame_block_max_fpc = 0.0;
+    ctx->frame_block_avg_fpc = 0.0;
     memset(ctx->frame_block_color_counts_ms, 0, sizeof(ctx->frame_block_color_counts_ms));
     memset(ctx->frame_block_color_counts_kb, 0, sizeof(ctx->frame_block_color_counts_kb));
     memset(ctx->frame_block_color_counts_span, 0, sizeof(ctx->frame_block_color_counts_span));
     memset(ctx->frame_block_color_counts_chunks, 0, sizeof(ctx->frame_block_color_counts_chunks));
+    memset(ctx->frame_block_color_counts_fpc, 0, sizeof(ctx->frame_block_color_counts_fpc));
     ctx->frame_block_missing = 0;
     ctx->frame_block_real_samples = 0;
     if (ctx->frame_block_values_lateness) g_array_set_size(ctx->frame_block_values_lateness, 0);
     if (ctx->frame_block_values_size) g_array_set_size(ctx->frame_block_values_size, 0);
     if (ctx->frame_block_values_span) g_array_set_size(ctx->frame_block_values_span, 0);
     if (ctx->frame_block_values_chunks) g_array_set_size(ctx->frame_block_values_chunks, 0);
+    if (ctx->frame_block_values_fpc) g_array_set_size(ctx->frame_block_values_fpc, 0);
     frame_block_sync_controls(ctx, NULL);
     frame_block_update_summary(ctx);
     if (ctx->frame_block_area) gtk_widget_queue_draw(GTK_WIDGET(ctx->frame_block_area));
@@ -4525,7 +4645,8 @@ static GtkWidget *build_frame_block_page(GuiContext *ctx) {
     gtk_box_append(GTK_BOX(width_box), GTK_WIDGET(ctx->frame_block_width_dropdown));
     gtk_box_append(GTK_BOX(controls), width_box);
 
-    const char *metric_labels[] = {"Lateness (ms)", "Size (KB)", "Span (ms)", "Chunks/frame", NULL};
+    const char *metric_labels[] = {"Lateness (ms)", "Size (KB)", "Span (ms)",
+                                   "Frame split (chunks/frame)", "Burst overlap (frames/chunk)", NULL};
     GtkWidget *metric_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
     GtkWidget *metric_label = gtk_label_new("Metric");
     gtk_widget_set_valign(metric_label, GTK_ALIGN_CENTER);
@@ -4782,6 +4903,10 @@ static GtkWidget *build_frame_block_page(GuiContext *ctx) {
                                                   ctx->frame_block_thresholds_chunks[0],
                                                   ctx->frame_block_thresholds_chunks[1],
                                                   ctx->frame_block_thresholds_chunks[2]);
+        uv_viewer_frame_block_set_overlap_thresholds(ctx->viewer,
+                                                    ctx->frame_block_thresholds_fpc[0],
+                                                    ctx->frame_block_thresholds_fpc[1],
+                                                    ctx->frame_block_thresholds_fpc[2]);
     }
     frame_block_sync_controls(ctx, NULL);
     frame_block_update_summary(ctx);
@@ -4832,6 +4957,26 @@ static GtkWidget *build_frame_release_page(GuiContext *ctx) {
     gtk_box_append(GTK_BOX(gap_box), GTK_WIDGET(ctx->frame_release_gap_spin));
     gtk_box_append(GTK_BOX(controls), gap_box);
 
+    const char *window_labels[] = {"1 s", "2 s", "5 s", "10 s", NULL};
+    GtkWidget *window_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
+    GtkWidget *window_label = gtk_label_new("Window");
+    gtk_widget_set_valign(window_label, GTK_ALIGN_CENTER);
+    gtk_box_append(GTK_BOX(window_box), window_label);
+    ctx->frame_release_window_dropdown = GTK_DROP_DOWN(gtk_drop_down_new_from_strings(window_labels));
+    guint window_index = 1; /* default 2 s */
+    switch (ctx->frame_release_window_s) {
+        case 1u:  window_index = 0; break;
+        case 5u:  window_index = 2; break;
+        case 10u: window_index = 3; break;
+        case 2u:
+        default:  window_index = 1; break;
+    }
+    gtk_drop_down_set_selected(ctx->frame_release_window_dropdown, window_index);
+    g_signal_connect(ctx->frame_release_window_dropdown, "notify::selected",
+                     G_CALLBACK(on_frame_release_window_changed), ctx);
+    gtk_box_append(GTK_BOX(window_box), GTK_WIDGET(ctx->frame_release_window_dropdown));
+    gtk_box_append(GTK_BOX(controls), window_box);
+
     GtkWidget *help = gtk_label_new("?");
     gtk_widget_add_css_class(help, "dim-label");
     gtk_widget_set_tooltip_text(help,
@@ -4847,7 +4992,7 @@ static GtkWidget *build_frame_release_page(GuiContext *ctx) {
     gtk_widget_set_hexpand(timeline_frame, TRUE);
     gtk_widget_set_vexpand(timeline_frame, TRUE);
 
-    GtkWidget *timeline_title = gtk_label_new("Release Timeline (newest at right)");
+    GtkWidget *timeline_title = gtk_label_new("Cadence Timeline (newest at right)");
     gtk_label_set_xalign(GTK_LABEL(timeline_title), 0.0);
     gtk_frame_set_label_widget(GTK_FRAME(timeline_frame), timeline_title);
 
@@ -5293,14 +5438,23 @@ static void on_app_shutdown(GApplication *app, gpointer user_data) {
         g_array_free(ctx->frame_block_values_chunks, TRUE);
         ctx->frame_block_values_chunks = NULL;
     }
+    if (ctx->frame_block_values_fpc) {
+        g_array_free(ctx->frame_block_values_fpc, TRUE);
+        ctx->frame_block_values_fpc = NULL;
+    }
     if (ctx->frame_release_chunks) {
         g_array_free(ctx->frame_release_chunks, TRUE);
         ctx->frame_release_chunks = NULL;
+    }
+    if (ctx->frame_release_frames) {
+        g_array_free(ctx->frame_release_frames, TRUE);
+        ctx->frame_release_frames = NULL;
     }
     ctx->frame_release_enable_toggle = NULL;
     ctx->frame_release_pause_toggle = NULL;
     ctx->frame_release_reset_button = NULL;
     ctx->frame_release_gap_spin = NULL;
+    ctx->frame_release_window_dropdown = NULL;
     ctx->frame_release_timeline_area = NULL;
     ctx->frame_release_hist_area = NULL;
     ctx->frame_release_summary_label = NULL;
@@ -5371,14 +5525,21 @@ int uv_gui_run(UvViewer **viewer, UvViewerConfig *cfg, const char *program_name)
     ctx->frame_block_thresholds_chunks[0] = FRAME_BLOCK_DEFAULT_CHUNK_GREEN;
     ctx->frame_block_thresholds_chunks[1] = FRAME_BLOCK_DEFAULT_CHUNK_YELLOW;
     ctx->frame_block_thresholds_chunks[2] = FRAME_BLOCK_DEFAULT_CHUNK_ORANGE;
+    ctx->frame_block_thresholds_fpc[0] = FRAME_BLOCK_DEFAULT_FPC_GREEN;
+    ctx->frame_block_thresholds_fpc[1] = FRAME_BLOCK_DEFAULT_FPC_YELLOW;
+    ctx->frame_block_thresholds_fpc[2] = FRAME_BLOCK_DEFAULT_FPC_ORANGE;
     ctx->frame_block_width = FRAME_BLOCK_DEFAULT_WIDTH;
     ctx->frame_block_height = FRAME_BLOCK_DEFAULT_HEIGHT;
     ctx->frame_block_values_lateness = g_array_new(FALSE, TRUE, sizeof(double));
     ctx->frame_block_values_size = g_array_new(FALSE, TRUE, sizeof(double));
     ctx->frame_block_values_span = g_array_new(FALSE, TRUE, sizeof(double));
     ctx->frame_block_values_chunks = g_array_new(FALSE, TRUE, sizeof(double));
+    ctx->frame_block_values_fpc = g_array_new(FALSE, TRUE, sizeof(double));
     ctx->frame_block_view = FRAME_BLOCK_VIEW_LATENESS;
     ctx->frame_release_chunks = g_array_new(FALSE, TRUE, sizeof(UvReleaseChunk));
+    ctx->frame_release_frames = g_array_new(FALSE, TRUE, sizeof(UvReleaseFrame));
+    ctx->frame_release_period_ms = 0.0;
+    ctx->frame_release_window_s = 2u;
     ctx->frame_release_gap_us = 500.0;
     ctx->frame_block_missing = 0;
     ctx->frame_block_real_samples = 0;
