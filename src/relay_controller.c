@@ -31,6 +31,9 @@ typedef struct UvFrameBlockState {
     double thresholds_size_kb[3];
     double *lateness_ms; // array length == capacity
     double *size_kb;     // array length == capacity
+    double *span_ms;     // array length == capacity (first-pkt -> marker, ms)
+    double *chunks_pf;   // array length == capacity (release bursts per frame)
+    double *fpc;         // array length == capacity (frames per burst, 1 or 2+)
     double sum_lateness_ms;
     double min_lateness_ms;
     double max_lateness_ms;
@@ -58,6 +61,9 @@ static UvFrameBlockState *frame_block_state_new(guint width, guint height) {
     state->capacity = state->width * state->height;
     state->lateness_ms = g_new(double, state->capacity);
     state->size_kb = g_new(double, state->capacity);
+    state->span_ms = g_new(double, state->capacity);
+    state->chunks_pf = g_new(double, state->capacity);
+    state->fpc = g_new(double, state->capacity);
     frame_block_state_reset(state);
     return state;
 }
@@ -68,6 +74,12 @@ static void frame_block_state_free(UvFrameBlockState *state) {
     state->lateness_ms = NULL;
     g_free(state->size_kb);
     state->size_kb = NULL;
+    g_free(state->span_ms);
+    state->span_ms = NULL;
+    g_free(state->chunks_pf);
+    state->chunks_pf = NULL;
+    g_free(state->fpc);
+    state->fpc = NULL;
     g_free(state);
 }
 
@@ -97,6 +109,9 @@ static void frame_block_state_reset(UvFrameBlockState *state) {
     for (guint i = 0; i < state->capacity; i++) {
         state->lateness_ms[i] = NAN;
         state->size_kb[i] = NAN;
+        state->span_ms[i] = NAN;
+        state->chunks_pf[i] = NAN;
+        state->fpc[i] = NAN;
     }
 }
 
@@ -105,6 +120,40 @@ static guint frame_block_classify_value(const double thresholds[3], double value
     if (value <= thresholds[1]) return 1;
     if (value <= thresholds[2]) return 2;
     return 3;
+}
+
+/* Compute min/max/avg + per-bucket color counts for one metric array at
+ * snapshot time. Skips NAN (empty cell) and negative (missing-frame sentinel)
+ * entries. Used for the span / chunks-per-frame grid metrics, whose running
+ * stats are derived here rather than maintained in the record hot path. */
+static void frame_block_summarize_metric(GArray *arr, guint capacity,
+                                         const double thresholds[3],
+                                         double *min_out, double *max_out, double *avg_out,
+                                         guint color_counts[UV_FRAME_BLOCK_COLOR_BUCKETS]) {
+    if (min_out) *min_out = 0.0;
+    if (max_out) *max_out = 0.0;
+    if (avg_out) *avg_out = 0.0;
+    memset(color_counts, 0, sizeof(guint) * UV_FRAME_BLOCK_COLOR_BUCKETS);
+    if (!arr) return;
+    double sum = 0.0;
+    guint n = 0;
+    guint lim = MIN(capacity, arr->len);
+    for (guint i = 0; i < lim; i++) {
+        double v = g_array_index(arr, double, i);
+        if (isnan(v) || v < 0.0) continue;
+        if (n == 0) {
+            if (min_out) *min_out = v;
+            if (max_out) *max_out = v;
+        } else {
+            if (min_out && v < *min_out) *min_out = v;
+            if (max_out && v > *max_out) *max_out = v;
+        }
+        sum += v;
+        n++;
+        guint b = frame_block_classify_value(thresholds, v);
+        if (b < UV_FRAME_BLOCK_COLOR_BUCKETS) color_counts[b]++;
+    }
+    if (n > 0 && avg_out) *avg_out = sum / (double)n;
 }
 
 static void frame_block_state_reclassify(UvFrameBlockState *state) {
@@ -149,6 +198,9 @@ static void frame_block_state_apply_size_thresholds(UvFrameBlockState *state, co
 static void frame_block_state_record(UvFrameBlockState *state,
                                      double lateness_ms,
                                      double size_kb,
+                                     double span_ms,
+                                     double chunks_pf,
+                                     double fpc,
                                      gboolean snapshot_mode,
                                      gboolean is_missing) {
     if (!state) return;
@@ -171,10 +223,16 @@ static void frame_block_state_record(UvFrameBlockState *state,
     if (is_missing) {
         state->lateness_ms[idx] = UV_FRAME_BLOCK_MISSING_SENTINEL;
         state->size_kb[idx] = UV_FRAME_BLOCK_MISSING_SENTINEL;
+        state->span_ms[idx] = UV_FRAME_BLOCK_MISSING_SENTINEL;
+        state->chunks_pf[idx] = UV_FRAME_BLOCK_MISSING_SENTINEL;
+        state->fpc[idx] = UV_FRAME_BLOCK_MISSING_SENTINEL;
         state->missing_frames++;
     } else {
         state->lateness_ms[idx] = lateness_ms;
         state->size_kb[idx] = size_kb;
+        state->span_ms[idx] = span_ms;
+        state->chunks_pf[idx] = chunks_pf;
+        state->fpc[idx] = fpc;
 
         if (state->real_samples == 0) {
             state->min_lateness_ms = lateness_ms;
@@ -284,6 +342,31 @@ static void relay_source_clear_stats(UvRelaySource *src, gboolean reset_totals) 
         frame_block_state_reset(src->frame_block);
     }
     src->frame_block_accum_bytes = 0;
+    src->frame_open = FALSE;
+    src->frame_first_pkt_us = 0;
+    src->frame_chunk_count = 0;
+    src->frame_pkts = 0;
+    src->frame_overlap = FALSE;
+    src->last_pkt_us = 0;
+    src->chunk_open = FALSE;
+    src->chunk_start_us = 0;
+    src->chunk_gap_ms = 0.0;
+    src->chunk_pkts = 0;
+    src->chunk_bytes = 0;
+    src->chunk_frames = 0;
+    src->chunk_last_ts = 0;
+    if (src->release_ring) { g_free(src->release_ring); src->release_ring = NULL; }
+    if (src->frame_ring)   { g_free(src->frame_ring);   src->frame_ring = NULL; }
+    src->release_head = 0;
+    src->release_count = 0;
+    src->release_total = 0;
+    src->release_overlap = 0;
+    src->have_marker_baseline = FALSE;
+    src->last_marker_us = 0;
+    src->last_marker_ts = 0;
+    src->frame_period_ms = 0.0;
+    src->frame_ring_head = 0;
+    src->frame_ring_count = 0;
     src->hevc_idr_count = 0;
     src->hevc_cra_count = 0;
     src->hevc_trail_count = 0;
@@ -436,24 +519,26 @@ void uv_internal_populate_source_stats(const UvRelaySource *src, int clock_rate,
     }
 }
 
-static void frame_block_process_packet(RelayController *rc,
-                                       UvRelaySource *src,
-                                       uint32_t ts,
-                                       gboolean marker,
-                                       gint64 arrival_us,
-                                       int clock_rate,
-                                       gboolean is_selected,
-                                       uint64_t frame_size_bytes) {
-    if (!rc || !src) return;
-    if (!marker) return;
+/* Push a completed frame into the per-source cadence ring (oldest overwritten). */
+static void frame_ring_push(UvRelaySource *src, const UvReleaseFrame *frec) {
+    if (!src->frame_ring) return;
+    src->frame_ring[src->frame_ring_head] = *frec;
+    src->frame_ring_head = (src->frame_ring_head + 1u) % UV_RELEASE_FRAME_RING;
+    if (src->frame_ring_count < UV_RELEASE_FRAME_RING) src->frame_ring_count++;
+}
 
-    if (!rc->frame_block.enabled || !is_selected) {
-        if (src->frame_block) {
-            src->frame_block->have_baseline = FALSE;
-        }
-        return;
-    }
-
+/* Record one completed frame into the frame-block grid. Caller has already
+ * confirmed the grid is enabled+selected and computed the per-frame span /
+ * chunks-per-frame / frames-per-chunk values. */
+static void frame_block_grid_record(RelayController *rc,
+                                    UvRelaySource *src,
+                                    uint32_t ts,
+                                    gint64 arrival_us,
+                                    int clock_rate,
+                                    uint64_t frame_size_bytes,
+                                    double span_ms,
+                                    double chunks_pf,
+                                    double fpc) {
     UvFrameBlockState *state = src->frame_block;
     if (!state) {
         state = frame_block_state_new(rc->frame_block.width, rc->frame_block.height);
@@ -543,11 +628,13 @@ static void frame_block_process_packet(RelayController *rc,
 
     if (missing > 0) {
         for (guint m = 0; m < missing; m++) {
-            frame_block_state_record(state, 0.0, 0.0, rc->frame_block.snapshot_mode, TRUE);
+            frame_block_state_record(state, 0.0, 0.0, 0.0, 0.0, 0.0,
+                                     rc->frame_block.snapshot_mode, TRUE);
         }
     }
 
-    frame_block_state_record(state, lateness_ms, size_kb, rc->frame_block.snapshot_mode, FALSE);
+    frame_block_state_record(state, lateness_ms, size_kb, span_ms, chunks_pf, fpc,
+                             rc->frame_block.snapshot_mode, FALSE);
 
     if (normalized_expected_ms > 0.0) {
         if (!state->have_expected_period) {
@@ -558,6 +645,224 @@ static void frame_block_process_packet(RelayController *rc,
             state->expected_frame_ms = (1.0 - alpha) * state->expected_frame_ms + alpha * normalized_expected_ms;
         }
     }
+}
+
+/* Marker-packet handler: finalizes one frame. Computes the per-frame metrics
+ * (span, chunks/frame, frames/chunk), maintains an independent marker-cadence
+ * baseline (so the cadence ring + frame period work even when the grid is off),
+ * pushes the frame to the cadence ring, and records into the grid when enabled. */
+static void frame_block_process_packet(RelayController *rc,
+                                       UvRelaySource *src,
+                                       uint32_t ts,
+                                       gboolean marker,
+                                       gint64 arrival_us,
+                                       int clock_rate,
+                                       gboolean is_selected,
+                                       uint64_t frame_size_bytes) {
+    if (!rc || !src) return;
+    if (!marker) return;
+
+    gboolean grid_on = rc->frame_block.enabled && is_selected;
+    gboolean ring_on = rc->frame_release.enabled && is_selected;
+
+    if (!grid_on && !ring_on) {
+        if (src->frame_block) src->frame_block->have_baseline = FALSE;
+        src->have_marker_baseline = FALSE;
+        src->frame_open = FALSE;
+        return;
+    }
+
+    /* Per-frame metrics (independent of the grid). */
+    double span_ms = 0.0;
+    if (src->frame_open && src->frame_first_pkt_us > 0 && arrival_us > src->frame_first_pkt_us) {
+        span_ms = (double)(arrival_us - src->frame_first_pkt_us) / 1000.0;
+    }
+    double chunks_pf = (double)src->frame_chunk_count;
+    double fpc = src->frame_overlap ? 2.0 : 1.0;
+
+    /* Independent marker-cadence baseline → cadence lateness + frame period. */
+    double cad_lateness_ms = 0.0;
+    if (src->have_marker_baseline) {
+        uint32_t cad_tsd = ts - src->last_marker_ts;
+        double cad_expected_ms = (clock_rate > 0)
+            ? ((double)cad_tsd * 1000.0 / (double)clock_rate) : 0.0;
+        double cad_adl = (arrival_us > src->last_marker_us)
+            ? (double)(arrival_us - src->last_marker_us) / 1000.0 : 0.0;
+        cad_lateness_ms = cad_adl - cad_expected_ms;
+        if (cad_lateness_ms < 0.0) cad_lateness_ms = 0.0;
+        if (cad_expected_ms > 0.0 && cad_expected_ms < 10000.0) {
+            if (src->frame_period_ms <= 0.0) src->frame_period_ms = cad_expected_ms;
+            else src->frame_period_ms = 0.875 * src->frame_period_ms + 0.125 * cad_expected_ms;
+        }
+    }
+    src->last_marker_ts = ts;
+    src->last_marker_us = arrival_us;
+    src->have_marker_baseline = TRUE;
+
+    if (ring_on && !rc->frame_release.paused) {
+        UvReleaseFrame frec;
+        frec.first_us = (src->frame_open && src->frame_first_pkt_us > 0)
+                        ? src->frame_first_pkt_us : arrival_us;
+        frec.marker_us = arrival_us;
+        frec.pkts = src->frame_pkts;
+        frec.chunks = src->frame_chunk_count;
+        frec.lateness_ms = cad_lateness_ms;
+        frec.overlap = src->frame_overlap;
+        frame_ring_push(src, &frec);
+    }
+
+    if (grid_on) {
+        frame_block_grid_record(rc, src, ts, arrival_us, clock_rate,
+                                frame_size_bytes, span_ms, chunks_pf, fpc);
+    }
+
+    src->frame_open = FALSE;
+}
+
+/* Lazily (de)allocate the per-source rings. Only the selected source with
+ * frame_release enabled holds them, so the steady-state footprint is ~one
+ * source's worth (~60 KB) instead of ~15 MB across all 256 slots. */
+static void release_rings_alloc(UvRelaySource *src) {
+    if (!src->release_ring) src->release_ring = g_new0(UvReleaseChunk, UV_RELEASE_CHUNK_RING);
+    if (!src->frame_ring)   src->frame_ring   = g_new0(UvReleaseFrame, UV_RELEASE_FRAME_RING);
+}
+
+static void release_rings_free(UvRelaySource *src) {
+    if (src->release_ring) { g_free(src->release_ring); src->release_ring = NULL; }
+    if (src->frame_ring)   { g_free(src->frame_ring);   src->frame_ring = NULL; }
+    src->release_head = 0;
+    src->release_count = 0;
+    src->frame_ring_head = 0;
+    src->frame_ring_count = 0;
+    src->chunk_open = FALSE;
+}
+
+/* Push a finalized release burst into the per-source ring (oldest overwritten). */
+static void release_ring_push(UvRelaySource *src, gint64 t_us, guint pkts,
+                              guint frames, guint bytes, double gap_ms) {
+    if (!src->release_ring) return;
+    UvReleaseChunk *rec = &src->release_ring[src->release_head];
+    rec->t_us = t_us;
+    rec->pkts = pkts;
+    rec->frames = frames;
+    rec->bytes = bytes;
+    rec->gap_ms = gap_ms;
+    rec->overlap = (frames >= 2u);
+    src->release_head = (src->release_head + 1u) % UV_RELEASE_CHUNK_RING;
+    if (src->release_count < UV_RELEASE_CHUNK_RING) src->release_count++;
+    src->release_total++;
+    if (frames >= 2u) src->release_overlap++;
+}
+
+static void release_close_chunk(RelayController *rc, UvRelaySource *src) {
+    if (!src->chunk_open) return;
+    if (rc->frame_release.enabled && !rc->frame_release.paused) {
+        release_ring_push(src, src->chunk_start_us, src->chunk_pkts,
+                          src->chunk_frames, src->chunk_bytes, src->chunk_gap_ms);
+    }
+    src->chunk_open = FALSE;
+}
+
+static void release_state_clear(UvRelaySource *src) {
+    src->release_head = 0;
+    src->release_count = 0;
+    src->release_total = 0;
+    src->release_overlap = 0;
+    src->chunk_open = FALSE;
+    src->frame_open = FALSE;
+    src->last_pkt_us = 0;
+    src->frame_pkts = 0;
+    src->frame_overlap = FALSE;
+    src->frame_ring_head = 0;
+    src->frame_ring_count = 0;
+    src->have_marker_baseline = FALSE;
+    src->frame_period_ms = 0.0;
+}
+
+/* Per-unique-packet release tracking, run on the relay recv thread under
+ * rc->lock. Groups packets into bursts ("chunks") separated by an idle gap >
+ * frame_release.gap_us — i.e. wfb-ng FEC block releases — and tracks how many
+ * distinct frames each burst touches (>=2 == cross-frame overlap, the
+ * drop-causing condition). Also drives the per-frame span / chunks-per-frame
+ * metrics consumed by the frame-block grid. */
+static void release_process_packet(RelayController *rc, UvRelaySource *src,
+                                   uint32_t ts, gboolean marker,
+                                   gint64 arrival_us, guint len,
+                                   gboolean is_selected) {
+    (void)marker;
+    if (!rc || !src) return;
+
+    gboolean track = is_selected && (rc->frame_block.enabled || rc->frame_release.enabled);
+    gboolean ring_on = is_selected && rc->frame_release.enabled;
+    if (!track) {
+        /* Feature off / not selected: drop in-flight state and release the
+         * rings. The trailing in-flight burst (if any) is intentionally not
+         * flushed — during steady capture the ring lags by at most one burst,
+         * which closes on the next gap; at a transition the source's view is
+         * discarded anyway. */
+        src->chunk_open = FALSE;
+        src->frame_open = FALSE;
+        src->last_pkt_us = 0;
+        release_rings_free(src);
+        return;
+    }
+
+    /* Rings exist only while the cadence/burst capture is on for this source. */
+    if (ring_on && !src->release_ring) release_rings_alloc(src);
+    else if (!ring_on && src->release_ring) release_rings_free(src);
+
+    if (rc->frame_release.reset_requested) {
+        release_state_clear(src);
+        rc->frame_release.reset_requested = FALSE;
+    }
+
+    double gap_us = rc->frame_release.gap_us;
+    if (gap_us <= 0.0) gap_us = UV_RELEASE_DEFAULT_GAP_US;
+
+    gboolean new_chunk = FALSE;
+    double gap_ms = 0.0;
+    if (!src->chunk_open) {
+        new_chunk = TRUE;
+    } else if (src->last_pkt_us > 0 && arrival_us > src->last_pkt_us) {
+        double delta_us = (double)(arrival_us - src->last_pkt_us);
+        if (delta_us > gap_us) {
+            gap_ms = delta_us / 1000.0;
+            release_close_chunk(rc, src);
+            new_chunk = TRUE;
+        }
+    }
+
+    if (new_chunk) {
+        src->chunk_open = TRUE;
+        src->chunk_start_us = arrival_us;
+        src->chunk_gap_ms = gap_ms;
+        src->chunk_pkts = 0;
+        src->chunk_bytes = 0;
+        src->chunk_frames = 0;
+        src->chunk_last_ts = 0;
+        /* A frame that is still open has now been split across another burst. */
+        if (src->frame_open) src->frame_chunk_count++;
+    }
+
+    src->chunk_pkts++;
+    src->chunk_bytes += len;
+    if (src->chunk_frames == 0u || ts != src->chunk_last_ts) {
+        src->chunk_frames++;
+    }
+    src->chunk_last_ts = ts;
+
+    if (!src->frame_open) {
+        src->frame_open = TRUE;
+        src->frame_first_pkt_us = arrival_us;
+        src->frame_chunk_count = 1u; /* counts the burst this first packet is in */
+        src->frame_pkts = 0u;
+        /* If the first packet did NOT start a new burst, it joined the burst
+         * still carrying the previous frame's tail = a cross-frame burst. */
+        src->frame_overlap = !new_chunk;
+    }
+    src->frame_pkts++;
+
+    src->last_pkt_us = arrival_us;
 }
 
 /* Bump the matching counter for an HEVC NAL unit type. NAL types 19/20/21
@@ -712,6 +1017,10 @@ static inline void rtp_update_stats(RelayController *rc,
         }
     }
 skip_nal_parse:
+
+    if (unique_packet) {
+        release_process_packet(rc, s, ts, marker, arrival_us, (guint)len, is_selected);
+    }
 
     uint32_t arrival_ts = rtp_now_ts_from_us(clock_rate, arrival_us);
     uint32_t transit = arrival_ts - ts;
@@ -924,9 +1233,29 @@ gboolean relay_controller_init(RelayController *rc, struct _UvViewer *viewer) {
     rc->frame_block.thresholds_kb[0] = UV_FRAME_BLOCK_DEFAULT_SIZE_GREEN_KB;
     rc->frame_block.thresholds_kb[1] = UV_FRAME_BLOCK_DEFAULT_SIZE_YELLOW_KB;
     rc->frame_block.thresholds_kb[2] = UV_FRAME_BLOCK_DEFAULT_SIZE_ORANGE_KB;
+    /* span_ms metric: a 60fps frame budget is ~16.7ms, so flag frames whose
+     * packets took longer than a frame period to fully land. */
+    rc->frame_block.thresholds_span[0] = 8.0;
+    rc->frame_block.thresholds_span[1] = 16.0;
+    rc->frame_block.thresholds_span[2] = 25.0;
+    /* chunks-per-frame: 1 burst is ideal, 2+ means the frame straddled FEC
+     * blocks (overlap risk). */
+    rc->frame_block.thresholds_chunks[0] = 1.0;
+    rc->frame_block.thresholds_chunks[1] = 2.0;
+    rc->frame_block.thresholds_chunks[2] = 3.0;
+    /* frames-per-chunk: 1 = clean (burst carried only this frame), 2+ = the
+     * burst straddled a frame boundary. */
+    rc->frame_block.thresholds_fpc[0] = 1.0;
+    rc->frame_block.thresholds_fpc[1] = 2.0;
+    rc->frame_block.thresholds_fpc[2] = 3.0;
     rc->frame_block.reset_requested = TRUE;
     rc->frame_block.thresholds_dirty_ms = TRUE;
     rc->frame_block.thresholds_dirty_kb = TRUE;
+
+    rc->frame_release.enabled = FALSE;
+    rc->frame_release.paused = FALSE;
+    rc->frame_release.gap_us = UV_RELEASE_DEFAULT_GAP_US;
+    rc->frame_release.reset_requested = TRUE;
     return TRUE;
 }
 
@@ -939,6 +1268,7 @@ void relay_controller_deinit(RelayController *rc) {
     for (guint i = 0; i < rc->sources_count; i++) {
         frame_block_state_free(rc->sources[i].frame_block);
         rc->sources[i].frame_block = NULL;
+        release_rings_free(&rc->sources[i]);
     }
     rc->sources_count = 0;
     rc->selected_index = -1;
@@ -1043,12 +1373,30 @@ void relay_controller_snapshot(RelayController *rc, UvViewerStats *stats, int cl
 
     GArray *fb_lateness = stats->frame_block.lateness_ms;
     GArray *fb_sizes = stats->frame_block.frame_size_kb;
+    GArray *fb_span = stats->frame_block.span_ms;
+    GArray *fb_chunks = stats->frame_block.chunks_per_frame;
+    GArray *fb_fpc = stats->frame_block.frames_per_chunk;
     memset(&stats->frame_block, 0, sizeof(stats->frame_block));
     stats->frame_block.lateness_ms = fb_lateness;
     stats->frame_block.frame_size_kb = fb_sizes;
+    stats->frame_block.span_ms = fb_span;
+    stats->frame_block.chunks_per_frame = fb_chunks;
+    stats->frame_block.frames_per_chunk = fb_fpc;
     if (fb_lateness) g_array_set_size(fb_lateness, 0);
     if (fb_sizes) g_array_set_size(fb_sizes, 0);
+    if (fb_span) g_array_set_size(fb_span, 0);
+    if (fb_chunks) g_array_set_size(fb_chunks, 0);
+    if (fb_fpc) g_array_set_size(fb_fpc, 0);
     stats->frame_block_valid = FALSE;
+
+    GArray *fr_chunks = stats->frame_release.chunks;
+    GArray *fr_frames = stats->frame_release.frames;
+    memset(&stats->frame_release, 0, sizeof(stats->frame_release));
+    stats->frame_release.chunks = fr_chunks;
+    stats->frame_release.frames = fr_frames;
+    if (fr_chunks) g_array_set_size(fr_chunks, 0);
+    if (fr_frames) g_array_set_size(fr_frames, 0);
+    stats->frame_release_valid = FALSE;
 
     g_mutex_lock(&rc->lock);
     for (guint i = 0; i < rc->sources_count; i++) {
@@ -1169,6 +1517,80 @@ void relay_controller_snapshot(RelayController *rc, UvViewerStats *stats, int cl
                 fb->avg_size_kb = 0.0;
                 memset(fb->color_counts_lateness, 0, sizeof(fb->color_counts_lateness));
                 memset(fb->color_counts_size, 0, sizeof(fb->color_counts_size));
+            }
+
+            /* Part A: per-frame span (first-pkt -> marker) + chunks-per-frame.
+             * Same grid layout as lateness/size; summary computed here. */
+            if (!fb->span_ms) fb->span_ms = g_array_new(FALSE, TRUE, sizeof(double));
+            if (!fb->chunks_per_frame) fb->chunks_per_frame = g_array_new(FALSE, TRUE, sizeof(double));
+            if (!fb->frames_per_chunk) fb->frames_per_chunk = g_array_new(FALSE, TRUE, sizeof(double));
+            g_array_set_size(fb->span_ms, capacity);
+            g_array_set_size(fb->chunks_per_frame, capacity);
+            g_array_set_size(fb->frames_per_chunk, capacity);
+            for (guint k = 0; k < capacity; k++) {
+                double sv = NAN, cv = NAN, fv = NAN;
+                if (state && state->span_ms && state->chunks_pf && state->fpc && k < state->capacity) {
+                    sv = state->span_ms[k];
+                    cv = state->chunks_pf[k];
+                    fv = state->fpc[k];
+                }
+                g_array_index(fb->span_ms, double, k) = sv;
+                g_array_index(fb->chunks_per_frame, double, k) = cv;
+                g_array_index(fb->frames_per_chunk, double, k) = fv;
+            }
+            memcpy(fb->thresholds_span_ms, rc->frame_block.thresholds_span, sizeof(fb->thresholds_span_ms));
+            memcpy(fb->thresholds_chunks, rc->frame_block.thresholds_chunks, sizeof(fb->thresholds_chunks));
+            memcpy(fb->thresholds_fpc, rc->frame_block.thresholds_fpc, sizeof(fb->thresholds_fpc));
+            frame_block_summarize_metric(fb->span_ms, capacity, fb->thresholds_span_ms,
+                                         &fb->min_span_ms, &fb->max_span_ms, &fb->avg_span_ms,
+                                         fb->color_counts_span);
+            frame_block_summarize_metric(fb->chunks_per_frame, capacity, fb->thresholds_chunks,
+                                         &fb->min_chunks, &fb->max_chunks, &fb->avg_chunks,
+                                         fb->color_counts_chunks);
+            frame_block_summarize_metric(fb->frames_per_chunk, capacity, fb->thresholds_fpc,
+                                         &fb->min_fpc, &fb->max_fpc, &fb->avg_fpc,
+                                         fb->color_counts_fpc);
+
+            /* Part B: frame-release (FEC chunk) ring snapshot. */
+            stats->frame_release_valid = TRUE;
+            UvReleaseStats *fr = &stats->frame_release;
+            fr->active = rc->frame_release.enabled;
+            fr->paused = rc->frame_release.paused;
+            fr->gap_us = rc->frame_release.gap_us > 0.0 ? rc->frame_release.gap_us
+                                                        : UV_RELEASE_DEFAULT_GAP_US;
+            fr->frame_period_ms = src->frame_period_ms;
+            fr->total_chunks = src->release_total;
+            fr->overlap_chunks = src->release_overlap;
+            fr->overlap_rate = src->release_total > 0
+                ? (double)src->release_overlap / (double)src->release_total : 0.0;
+            if (!fr->chunks) fr->chunks = g_array_new(FALSE, TRUE, sizeof(UvReleaseChunk));
+            g_array_set_size(fr->chunks, 0);
+            guint rc_count = src->release_ring ? src->release_count : 0;
+            guint rc_start = (src->release_head + UV_RELEASE_CHUNK_RING - rc_count) % UV_RELEASE_CHUNK_RING;
+            guint64 sum_pkts = 0, sum_frames = 0;
+            for (guint i = 0; i < rc_count; i++) {
+                UvReleaseChunk c = src->release_ring[(rc_start + i) % UV_RELEASE_CHUNK_RING];
+                g_array_append_val(fr->chunks, c);
+                sum_pkts += c.pkts;
+                sum_frames += c.frames;
+                guint bucket = (c.frames >= UV_RELEASE_FRAMES_BUCKETS)
+                    ? (UV_RELEASE_FRAMES_BUCKETS - 1u)
+                    : (c.frames > 0u ? c.frames - 1u : 0u);
+                fr->hist_frames[bucket]++;
+            }
+            if (rc_count > 0) {
+                fr->avg_pkts_per_chunk = (double)sum_pkts / (double)rc_count;
+                fr->avg_frames_per_chunk = (double)sum_frames / (double)rc_count;
+            }
+
+            /* Per-frame ring → cadence timeline. */
+            if (!fr->frames) fr->frames = g_array_new(FALSE, TRUE, sizeof(UvReleaseFrame));
+            g_array_set_size(fr->frames, 0);
+            guint fr_count = src->frame_ring ? src->frame_ring_count : 0;
+            guint fr_start = (src->frame_ring_head + UV_RELEASE_FRAME_RING - fr_count) % UV_RELEASE_FRAME_RING;
+            for (guint i = 0; i < fr_count; i++) {
+                UvReleaseFrame f = src->frame_ring[(fr_start + i) % UV_RELEASE_FRAME_RING];
+                g_array_append_val(fr->frames, f);
             }
         }
     }
@@ -1341,5 +1763,90 @@ void relay_controller_frame_block_set_size_thresholds(RelayController *rc,
         }
     }
     rc->frame_block.thresholds_dirty_kb = FALSE;
+    g_mutex_unlock(&rc->lock);
+}
+
+/* Sort three threshold values ascending in place. */
+static void sort3_ascending(double *a, double *b, double *c) {
+    if (*a > *b) { double t = *a; *a = *b; *b = t; }
+    if (*b > *c) { double t = *b; *b = *c; *c = t; }
+    if (*a > *b) { double t = *a; *a = *b; *b = t; }
+}
+
+void relay_controller_frame_block_set_span_thresholds(RelayController *rc,
+                                                      double green_ms,
+                                                      double yellow_ms,
+                                                      double orange_ms) {
+    if (!rc) return;
+    if (green_ms < 0.0) green_ms = 0.0;
+    if (yellow_ms < 0.0) yellow_ms = 0.0;
+    if (orange_ms < 0.0) orange_ms = 0.0;
+    sort3_ascending(&green_ms, &yellow_ms, &orange_ms);
+    g_mutex_lock(&rc->lock);
+    rc->frame_block.thresholds_span[0] = green_ms;
+    rc->frame_block.thresholds_span[1] = yellow_ms;
+    rc->frame_block.thresholds_span[2] = orange_ms;
+    g_mutex_unlock(&rc->lock);
+}
+
+void relay_controller_frame_block_set_chunk_thresholds(RelayController *rc,
+                                                       double green,
+                                                       double yellow,
+                                                       double orange) {
+    if (!rc) return;
+    if (green < 0.0) green = 0.0;
+    if (yellow < 0.0) yellow = 0.0;
+    if (orange < 0.0) orange = 0.0;
+    sort3_ascending(&green, &yellow, &orange);
+    g_mutex_lock(&rc->lock);
+    rc->frame_block.thresholds_chunks[0] = green;
+    rc->frame_block.thresholds_chunks[1] = yellow;
+    rc->frame_block.thresholds_chunks[2] = orange;
+    g_mutex_unlock(&rc->lock);
+}
+
+void relay_controller_frame_block_set_overlap_thresholds(RelayController *rc,
+                                                         double green,
+                                                         double yellow,
+                                                         double orange) {
+    if (!rc) return;
+    if (green < 0.0) green = 0.0;
+    if (yellow < 0.0) yellow = 0.0;
+    if (orange < 0.0) orange = 0.0;
+    sort3_ascending(&green, &yellow, &orange);
+    g_mutex_lock(&rc->lock);
+    rc->frame_block.thresholds_fpc[0] = green;
+    rc->frame_block.thresholds_fpc[1] = yellow;
+    rc->frame_block.thresholds_fpc[2] = orange;
+    g_mutex_unlock(&rc->lock);
+}
+
+void relay_controller_frame_release_configure(RelayController *rc, gboolean enabled) {
+    if (!rc) return;
+    g_mutex_lock(&rc->lock);
+    rc->frame_release.enabled = enabled;
+    rc->frame_release.reset_requested = TRUE;
+    g_mutex_unlock(&rc->lock);
+}
+
+void relay_controller_frame_release_pause(RelayController *rc, gboolean paused) {
+    if (!rc) return;
+    g_mutex_lock(&rc->lock);
+    rc->frame_release.paused = paused;
+    g_mutex_unlock(&rc->lock);
+}
+
+void relay_controller_frame_release_reset(RelayController *rc) {
+    if (!rc) return;
+    g_mutex_lock(&rc->lock);
+    rc->frame_release.reset_requested = TRUE;
+    g_mutex_unlock(&rc->lock);
+}
+
+void relay_controller_frame_release_set_gap_us(RelayController *rc, double gap_us) {
+    if (!rc) return;
+    if (gap_us < 1.0) gap_us = 1.0;
+    g_mutex_lock(&rc->lock);
+    rc->frame_release.gap_us = gap_us;
     g_mutex_unlock(&rc->lock);
 }

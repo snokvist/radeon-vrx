@@ -16,6 +16,9 @@ G_BEGIN_DECLS
 #define UV_RTP_SLOT_EMPTY 0xffffffffu
 #define UV_SOURCE_FRAME_FPS_WINDOW_SAMPLES 512u
 #define UV_DECODER_FPS_WINDOW_SAMPLES 512u
+#define UV_RELEASE_CHUNK_RING 512u
+#define UV_RELEASE_FRAME_RING 1024u
+#define UV_RELEASE_DEFAULT_GAP_US 500.0
 
 struct UvFrameBlockState;
 
@@ -54,6 +57,43 @@ typedef struct {
     struct UvFrameBlockState *frame_block;
     uint64_t frame_block_accum_bytes;
 
+    /* Per-frame release timing (Part A: span + chunks-per-frame). A frame is
+     * "open" from its first RTP packet until its marker packet. */
+    gboolean frame_open;
+    gint64   frame_first_pkt_us;   /* arrival of the frame's first packet */
+    guint    frame_chunk_count;    /* release bursts the frame spanned so far */
+    guint    frame_pkts;           /* packets in the current frame */
+    gboolean frame_overlap;        /* first packet joined the previous burst */
+
+    /* Independent marker-cadence baseline (decoupled from the frame-block grid
+     * state so the cadence ring works even when the grid is disabled). */
+    gboolean have_marker_baseline;
+    gint64   last_marker_us;
+    uint32_t last_marker_ts;
+    double   frame_period_ms;      /* EWMA of marker-to-marker RTP-ts period */
+
+    /* Per-frame ring for the cadence timeline. Lazily allocated only while
+     * frame_release is enabled on the selected source (NULL otherwise). */
+    UvReleaseFrame *frame_ring;    /* UV_RELEASE_FRAME_RING entries when non-NULL */
+    guint    frame_ring_head;
+    guint    frame_ring_count;
+
+    /* Release-burst (FEC chunk) accumulator + ring (Part B). A chunk is a run
+     * of packets whose inter-arrival gap stayed below frame_release.gap_us. */
+    gint64        last_pkt_us;         /* arrival of the previous unique packet */
+    gboolean      chunk_open;
+    gint64        chunk_start_us;
+    double        chunk_gap_ms;        /* idle gap that preceded this chunk */
+    guint         chunk_pkts;
+    guint         chunk_bytes;
+    guint         chunk_frames;        /* distinct RTP timestamps in this chunk */
+    uint32_t      chunk_last_ts;
+    UvReleaseChunk *release_ring;      /* UV_RELEASE_CHUNK_RING entries, lazy (NULL off) */
+    guint         release_head;        /* next write slot */
+    guint         release_count;       /* filled entries (<= ring size) */
+    guint64       release_total;       /* lifetime chunks since reset */
+    guint64       release_overlap;     /* lifetime chunks with frames >= 2 */
+
     /* HEVC stream composition counters (computed from RTP payload). */
     uint64_t hevc_idr_count;
     uint64_t hevc_cra_count;
@@ -91,10 +131,20 @@ typedef struct {
         guint height;
         double thresholds_ms[3];
         double thresholds_kb[3];
+        double thresholds_span[3];   /* span_ms metric (computed at snapshot) */
+        double thresholds_chunks[3]; /* chunks-per-frame metric */
+        double thresholds_fpc[3];    /* frames-per-chunk metric */
         gboolean reset_requested;
         gboolean thresholds_dirty_ms;
         gboolean thresholds_dirty_kb;
     } frame_block;
+
+    struct {
+        gboolean enabled;
+        gboolean paused;
+        double gap_us;            /* burst separator: gap above this = new chunk */
+        gboolean reset_requested;
+    } frame_release;
 
     GMutex lock;
     struct _UvViewer *viewer;
@@ -303,6 +353,22 @@ void     relay_controller_frame_block_set_size_thresholds(RelayController *rc,
                                                           double green_kb,
                                                           double yellow_kb,
                                                           double orange_kb);
+void     relay_controller_frame_block_set_span_thresholds(RelayController *rc,
+                                                          double green_ms,
+                                                          double yellow_ms,
+                                                          double orange_ms);
+void     relay_controller_frame_block_set_chunk_thresholds(RelayController *rc,
+                                                           double green,
+                                                           double yellow,
+                                                           double orange);
+void     relay_controller_frame_block_set_overlap_thresholds(RelayController *rc,
+                                                             double green,
+                                                             double yellow,
+                                                             double orange);
+void     relay_controller_frame_release_configure(RelayController *rc, gboolean enabled);
+void     relay_controller_frame_release_pause(RelayController *rc, gboolean paused);
+void     relay_controller_frame_release_reset(RelayController *rc);
+void     relay_controller_frame_release_set_gap_us(RelayController *rc, double gap_us);
 
 gboolean sidecar_controller_init(SidecarController *sc, struct _UvViewer *viewer);
 void     sidecar_controller_deinit(SidecarController *sc);
