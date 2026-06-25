@@ -779,6 +779,64 @@ static void release_state_clear(UvRelaySource *src) {
     src->frame_period_ms = 0.0;
 }
 
+/* Finish a gap auto-calibration pass: 1-D 2-means over the collected
+ * log10(inter-arrival µs) samples. wfb-ng delivery is bimodal — a dense
+ * intra-burst cluster (packets back-to-back inside one FEC block) and a sparse
+ * inter-burst cluster (the idle gap between blocks). The k-means decision
+ * boundary (midpoint of the two centroids in log space = geometric mean of the
+ * cluster centers) sits in the valley between them, which is exactly the gap
+ * threshold we want. Runs on the relay thread under rc->lock; ~25 * 1500 float
+ * ops, microseconds. Publishes via calib_seq so the GUI applies it once. */
+static void release_calib_finish(RelayController *rc) {
+    guint n = rc->frame_release.calib_count;
+    const double *x = rc->frame_release.calib_samples;
+    rc->frame_release.calib_active = FALSE;
+
+    if (!x || n < 50u) {
+        /* Too little traffic to judge — leave the gap, flag low confidence. */
+        rc->frame_release.calib_confident = FALSE;
+        rc->frame_release.calib_seq++;
+        return;
+    }
+
+    double lo = x[0], hi = x[0];
+    for (guint i = 1; i < n; i++) {
+        if (x[i] < lo) lo = x[i];
+        if (x[i] > hi) hi = x[i];
+    }
+
+    double c0 = lo, c1 = hi;
+    if (hi - lo >= 1e-6) {
+        for (int it = 0; it < 25; it++) {
+            double mid = 0.5 * (c0 + c1);
+            double s0 = 0.0, s1 = 0.0;
+            guint n0 = 0, n1 = 0;
+            for (guint i = 0; i < n; i++) {
+                if (x[i] <= mid) { s0 += x[i]; n0++; }
+                else             { s1 += x[i]; n1++; }
+            }
+            double nc0 = n0 ? s0 / (double)n0 : c0;
+            double nc1 = n1 ? s1 / (double)n1 : c1;
+            if (fabs(nc0 - c0) < 1e-9 && fabs(nc1 - c1) < 1e-9) {
+                c0 = nc0; c1 = nc1;
+                break;
+            }
+            c0 = nc0; c1 = nc1;
+        }
+    }
+    if (c0 > c1) { double t = c0; c0 = c1; c1 = t; }
+
+    double gap = pow(10.0, 0.5 * (c0 + c1));
+    if (gap < 50.0)     gap = 50.0;
+    if (gap > 20000.0)  gap = 20000.0;
+    /* >= ~0.3 decades (2x) between clusters means a genuinely bimodal stream;
+     * tighter than that and we are just bisecting one cluster (e.g. an evenly
+     * paced sender), so the suggestion is not trustworthy. */
+    rc->frame_release.calib_gap_us = gap;
+    rc->frame_release.calib_confident = (c1 - c0) >= 0.3;
+    rc->frame_release.calib_seq++;
+}
+
 /* Per-unique-packet release tracking, run on the relay recv thread under
  * rc->lock. Groups packets into bursts ("chunks") separated by an idle gap >
  * frame_release.gap_us — i.e. wfb-ng FEC block releases — and tracks how many
@@ -861,6 +919,26 @@ static void release_process_packet(RelayController *rc, UvRelaySource *src,
         src->frame_overlap = !new_chunk;
     }
     src->frame_pkts++;
+
+    /* Auto-calibration: log every raw inter-arrival delta (independent of the
+     * current gap threshold) until we have enough to 2-means the distribution. */
+    if (rc->frame_release.calib_active && src->last_pkt_us > 0 &&
+        arrival_us > src->last_pkt_us) {
+        double d = (double)(arrival_us - src->last_pkt_us);
+        if (d >= 1.0 && d <= 100000.0) { /* 1µs..100ms sane window */
+            if (!rc->frame_release.calib_samples) {
+                rc->frame_release.calib_samples =
+                    g_new0(double, UV_RELEASE_CALIB_SAMPLES);
+            }
+            if (rc->frame_release.calib_count < UV_RELEASE_CALIB_SAMPLES) {
+                rc->frame_release.calib_samples[rc->frame_release.calib_count++] =
+                    log10(d);
+            }
+            if (rc->frame_release.calib_count >= UV_RELEASE_CALIB_SAMPLES) {
+                release_calib_finish(rc);
+            }
+        }
+    }
 
     src->last_pkt_us = arrival_us;
 }
@@ -1272,6 +1350,8 @@ void relay_controller_deinit(RelayController *rc) {
     }
     rc->sources_count = 0;
     rc->selected_index = -1;
+    g_free(rc->frame_release.calib_samples);
+    rc->frame_release.calib_samples = NULL;
     g_mutex_unlock(&rc->lock);
     g_mutex_clear(&rc->lock);
 }
@@ -1563,6 +1643,10 @@ void relay_controller_snapshot(RelayController *rc, UvViewerStats *stats, int cl
             fr->overlap_chunks = src->release_overlap;
             fr->overlap_rate = src->release_total > 0
                 ? (double)src->release_overlap / (double)src->release_total : 0.0;
+            fr->calib_active = rc->frame_release.calib_active;
+            fr->calib_seq = rc->frame_release.calib_seq;
+            fr->calib_gap_us = rc->frame_release.calib_gap_us;
+            fr->calib_confident = rc->frame_release.calib_confident;
             if (!fr->chunks) fr->chunks = g_array_new(FALSE, TRUE, sizeof(UvReleaseChunk));
             g_array_set_size(fr->chunks, 0);
             guint rc_count = src->release_ring ? src->release_count : 0;
@@ -1848,5 +1932,13 @@ void relay_controller_frame_release_set_gap_us(RelayController *rc, double gap_u
     if (gap_us < 1.0) gap_us = 1.0;
     g_mutex_lock(&rc->lock);
     rc->frame_release.gap_us = gap_us;
+    g_mutex_unlock(&rc->lock);
+}
+
+void relay_controller_frame_release_calibrate(RelayController *rc) {
+    if (!rc) return;
+    g_mutex_lock(&rc->lock);
+    rc->frame_release.calib_active = TRUE;
+    rc->frame_release.calib_count = 0;
     g_mutex_unlock(&rc->lock);
 }

@@ -19,6 +19,9 @@ G_BEGIN_DECLS
 #define UV_RELEASE_CHUNK_RING 512u
 #define UV_RELEASE_FRAME_RING 1024u
 #define UV_RELEASE_DEFAULT_GAP_US 500.0
+/* Inter-arrival deltas collected before auto-calibration runs its 2-means.
+ * At ~30 pkts/frame * 60 fps (~1800 pps) this fills in under a second. */
+#define UV_RELEASE_CALIB_SAMPLES 1500u
 
 struct UvFrameBlockState;
 
@@ -144,6 +147,17 @@ typedef struct {
         gboolean paused;
         double gap_us;            /* burst separator: gap above this = new chunk */
         gboolean reset_requested;
+        /* Auto-calibration of gap_us. While active, every selected-source
+         * inter-arrival delta is logged; once UV_RELEASE_CALIB_SAMPLES land we
+         * 2-means the log10(delta) distribution and place gap_us in the valley
+         * between the intra-burst and inter-burst clusters. calib_seq bumps when
+         * a fresh result is ready so the GUI can apply it exactly once. */
+        gboolean calib_active;
+        guint    calib_count;
+        guint    calib_seq;
+        double   calib_gap_us;    /* last suggestion (clamped to spin range) */
+        gboolean calib_confident; /* clusters were cleanly bimodal */
+        double  *calib_samples;   /* log10(delta_us), lazily allocated */
     } frame_release;
 
     GMutex lock;
@@ -369,6 +383,7 @@ void     relay_controller_frame_release_configure(RelayController *rc, gboolean 
 void     relay_controller_frame_release_pause(RelayController *rc, gboolean paused);
 void     relay_controller_frame_release_reset(RelayController *rc);
 void     relay_controller_frame_release_set_gap_us(RelayController *rc, double gap_us);
+void     relay_controller_frame_release_calibrate(RelayController *rc);
 
 gboolean sidecar_controller_init(SidecarController *sc, struct _UvViewer *viewer);
 void     sidecar_controller_deinit(SidecarController *sc);

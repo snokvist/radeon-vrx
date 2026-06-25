@@ -181,6 +181,10 @@ typedef struct {
     GtkToggleButton *frame_release_pause_toggle;
     GtkButton *frame_release_reset_button;
     GtkSpinButton *frame_release_gap_spin;
+    GtkButton *frame_release_calib_button;
+    GtkLabel *frame_release_calib_label;
+    gboolean frame_release_calib_pending;  // Auto pressed, awaiting a fresh result
+    guint frame_release_calib_seq;         // last calib_seq consumed from snapshots
     GtkDrawingArea *frame_release_timeline_area;
     GtkDrawingArea *frame_release_hist_area;
     GtkLabel *frame_release_summary_label;
@@ -2697,6 +2701,35 @@ static void refresh_frame_release(GuiContext *ctx, const UvViewerStats *stats) {
             memcpy(ctx->frame_release_frames->data, fr->frames->data,
                    sizeof(UvReleaseFrame) * nf);
         }
+
+        /* Auto-calibration result: apply once on a calib_seq change. While no
+         * request is outstanding, track the latest seq so a stale increment
+         * (e.g. a result that landed while the page was hidden) never fires. */
+        if (ctx->frame_release_calib_pending && fr->calib_seq != ctx->frame_release_calib_seq) {
+            ctx->frame_release_calib_seq = fr->calib_seq;
+            ctx->frame_release_calib_pending = FALSE;
+            if (ctx->frame_release_calib_button) {
+                gtk_button_set_label(ctx->frame_release_calib_button, "Auto");
+                gtk_widget_set_sensitive(GTK_WIDGET(ctx->frame_release_calib_button), TRUE);
+            }
+            if (fr->calib_confident) {
+                /* Setting the spin value fires on_frame_release_gap_changed,
+                 * which forwards the new gap to the relay. */
+                if (ctx->frame_release_gap_spin) {
+                    gtk_spin_button_set_value(ctx->frame_release_gap_spin, fr->calib_gap_us);
+                }
+                if (ctx->frame_release_calib_label) {
+                    char b[64];
+                    g_snprintf(b, sizeof(b), "auto → %.0f µs", fr->calib_gap_us);
+                    gtk_label_set_text(ctx->frame_release_calib_label, b);
+                }
+            } else if (ctx->frame_release_calib_label) {
+                gtk_label_set_text(ctx->frame_release_calib_label,
+                                   "auto: no clear burst pattern — gap kept");
+            }
+        } else if (!ctx->frame_release_calib_pending) {
+            ctx->frame_release_calib_seq = fr->calib_seq;
+        }
     } else {
         ctx->frame_release_valid = FALSE;
         ctx->frame_release_active = FALSE;
@@ -2774,6 +2807,15 @@ static void on_frame_release_enable_toggled(GtkToggleButton *button, gpointer us
     if (ctx->frame_release_reset_button) {
         gtk_widget_set_sensitive(GTK_WIDGET(ctx->frame_release_reset_button), enabled);
     }
+    if (ctx->frame_release_calib_button) {
+        /* Sampling only runs while the feature is on (release_process_packet
+         * is gated on it), so disabling the feature cancels any pending pass. */
+        gtk_widget_set_sensitive(GTK_WIDGET(ctx->frame_release_calib_button), enabled);
+        if (!enabled) {
+            ctx->frame_release_calib_pending = FALSE;
+            gtk_button_set_label(ctx->frame_release_calib_button, "Auto");
+        }
+    }
 }
 
 static void on_frame_release_pause_toggled(GtkToggleButton *button, gpointer user_data) {
@@ -2819,6 +2861,23 @@ static void on_frame_release_gap_changed(GtkSpinButton *spin, gpointer user_data
     ctx->frame_release_gap_us = gap_us;
     if (ctx->viewer) {
         uv_viewer_frame_release_set_gap_us(ctx->viewer, gap_us);
+    }
+}
+
+static void on_frame_release_calib_clicked(GtkButton *button, gpointer user_data) {
+    GuiContext *ctx = user_data;
+    if (!ctx || !ctx->viewer) return;
+    /* One-shot: kick the relay-side sampler and wait for the result via the
+     * snapshot poll. The baseline seq is already tracked while idle, so any
+     * bump from here on is our result. */
+    ctx->frame_release_calib_pending = TRUE;
+    uv_viewer_frame_release_calibrate(ctx->viewer);
+    if (button) {
+        gtk_button_set_label(button, "Calibrating…");
+        gtk_widget_set_sensitive(GTK_WIDGET(button), FALSE);
+    }
+    if (ctx->frame_release_calib_label) {
+        gtk_label_set_text(ctx->frame_release_calib_label, "auto: sampling…");
     }
 }
 
@@ -5469,8 +5528,33 @@ static GtkWidget *build_frame_release_page(GuiContext *ctx) {
     gtk_spin_button_set_digits(ctx->frame_release_gap_spin, 0);
     gtk_spin_button_set_value(ctx->frame_release_gap_spin,
                               ctx->frame_release_gap_us > 0.0 ? ctx->frame_release_gap_us : 500.0);
+    gtk_widget_set_tooltip_text(GTK_WIDGET(ctx->frame_release_gap_spin),
+        "Idle inter-arrival gap that separates one FEC release burst from the next. "
+        "Packets closer together than this are one burst; a longer silence starts a "
+        "new one. Too low fragments a single burst into fake chunks (overlap detection "
+        "stops working); too high merges adjacent bursts and hides real cross-frame "
+        "overlap. The sweet spot sits between the intra-burst packet spacing (tens of "
+        "µs) and the inter-burst spacing (hundreds of µs to ms) — it scales with link "
+        "rate / MCS, so press Auto to measure it for the current stream.");
     g_signal_connect(ctx->frame_release_gap_spin, "value-changed", G_CALLBACK(on_frame_release_gap_changed), ctx);
     gtk_box_append(GTK_BOX(gap_box), GTK_WIDGET(ctx->frame_release_gap_spin));
+
+    ctx->frame_release_calib_button = GTK_BUTTON(gtk_button_new_with_label("Auto"));
+    gtk_widget_set_sensitive(GTK_WIDGET(ctx->frame_release_calib_button), FALSE);
+    gtk_widget_set_tooltip_text(GTK_WIDGET(ctx->frame_release_calib_button),
+        "Measure a good Gap (µs) for the current stream: samples ~1 s of packet "
+        "arrival timing and splits the intra-burst vs inter-burst clusters, placing "
+        "the gap in the valley between them. Applies the result automatically when "
+        "the stream is clearly bursty; leaves the gap untouched if no burst pattern "
+        "is found (e.g. an evenly paced sender).");
+    g_signal_connect(ctx->frame_release_calib_button, "clicked",
+                     G_CALLBACK(on_frame_release_calib_clicked), ctx);
+    gtk_box_append(GTK_BOX(gap_box), GTK_WIDGET(ctx->frame_release_calib_button));
+
+    ctx->frame_release_calib_label = GTK_LABEL(gtk_label_new(""));
+    gtk_widget_add_css_class(GTK_WIDGET(ctx->frame_release_calib_label), "dim-label");
+    gtk_label_set_xalign(ctx->frame_release_calib_label, 0.0);
+    gtk_box_append(GTK_BOX(gap_box), GTK_WIDGET(ctx->frame_release_calib_label));
     gtk_box_append(GTK_BOX(controls), gap_box);
 
     const char *window_labels[] = {"1 s", "2 s", "5 s", "10 s", NULL};
@@ -5510,7 +5594,8 @@ static GtkWidget *build_frame_release_page(GuiContext *ctx) {
         "boundary does not align to frame boundaries, so one burst can carry the tail of frame "
         "N plus the head of frame N+1. Those cross-frame bursts (red, multi-stripe) are the ones "
         "that turn into downstream frame drops. Gap (µs) is the idle threshold that separates "
-        "one burst from the next. A cross-frame burst is marked on the later frame.");
+        "one burst from the next — press Auto to measure it for the current stream instead of "
+        "guessing. A cross-frame burst is marked on the later frame.");
     gtk_box_append(GTK_BOX(controls), help);
 
     /* Overview health strip (whole capture, drag to select). */
@@ -6030,6 +6115,10 @@ static void on_app_shutdown(GApplication *app, gpointer user_data) {
     ctx->frame_release_pause_toggle = NULL;
     ctx->frame_release_reset_button = NULL;
     ctx->frame_release_gap_spin = NULL;
+    ctx->frame_release_calib_button = NULL;
+    ctx->frame_release_calib_label = NULL;
+    ctx->frame_release_calib_pending = FALSE;
+    ctx->frame_release_calib_seq = 0;
     ctx->frame_release_window_dropdown = NULL;
     ctx->frame_release_follow_toggle = NULL;
     ctx->frame_release_overview_area = NULL;
