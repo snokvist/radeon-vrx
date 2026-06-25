@@ -26,6 +26,7 @@ SRCS := \
 	src/gui_shell.c
 
 OBJS := $(SRCS:.c=.o)
+DEPS := $(OBJS:.o=.d)
 TARGET := udp-h265-viewer
 
 all: $(TARGET)
@@ -33,11 +34,17 @@ all: $(TARGET)
 $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(GST_LIBS) $(GTK_LIBS) -lm
 
+# -MMD -MP emits a per-object .d listing its header prerequisites, so editing a
+# shared header (e.g. uv_viewer.h / uv_internal.h) rebuilds every dependent
+# object. Without this an incremental build can mix objects compiled against
+# different struct layouts -> ABI mismatch -> memory corruption at runtime.
 %.o: %.c
-	$(CC) $(CFLAGS) $(INCLUDES) $(GST_FLAGS) $(GTK_FLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) $(INCLUDES) $(GST_FLAGS) $(GTK_FLAGS) -MMD -MP -c $< -o $@
 
 clean:
-	rm -f $(OBJS) $(TARGET)
+	rm -f $(OBJS) $(DEPS) $(TARGET)
+
+-include $(DEPS)
 
 install: $(TARGET) $(DESKTOP_FILE)
 	$(INSTALL) -d "$(DESTDIR)$(BINDIR)"
