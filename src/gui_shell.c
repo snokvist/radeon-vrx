@@ -34,6 +34,8 @@ typedef enum {
     STATS_METRIC_JITTER,
     STATS_METRIC_INPUT_FPS,
     STATS_METRIC_DECODER_FPS,
+    STATS_METRIC_PPS,
+    STATS_METRIC_PKT_SIZE,
     STATS_METRIC_COUNT
 } StatsMetric;
 
@@ -223,9 +225,13 @@ typedef struct {
     double lost_packets;      // cumulative count (kept for delta arithmetic)
     double dup_packets;
     double reorder_packets;
+    double rx_packets;        // cumulative RX packets (kept for delta arithmetic)
+    double rx_bytes;          // cumulative RX bytes
     double lost_pps;          // per-second rate vs. previous sample (charted)
     double dup_pps;
     double reorder_pps;
+    double pps;               // RX packets/sec vs. previous sample (charted)
+    double pkt_size_bytes;    // mean RX bytes/packet over the interval (charted)
     double jitter_ms;
     double input_fps;
     double decoder_fps_current;
@@ -1935,6 +1941,8 @@ static double stats_metric_value(const StatsSample *sample, StatsMetric metric) 
         case STATS_METRIC_JITTER:  return sample->jitter_ms;
         case STATS_METRIC_INPUT_FPS: return sample->input_fps;
         case STATS_METRIC_DECODER_FPS: return sample->decoder_fps_current;
+        case STATS_METRIC_PPS:     return sample->pps;
+        case STATS_METRIC_PKT_SIZE: return sample->pkt_size_bytes;
         default:                   return 0.0;
     }
 }
@@ -1948,6 +1956,8 @@ static const char *stats_metric_unit(StatsMetric metric) {
         case STATS_METRIC_JITTER:      return "ms";
         case STATS_METRIC_INPUT_FPS:
         case STATS_METRIC_DECODER_FPS: return "fps";
+        case STATS_METRIC_PPS:         return "pps";
+        case STATS_METRIC_PKT_SIZE:    return "bytes";
         default:                       return "";
     }
 }
@@ -1974,12 +1984,15 @@ static void format_metric_value(StatsMetric metric, double value, char *out, siz
     }
     if (metric == STATS_METRIC_RATE) {
         g_snprintf(out, outlen, "%.2f %s", value / 1e6, unit);
-    } else if (metric == STATS_METRIC_LOST || metric == STATS_METRIC_DUP || metric == STATS_METRIC_REORDER) {
+    } else if (metric == STATS_METRIC_LOST || metric == STATS_METRIC_DUP ||
+               metric == STATS_METRIC_REORDER || metric == STATS_METRIC_PPS) {
         if (value < 10.0) {
             g_snprintf(out, outlen, "%.2f %s", value, unit);
         } else {
             g_snprintf(out, outlen, "%.0f %s", value, unit);
         }
+    } else if (metric == STATS_METRIC_PKT_SIZE) {
+        g_snprintf(out, outlen, "%.0f %s", value, unit);
     } else {
         g_snprintf(out, outlen, "%.2f %s", value, unit);
     }
@@ -3380,6 +3393,8 @@ static void refresh_stats(GuiContext *ctx) {
         sample.lost_packets = (double)viewer_selected_source->rtp_lost_packets;
         sample.dup_packets = (double)viewer_selected_source->rtp_duplicate_packets;
         sample.reorder_packets = (double)viewer_selected_source->rtp_reordered_packets;
+        sample.rx_packets = (double)viewer_selected_source->rx_packets;
+        sample.rx_bytes = (double)viewer_selected_source->rx_bytes;
         if (ctx->stats_history && ctx->stats_history->len > 0) {
             const StatsSample *prev = &g_array_index(ctx->stats_history, StatsSample,
                                                     ctx->stats_history->len - 1);
@@ -3393,6 +3408,11 @@ static void refresh_stats(GuiContext *ctx) {
                 sample.lost_pps = dl > 0.0 ? dl / dt : 0.0;
                 sample.dup_pps = dd > 0.0 ? dd / dt : 0.0;
                 sample.reorder_pps = dr > 0.0 ? dr / dt : 0.0;
+                double dpkts = sample.rx_packets - prev->rx_packets;
+                double dbytes_rx = sample.rx_bytes - prev->rx_bytes;
+                sample.pps = dpkts > 0.0 ? dpkts / dt : 0.0;
+                sample.pkt_size_bytes = (dpkts > 0.0 && dbytes_rx > 0.0)
+                                            ? dbytes_rx / dpkts : 0.0;
             }
         }
         sample.jitter_ms = viewer_selected_source->rfc3550_jitter_ms;
@@ -4639,7 +4659,9 @@ static GtkWidget *build_stats_page(GuiContext *ctx) {
         "RTP Reordered (pkt/s)",
         "RTP Jitter (ms)",
         "Input Frame FPS",
-        "Decoder FPS (current)"
+        "Decoder FPS (current)",
+        "Packets/sec (PPS)",
+        "Avg Packet Size (bytes)"
     };
 
     for (int i = 0; i < STATS_METRIC_COUNT; i++) {
