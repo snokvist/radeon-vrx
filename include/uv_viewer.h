@@ -220,6 +220,14 @@ typedef struct {
     guint    hist_frames[UV_RELEASE_FRAMES_BUCKETS]; // over retained ring window
     GArray  *chunks;             // UvReleaseChunk, oldest-first, most recent last
     GArray  *frames;             // UvReleaseFrame, oldest-first (cadence timeline)
+
+    /* Gap (µs) auto-calibration result. calib_seq increments each time a fresh
+     * suggestion is computed; the GUI applies on a change of seq. calib_gap_us
+     * is only worth applying when calib_confident (a clearly bimodal stream). */
+    gboolean calib_active;       // calibration sampling in progress
+    guint    calib_seq;          // bumps when a new suggestion lands
+    double   calib_gap_us;       // suggested gap threshold
+    gboolean calib_confident;    // intra/inter-burst clusters were well-separated
 } UvReleaseStats;
 
 /* Encoder-side telemetry received over the waybeam_venc RTP sidecar
@@ -363,6 +371,9 @@ void uv_viewer_frame_release_configure(UvViewer *viewer, gboolean enabled);
 void uv_viewer_frame_release_pause(UvViewer *viewer, gboolean paused);
 void uv_viewer_frame_release_reset(UvViewer *viewer);
 void uv_viewer_frame_release_set_gap_us(UvViewer *viewer, double gap_us);
+/* Begin a one-shot auto-calibration of the gap threshold; the result lands in
+ * UvReleaseStats (calib_seq / calib_gap_us / calib_confident) within ~1 s. */
+void uv_viewer_frame_release_calibrate(UvViewer *viewer);
 
 void uv_viewer_stats_init(UvViewerStats *stats);
 void uv_viewer_stats_clear(UvViewerStats *stats);

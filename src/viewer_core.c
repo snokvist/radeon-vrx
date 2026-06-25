@@ -306,6 +306,11 @@ void uv_viewer_frame_release_set_gap_us(UvViewer *viewer, double gap_us) {
     relay_controller_frame_release_set_gap_us(&viewer->relay, gap_us);
 }
 
+void uv_viewer_frame_release_calibrate(UvViewer *viewer) {
+    if (!viewer) return;
+    relay_controller_frame_release_calibrate(&viewer->relay);
+}
+
 void uv_viewer_stats_init(UvViewerStats *stats) {
     if (!stats) return;
     stats->sources = g_array_new(FALSE, TRUE, sizeof(UvSourceStats));
