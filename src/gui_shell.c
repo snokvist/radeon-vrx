@@ -80,6 +80,12 @@ typedef struct {
     GtkCheckButton *jitter_drop_toggle;
     GtkCheckButton *jitter_do_lost_toggle;
     GtkCheckButton *jitter_post_drop_toggle;
+    /* Restream (verbatim UDP forward of the selected source) — Settings tab. */
+    GtkCheckButton *restream_toggle;
+    GtkEntry       *restream_host_entry;
+    GtkSpinButton  *restream_port_spin;
+    GtkLabel       *restream_status_label;
+    gboolean        restream_toggle_suppress;
     GtkNotebook *notebook;
     GtkDropDown *stats_range_dropdown;
     GtkDrawingArea *stats_charts[STATS_METRIC_COUNT];
@@ -277,6 +283,8 @@ static void on_audio_apply_clicked(GtkButton *btn, gpointer user_data);
 static void on_audio_restart_clicked(GtkButton *btn, gpointer user_data);
 static void on_audio_port_mode_changed(GObject *dropdown, GParamSpec *pspec, gpointer user_data);
 static void update_audio_status_label(GuiContext *ctx, const UvViewerStats *stats);
+static void update_restream_status_label(GuiContext *ctx, const UvRestreamStats *rs);
+static void on_restream_toggled(GtkCheckButton *btn, gpointer user_data);
 static void viewer_event_callback(const UvViewerEvent *event, gpointer user_data);
 static void on_notebook_switch_page(GtkNotebook *notebook, GtkWidget *page, guint page_num, gpointer user_data);
 static void detach_bound_sink(GuiContext *ctx);
@@ -1819,6 +1827,26 @@ static void sync_settings_controls(GuiContext *ctx) {
     if (ctx->idr_port_spin) {
         guint port = ctx->current_cfg.idr_http_port ? ctx->current_cfg.idr_http_port : 80;
         gtk_spin_button_set_value(ctx->idr_port_spin, port);
+    }
+    if (ctx->restream_host_entry) {
+        gtk_editable_set_text(GTK_EDITABLE(ctx->restream_host_entry),
+                              ctx->current_cfg.restream_address);
+    }
+    if (ctx->restream_port_spin) {
+        guint port = ctx->current_cfg.restream_port ? ctx->current_cfg.restream_port : 5600;
+        gtk_spin_button_set_value(ctx->restream_port_spin, port);
+    }
+    if (ctx->restream_toggle) {
+        gboolean on = ctx->current_cfg.restream_enabled ? TRUE : FALSE;
+        ctx->restream_toggle_suppress = TRUE;
+        gtk_check_button_set_active(ctx->restream_toggle, on);
+        ctx->restream_toggle_suppress = FALSE;
+        if (ctx->restream_host_entry) {
+            gtk_widget_set_sensitive(GTK_WIDGET(ctx->restream_host_entry), !on);
+        }
+        if (ctx->restream_port_spin) {
+            gtk_widget_set_sensitive(GTK_WIDGET(ctx->restream_port_spin), !on);
+        }
     }
     if (ctx->decoder_dropdown) {
         gtk_drop_down_set_selected(ctx->decoder_dropdown,
@@ -3670,6 +3698,7 @@ static void refresh_stats(GuiContext *ctx) {
 
     update_sidecar_panel(ctx, &stats.sidecar);
     update_audio_status_label(ctx, &stats);
+    update_restream_status_label(ctx, &stats.restream);
 
     uv_viewer_stats_clear(&stats);
 }
@@ -4164,6 +4193,24 @@ static void on_settings_apply_clicked(GtkButton *button, gpointer user_data) {
     new_cfg.sidecar_enabled = ctx->current_cfg.sidecar_enabled;
     new_cfg.sidecar_port    = ctx->current_cfg.sidecar_port;
 
+    /* Restream is toggled live on this tab; preserve its enabled state and
+     * capture any pending edits to the destination so the rebuilt viewer
+     * (uv_viewer_start) resumes forwarding to the same target. */
+    new_cfg.restream_enabled = ctx->current_cfg.restream_enabled;
+    if (ctx->restream_host_entry) {
+        const char *host = gtk_editable_get_text(GTK_EDITABLE(ctx->restream_host_entry));
+        g_strlcpy(new_cfg.restream_address, host ? host : "", sizeof(new_cfg.restream_address));
+        g_strlcpy(ctx->current_cfg.restream_address, host ? host : "",
+                  sizeof(ctx->current_cfg.restream_address));
+    }
+    if (ctx->restream_port_spin) {
+        int rp = gtk_spin_button_get_value_as_int(ctx->restream_port_spin);
+        if (rp < 1) rp = 1;
+        if (rp > 65535) rp = 65535;
+        new_cfg.restream_port = (guint16)rp;
+        ctx->current_cfg.restream_port = (guint16)rp;
+    }
+
     guint new_refresh_interval = ctx->stats_refresh_interval_ms;
     if (ctx->stats_refresh_spin) {
         int refresh = gtk_spin_button_get_value_as_int(ctx->stats_refresh_spin);
@@ -4494,6 +4541,72 @@ static GtkWidget *build_monitor_page(GuiContext *ctx) {
     return page;
 }
 
+static void update_restream_status_label(GuiContext *ctx, const UvRestreamStats *rs) {
+    if (!ctx || !ctx->restream_status_label) return;
+    char line[256];
+    if (!rs || !rs->enabled) {
+        g_snprintf(line, sizeof(line), "Restream: off");
+    } else if (!rs->active) {
+        g_snprintf(line, sizeof(line), "Restream: enabled (no valid destination)");
+    } else {
+        g_snprintf(line, sizeof(line),
+                   "Restream \xE2\x86\x92 %s:%u   tx=%" G_GUINT64_FORMAT " pkts / %.1f MB%s",
+                   rs->address, rs->port, rs->tx_packets,
+                   (double)rs->tx_bytes / (1024.0 * 1024.0),
+                   rs->tx_errors ? "   (send errors)" : "");
+    }
+    gtk_label_set_text(ctx->restream_status_label, line);
+}
+
+static void on_restream_toggled(GtkCheckButton *btn, gpointer user_data) {
+    GuiContext *ctx = user_data;
+    if (!ctx || ctx->restream_toggle_suppress) return;
+    gboolean want = gtk_check_button_get_active(btn);
+
+    const char *host = "";
+    if (ctx->restream_host_entry) {
+        host = gtk_editable_get_text(GTK_EDITABLE(ctx->restream_host_entry));
+    }
+    guint16 port = ctx->current_cfg.restream_port ? ctx->current_cfg.restream_port : 5600;
+    if (ctx->restream_port_spin) {
+        int v = gtk_spin_button_get_value_as_int(ctx->restream_port_spin);
+        if (v >= 1 && v <= 65535) port = (guint16)v;
+    }
+
+    if (want && (!host || !host[0])) {
+        update_status(ctx, "Restream: enter a destination host first");
+        ctx->restream_toggle_suppress = TRUE;
+        gtk_check_button_set_active(btn, FALSE);
+        ctx->restream_toggle_suppress = FALSE;
+        return;
+    }
+
+    ctx->current_cfg.restream_enabled = want;
+    g_strlcpy(ctx->current_cfg.restream_address, host ? host : "",
+              sizeof(ctx->current_cfg.restream_address));
+    ctx->current_cfg.restream_port = port;
+    if (ctx->cfg_slot) {
+        ctx->cfg_slot->restream_enabled = want;
+        g_strlcpy(ctx->cfg_slot->restream_address, host ? host : "",
+                  sizeof(ctx->cfg_slot->restream_address));
+        ctx->cfg_slot->restream_port = port;
+    }
+
+    if (ctx->viewer) {
+        uv_viewer_set_restream(ctx->viewer, want, host, port);
+    }
+
+    /* Freeze the destination fields while a forward is live so the displayed
+     * target always matches what the relay is actually sending to. */
+    if (ctx->restream_host_entry) {
+        gtk_widget_set_sensitive(GTK_WIDGET(ctx->restream_host_entry), !want);
+    }
+    if (ctx->restream_port_spin) {
+        gtk_widget_set_sensitive(GTK_WIDGET(ctx->restream_port_spin), !want);
+    }
+    update_status(ctx, want ? "Restream started" : "Restream stopped");
+}
+
 static GtkWidget *build_settings_page(GuiContext *ctx) {
     GtkWidget *page = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
     gtk_widget_set_margin_top(page, 12);
@@ -4614,6 +4727,45 @@ static GtkWidget *build_settings_page(GuiContext *ctx) {
                                 "Applies on next Apply Settings; the button targets this port "
                                 "on the currently locked source's IP.");
     gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(ctx->idr_port_spin), 1, 12, 1, 1);
+
+    /* Restream: verbatim UDP forward of the currently selected source. Live
+     * controls (no viewer restart) — the destination is frozen while active. */
+    GtkWidget *restream_header = gtk_label_new("Restream (verbatim UDP forward)");
+    gtk_label_set_xalign(GTK_LABEL(restream_header), 0.0);
+    gtk_widget_add_css_class(restream_header, "uv-info");
+    gtk_widget_set_margin_top(restream_header, 6);
+    gtk_grid_attach(GTK_GRID(grid), restream_header, 0, 13, 2, 1);
+
+    GtkWidget *restream_host_label = gtk_label_new("Restream Host:");
+    gtk_label_set_xalign(GTK_LABEL(restream_host_label), 0.0);
+    gtk_grid_attach(GTK_GRID(grid), restream_host_label, 0, 14, 1, 1);
+
+    ctx->restream_host_entry = GTK_ENTRY(gtk_entry_new());
+    gtk_entry_set_placeholder_text(ctx->restream_host_entry, "e.g. 192.168.2.30");
+    gtk_widget_set_tooltip_text(GTK_WIDGET(ctx->restream_host_entry),
+                                "Destination IPv4 address for the raw UDP forward of the "
+                                "currently selected source.");
+    gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(ctx->restream_host_entry), 1, 14, 1, 1);
+
+    GtkWidget *restream_port_label = gtk_label_new("Restream Port:");
+    gtk_label_set_xalign(GTK_LABEL(restream_port_label), 0.0);
+    gtk_grid_attach(GTK_GRID(grid), restream_port_label, 0, 15, 1, 1);
+
+    ctx->restream_port_spin = GTK_SPIN_BUTTON(gtk_spin_button_new_with_range(1, 65535, 1));
+    gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(ctx->restream_port_spin), 1, 15, 1, 1);
+
+    ctx->restream_toggle = GTK_CHECK_BUTTON(gtk_check_button_new_with_label("Enable restream"));
+    gtk_widget_set_tooltip_text(GTK_WIDGET(ctx->restream_toggle),
+                                "Forward every raw datagram from the selected source to the "
+                                "destination above, unchanged. Toggles live.");
+    g_signal_connect(ctx->restream_toggle, "toggled", G_CALLBACK(on_restream_toggled), ctx);
+    gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(ctx->restream_toggle), 0, 16, 2, 1);
+
+    ctx->restream_status_label = GTK_LABEL(gtk_label_new("Restream: off"));
+    gtk_label_set_xalign(ctx->restream_status_label, 0.0);
+    gtk_label_set_selectable(ctx->restream_status_label, TRUE);
+    gtk_widget_add_css_class(GTK_WIDGET(ctx->restream_status_label), "uv-source-detail");
+    gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(ctx->restream_status_label), 0, 17, 2, 1);
 
     GtkWidget *apply_button = gtk_button_new_with_label("Apply Settings");
     gtk_widget_add_css_class(apply_button, "suggested-action");
@@ -6184,6 +6336,11 @@ static void on_app_shutdown(GApplication *app, gpointer user_data) {
     ctx->sidecar_encoder_label = NULL;
     ctx->sidecar_counters_label = NULL;
     ctx->sidecar_transport_label = NULL;
+    ctx->restream_toggle = NULL;
+    ctx->restream_host_entry = NULL;
+    ctx->restream_port_spin = NULL;
+    ctx->restream_status_label = NULL;
+    ctx->restream_toggle_suppress = FALSE;
 }
 
 int uv_gui_run(UvViewer **viewer, UvViewerConfig *cfg, const char *program_name) {

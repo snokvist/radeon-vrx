@@ -11,7 +11,8 @@ static void print_usage(const char *argv0) {
                " [--audio-jitter ms] [--audio-port N|shared]"
                " [--decoder auto|intel|nvidia|vaapi|software]"
                " [--video-sink auto|gtk4|wayland|gl|xv|autovideo|fakesink]"
-               " [--idr-port N] [--sidecar] [--no-sidecar] [--sidecar-port N]\n",
+               " [--idr-port N] [--sidecar] [--no-sidecar] [--sidecar-port N]"
+               " [--restream HOST:PORT] [--no-restream]\n",
                argv0);
 }
 
@@ -185,6 +186,30 @@ static gboolean parse_args(int argc, char **argv, UvViewerConfig *cfg) {
                 return FALSE;
             }
             cfg->sidecar_port = (guint)port;
+        } else if (!strcmp(argv[i], "--restream") && i + 1 < argc) {
+            /* HOST:PORT — verbatim UDP forward of the selected source. */
+            const char *spec = argv[++i];
+            const char *colon = strrchr(spec, ':');
+            if (!colon || colon == spec) {
+                g_printerr("Invalid --restream target (expected HOST:PORT): %s\n", spec);
+                return FALSE;
+            }
+            int port = atoi(colon + 1);
+            if (port < 1 || port > 65535) {
+                g_printerr("Invalid --restream port: %s\n", colon + 1);
+                return FALSE;
+            }
+            size_t hostlen = (size_t)(colon - spec);
+            if (hostlen >= sizeof(cfg->restream_address)) {
+                g_printerr("--restream host too long: %s\n", spec);
+                return FALSE;
+            }
+            memcpy(cfg->restream_address, spec, hostlen);
+            cfg->restream_address[hostlen] = '\0';
+            cfg->restream_port = (guint16)port;
+            cfg->restream_enabled = TRUE;
+        } else if (!strcmp(argv[i], "--no-restream")) {
+            cfg->restream_enabled = FALSE;
         } else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
             print_usage(argv[0]);
             exit(EXIT_SUCCESS);

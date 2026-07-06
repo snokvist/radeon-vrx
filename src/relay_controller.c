@@ -1258,6 +1258,24 @@ static gpointer relay_thread_run(gpointer data) {
 
         gboolean push_now = rc->push_enabled && rc->selected_index >= 0 && idx == rc->selected_index;
         int push_index = push_now ? idx : -1;
+
+        /* Verbatim restream: forward every raw datagram from the selected
+         * source to the configured destination, untouched (independent of the
+         * pipeline push gate so it keeps flowing while the local view is
+         * paused). The socket is non-blocking; a full send buffer just drops. */
+        if (rc->restream.enabled && rc->restream.dest_valid && rc->restream.fd >= 0 &&
+            rc->selected_index >= 0 && idx == rc->selected_index) {
+            ssize_t sent = sendto(rc->restream.fd, buf, (size_t)r, 0,
+                                  (struct sockaddr *)&rc->restream.dest,
+                                  sizeof(rc->restream.dest));
+            if (sent == (ssize_t)r) {
+                rc->restream.tx_packets++;
+                rc->restream.tx_bytes += (uint64_t)r;
+            } else {
+                rc->restream.tx_errors++;
+            }
+        }
+
         g_mutex_unlock(&rc->lock);
 
         if (emit_added) {
@@ -1334,6 +1352,10 @@ gboolean relay_controller_init(RelayController *rc, struct _UvViewer *viewer) {
     rc->frame_release.paused = FALSE;
     rc->frame_release.gap_us = UV_RELEASE_DEFAULT_GAP_US;
     rc->frame_release.reset_requested = TRUE;
+
+    rc->restream.enabled = FALSE;
+    rc->restream.fd = -1;
+    rc->restream.dest_valid = FALSE;
     return TRUE;
 }
 
@@ -1352,6 +1374,12 @@ void relay_controller_deinit(RelayController *rc) {
     rc->selected_index = -1;
     g_free(rc->frame_release.calib_samples);
     rc->frame_release.calib_samples = NULL;
+    if (rc->restream.fd >= 0) {
+        close(rc->restream.fd);
+        rc->restream.fd = -1;
+    }
+    rc->restream.enabled = FALSE;
+    rc->restream.dest_valid = FALSE;
     g_mutex_unlock(&rc->lock);
     g_mutex_clear(&rc->lock);
 }
@@ -1699,6 +1727,73 @@ void relay_controller_set_push_enabled(RelayController *rc, gboolean enabled) {
     if (!rc) return;
     g_mutex_lock(&rc->lock);
     rc->push_enabled = enabled;
+    g_mutex_unlock(&rc->lock);
+}
+
+void relay_controller_set_restream(RelayController *rc, gboolean enabled,
+                                   const char *address, guint16 port) {
+    if (!rc) return;
+
+    /* Resolve the destination outside the lock so a bad address never wedges
+     * the relay thread. */
+    gboolean want = enabled && address && address[0] && port > 0;
+    struct in_addr resolved = {0};
+    if (want && inet_pton(AF_INET, address, &resolved) != 1) {
+        uv_log_warn("Restream: invalid destination address '%s'", address);
+        want = FALSE;
+    }
+
+    g_mutex_lock(&rc->lock);
+
+    /* Any change to enable/target closes the current socket; a fresh one is
+     * opened below so tx counters restart cleanly per session. */
+    if (rc->restream.fd >= 0) {
+        close(rc->restream.fd);
+        rc->restream.fd = -1;
+    }
+    rc->restream.dest_valid = FALSE;
+    rc->restream.enabled = want;
+    rc->restream.tx_packets = 0;
+    rc->restream.tx_bytes = 0;
+    rc->restream.tx_errors = 0;
+
+    if (want) {
+        int fd = socket(AF_INET, SOCK_DGRAM, 0);
+        if (fd < 0) {
+            uv_log_warn("Restream: socket() failed: %s", g_strerror(errno));
+            rc->restream.enabled = FALSE;
+        } else {
+            int flags = fcntl(fd, F_GETFL, 0);
+            if (flags >= 0) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+            memset(&rc->restream.dest, 0, sizeof(rc->restream.dest));
+            rc->restream.dest.sin_family = AF_INET;
+            rc->restream.dest.sin_port = htons(port);
+            rc->restream.dest.sin_addr = resolved;
+            g_strlcpy(rc->restream.dest_addr, address, sizeof(rc->restream.dest_addr));
+            rc->restream.dest_port = port;
+            rc->restream.fd = fd;
+            rc->restream.dest_valid = TRUE;
+            uv_log_info("Restream: forwarding selected source to %s:%u", address, port);
+        }
+    } else {
+        uv_log_info("Restream: disabled");
+    }
+
+    g_mutex_unlock(&rc->lock);
+}
+
+void relay_controller_restream_snapshot(RelayController *rc, UvRestreamStats *out) {
+    if (!out) return;
+    memset(out, 0, sizeof(*out));
+    if (!rc) return;
+    g_mutex_lock(&rc->lock);
+    out->enabled = rc->restream.enabled;
+    out->active = rc->restream.enabled && rc->restream.dest_valid && rc->restream.fd >= 0;
+    g_strlcpy(out->address, rc->restream.dest_addr, sizeof(out->address));
+    out->port = rc->restream.dest_port;
+    out->tx_packets = rc->restream.tx_packets;
+    out->tx_bytes = rc->restream.tx_bytes;
+    out->tx_errors = rc->restream.tx_errors;
     g_mutex_unlock(&rc->lock);
 }
 

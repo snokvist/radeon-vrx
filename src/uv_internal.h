@@ -160,6 +160,22 @@ typedef struct {
         double  *calib_samples;   /* log10(delta_us), lazily allocated */
     } frame_release;
 
+    /* Restream: verbatim UDP forward of the selected source's raw datagrams.
+     * All fields are guarded by RelayController.lock. The send socket is opened
+     * when restream is enabled with a resolvable destination and closed on
+     * disable / teardown. */
+    struct {
+        gboolean           enabled;
+        int                fd;          /* UDP send socket, -1 when closed */
+        gboolean           dest_valid;  /* dest resolved and socket ready */
+        struct sockaddr_in dest;
+        char               dest_addr[UV_VIEWER_ADDR_MAX];
+        guint16            dest_port;
+        uint64_t           tx_packets;
+        uint64_t           tx_bytes;
+        uint64_t           tx_errors;
+    } restream;
+
     GMutex lock;
     struct _UvViewer *viewer;
 } RelayController;
@@ -384,6 +400,9 @@ void     relay_controller_frame_release_pause(RelayController *rc, gboolean paus
 void     relay_controller_frame_release_reset(RelayController *rc);
 void     relay_controller_frame_release_set_gap_us(RelayController *rc, double gap_us);
 void     relay_controller_frame_release_calibrate(RelayController *rc);
+void     relay_controller_set_restream(RelayController *rc, gboolean enabled,
+                                       const char *address, guint16 port);
+void     relay_controller_restream_snapshot(RelayController *rc, UvRestreamStats *out);
 
 gboolean sidecar_controller_init(SidecarController *sc, struct _UvViewer *viewer);
 void     sidecar_controller_deinit(SidecarController *sc);

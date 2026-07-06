@@ -39,6 +39,9 @@ void uv_viewer_config_init(UvViewerConfig *cfg) {
     cfg->idr_http_port = 80;
     cfg->sidecar_enabled = FALSE;
     cfg->sidecar_port = 5602;
+    cfg->restream_enabled = FALSE;
+    cfg->restream_address[0] = '\0';
+    cfg->restream_port = 5600;
 }
 
 UvViewer *uv_viewer_new(const UvViewerConfig *cfg) {
@@ -100,6 +103,14 @@ bool uv_viewer_start(UvViewer *viewer, GError **error) {
     }
 
     sidecar_controller_start(&viewer->sidecar);
+
+    /* Honour a restream destination carried in the config (e.g. after an
+     * Apply-Settings restart that rebuilt the viewer). */
+    if (viewer->config.restream_enabled && viewer->config.restream_address[0]) {
+        relay_controller_set_restream(&viewer->relay, TRUE,
+                                      viewer->config.restream_address,
+                                      viewer->config.restream_port);
+    }
 
     g_mutex_lock(&viewer->state_lock);
     viewer->started = TRUE;
@@ -226,6 +237,26 @@ void uv_viewer_set_sidecar_enabled(UvViewer *viewer, bool enabled, guint port) {
     }
 }
 
+void uv_viewer_set_restream(UvViewer *viewer, bool enabled, const char *address, guint16 port) {
+    if (!viewer) return;
+    gboolean want = enabled && address && address[0] && port > 0;
+
+    /* Persist into the config so a subsequent Apply-Settings restart (which
+     * rebuilds the viewer from config) keeps forwarding to the same target. */
+    viewer->config.restream_enabled = want;
+    if (address) {
+        g_strlcpy(viewer->config.restream_address, address,
+                  sizeof(viewer->config.restream_address));
+    } else {
+        viewer->config.restream_address[0] = '\0';
+    }
+    if (port > 0) viewer->config.restream_port = port;
+
+    relay_controller_set_restream(&viewer->relay, want,
+                                  viewer->config.restream_address,
+                                  viewer->config.restream_port);
+}
+
 void uv_viewer_frame_block_configure(UvViewer *viewer, gboolean enabled, gboolean snapshot_mode) {
     if (!viewer) return;
     relay_controller_frame_block_configure(&viewer->relay, enabled, snapshot_mode);
@@ -335,6 +366,7 @@ void uv_viewer_stats_init(UvViewerStats *stats) {
     stats->frame_release.frames = g_array_new(FALSE, TRUE, sizeof(UvReleaseFrame));
     memset(&stats->sidecar, 0, sizeof(stats->sidecar));
     stats->sidecar.seconds_since_last_frame = -1.0;
+    memset(&stats->restream, 0, sizeof(stats->restream));
 }
 
 void uv_viewer_stats_clear(UvViewerStats *stats) {
@@ -403,6 +435,7 @@ bool uv_viewer_get_stats(UvViewer *viewer, UvViewerStats *stats) {
         sidecar_controller_set_target(&viewer->sidecar, have ? sel : NULL);
     }
     sidecar_controller_snapshot(&viewer->sidecar, stats);
+    relay_controller_restream_snapshot(&viewer->relay, &stats->restream);
     return TRUE;
 }
 
