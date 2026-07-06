@@ -55,6 +55,13 @@ typedef struct {
     guint idr_http_port; // TCP port for the encoder's /request/idr endpoint (default: 80)
     gboolean sidecar_enabled; // subscribe to the encoder's RTP sidecar telemetry
     guint sidecar_port;       // UDP port of the encoder's sidecar listener (default: 5602)
+    /* Restream: verbatim UDP forward of the currently selected source's raw
+     * datagrams to an external destination. A direct copy of every datagram
+     * from the locked source is re-sent to restream_address:restream_port with
+     * no re-packetisation. */
+    gboolean restream_enabled;                  // TRUE to forward the selected source
+    char     restream_address[UV_VIEWER_ADDR_MAX]; // destination IPv4 address
+    guint16  restream_port;                     // destination UDP port
 } UvViewerConfig;
 
 typedef struct {
@@ -281,6 +288,17 @@ typedef struct {
     uint32_t encoder_packets_sent;    /* lifetime */
 } UvSidecarStats;
 
+/* Restream (verbatim UDP forward of the selected source) status. */
+typedef struct {
+    gboolean enabled;                     /* config: restream is on */
+    gboolean active;                      /* send socket open + destination resolved */
+    char     address[UV_VIEWER_ADDR_MAX]; /* destination IPv4 address */
+    guint16  port;                        /* destination UDP port */
+    uint64_t tx_packets;                  /* datagrams forwarded since last (re)start */
+    uint64_t tx_bytes;                    /* bytes forwarded since last (re)start */
+    uint64_t tx_errors;                   /* sendto() failures */
+} UvRestreamStats;
+
 typedef struct {
     GArray *sources;      // UvSourceStats elements
     GArray *qos_entries;  // UvNamedQoSStats elements
@@ -294,6 +312,7 @@ typedef struct {
     gboolean frame_release_valid;
     UvReleaseStats frame_release;
     UvSidecarStats sidecar;
+    UvRestreamStats restream;
 } UvViewerStats;
 
 typedef struct {
@@ -339,6 +358,13 @@ bool uv_viewer_update_pipeline(UvViewer *viewer, const UvPipelineOverrides *over
  * configured port. Starts/stops the worker thread synchronously so the
  * GUI no longer has to restart the whole viewer to (un)subscribe. */
 void uv_viewer_set_sidecar_enabled(UvViewer *viewer, bool enabled, guint port);
+
+/* Toggle / retarget the restream verbatim UDP forward at runtime. When enabled,
+ * every raw datagram from the currently selected source is re-sent to
+ * address:port unchanged. Pass enabled=false (or a NULL/empty address) to stop
+ * forwarding. Takes effect immediately; the setting is also stored in the
+ * viewer config so it survives a pipeline/config restart. */
+void uv_viewer_set_restream(UvViewer *viewer, bool enabled, const char *address, guint16 port);
 
 void uv_viewer_frame_block_configure(UvViewer *viewer, gboolean enabled, gboolean snapshot_mode);
 void uv_viewer_frame_block_pause(UvViewer *viewer, gboolean paused);
