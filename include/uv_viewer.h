@@ -9,6 +9,12 @@
 G_BEGIN_DECLS
 
 #define UV_VIEWER_ADDR_MAX 64
+#define UV_SHM_NAME_MAX 64
+
+typedef enum {
+    UV_SOURCE_UDP = 0,
+    UV_SOURCE_SHM
+} UvSourceKind;
 
 typedef struct _UvViewer UvViewer;
 
@@ -62,9 +68,12 @@ typedef struct {
     gboolean restream_enabled;                  // TRUE to forward the selected source
     char     restream_address[UV_VIEWER_ADDR_MAX]; // destination IPv4 address
     guint16  restream_port;                     // destination UDP port
+    gboolean shm_enabled;
+    char shm_name[UV_SHM_NAME_MAX];
 } UvViewerConfig;
 
 typedef struct {
+    UvSourceKind kind;
     char address[UV_VIEWER_ADDR_MAX];
     bool selected;
     uint64_t rx_packets;
@@ -99,6 +108,12 @@ typedef struct {
     uint64_t rtp_fu_packets;        /* RFC 7798 fragmentation packets (type 49) */
     double seconds_since_keyframe;  /* time since last IDR/CRA; -1 if none seen */
     double last_keyframe_interval_seconds; /* gap between two most recent keyframes; -1 if unknown */
+    gboolean shm_attached;
+    double shm_fill_pct;
+    uint64_t shm_full_drops;
+    uint64_t shm_oversize_drops;
+    uint64_t shm_bad_slots;
+    uint64_t shm_reattaches;
 } UvSourceStats;
 
 typedef struct {

@@ -292,7 +292,8 @@ gboolean relay_controller_get_selected_address(RelayController *rc, char *out, s
     gboolean found = FALSE;
     g_mutex_lock(&rc->lock);
     int idx = rc->selected_index;
-    if (idx >= 0 && idx < (int)rc->sources_count && rc->sources[idx].in_use) {
+    if (idx >= 0 && idx < (int)rc->sources_count && rc->sources[idx].in_use &&
+        rc->sources[idx].kind == UV_SOURCE_UDP) {
         addr_to_str(&rc->sources[idx].addr, out, outlen);
         found = TRUE;
     }
@@ -386,6 +387,7 @@ static bool relay_add_or_find(RelayController *rc, const struct sockaddr_in *fro
     for (guint i = 0; i < rc->sources_count; i++) {
         UvRelaySource *slot = &rc->sources[i];
         if (!slot->in_use) continue;
+        if (slot->kind != UV_SOURCE_UDP) continue;
         if (slot->addr.sin_family == from->sin_family &&
             slot->addr.sin_addr.s_addr == from->sin_addr.s_addr) {
             if (slot->addr.sin_port != from->sin_port) {
@@ -400,6 +402,7 @@ static bool relay_add_or_find(RelayController *rc, const struct sockaddr_in *fro
     if (rc->sources_count >= UV_RELAY_MAX_SOURCES) return FALSE;
     UvRelaySource *ns = &rc->sources[rc->sources_count];
     memset(ns, 0, sizeof(*ns));
+    ns->kind = UV_SOURCE_UDP;
     ns->addr = *from;
     ns->addrlen = fromlen;
     ns->in_use = TRUE;
@@ -465,6 +468,8 @@ static void source_record_marker_frame(UvRelaySource *src, gint64 arrival_us) {
     }
 }
 
+static void hevc_count_nal_type(UvRelaySource *s, uint8_t nal_type, gint64 arrival_us);
+
 static double source_marker_window_fps(const UvRelaySource *src, gint64 now_us) {
     if (!src || src->frame_times_count < 2 || now_us <= 0) return 0.0;
 
@@ -493,23 +498,39 @@ static double source_marker_window_fps(const UvRelaySource *src, gint64 now_us) 
 void uv_internal_populate_source_stats(const UvRelaySource *src, int clock_rate,
                                        gint64 now_us, UvSourceStats *out) {
     if (!src || !out) return;
-    addr_to_str(&src->addr, out->address, sizeof(out->address));
+    out->kind = src->kind;
+    if (src->kind == UV_SOURCE_SHM) {
+        g_strlcpy(out->address, src->label, sizeof(out->address));
+    } else {
+        addr_to_str(&src->addr, out->address, sizeof(out->address));
+    }
     out->rx_packets = src->rx_packets;
     out->rx_bytes = src->rx_bytes;
     out->forwarded_packets = src->forwarded_packets;
     out->forwarded_bytes = src->forwarded_bytes;
-    out->rtp_unique_packets = src->rtp_unique_packets;
+    out->rtp_unique_packets = src->kind == UV_SOURCE_SHM ? UINT64_MAX : src->rtp_unique_packets;
+    if (src->kind == UV_SOURCE_SHM) {
+        out->rtp_expected_packets = UINT64_MAX;
+        out->rtp_lost_packets = UINT64_MAX;
+        out->rtp_duplicate_packets = UINT64_MAX;
+        out->rtp_reordered_packets = UINT64_MAX;
+        out->rtp_ap_packets = UINT64_MAX;
+        out->rtp_fu_packets = UINT64_MAX;
+        out->rfc3550_jitter_ms = -1.0;
+    }
     if (src->rtp_initialized) {
         out->rtp_expected_packets = (uint64_t)(src->rtp_max_ext_seq - src->rtp_first_ext_seq + 1);
         if (out->rtp_expected_packets > out->rtp_unique_packets) {
             out->rtp_lost_packets = out->rtp_expected_packets - out->rtp_unique_packets;
         }
     }
-    out->rtp_duplicate_packets = src->rtp_duplicate_packets;
-    out->rtp_reordered_packets = src->rtp_reordered_packets;
+    if (src->kind != UV_SOURCE_SHM) {
+        out->rtp_duplicate_packets = src->rtp_duplicate_packets;
+        out->rtp_reordered_packets = src->rtp_reordered_packets;
+    }
     out->rtp_marker_frames = src->rtp_marker_frames;
     out->rtp_marker_fps = source_marker_window_fps(src, now_us);
-    if (src->jitter_value > 0.0) {
+    if (src->kind != UV_SOURCE_SHM && src->jitter_value > 0.0) {
         out->rfc3550_jitter_ms = (src->jitter_value * 1000.0) / (double)MAX(clock_rate, 1);
     }
     if (src->last_seen_us > 0) {
@@ -517,6 +538,84 @@ void uv_internal_populate_source_stats(const UvRelaySource *src, int clock_rate,
     } else {
         out->seconds_since_last_seen = -1.0;
     }
+}
+
+int relay_controller_register_shm(RelayController *rc, const char *label) {
+    int index = -1;
+    UvRelaySource snapshot = {0};
+    gboolean added = FALSE;
+    g_mutex_lock(&rc->lock);
+    for (guint i = 0; i < rc->sources_count; i++) {
+        if (rc->sources[i].kind == UV_SOURCE_SHM &&
+            g_strcmp0(rc->sources[i].label, label) == 0) {
+            index = (int)i;
+            break;
+        }
+    }
+    if (index < 0 && rc->sources_count < UV_RELAY_MAX_SOURCES) {
+        index = (int)rc->sources_count++;
+        UvRelaySource *src = &rc->sources[index];
+        memset(src, 0, sizeof(*src));
+        src->kind = UV_SOURCE_SHM;
+        src->in_use = TRUE;
+        g_strlcpy(src->label, label, sizeof(src->label));
+        relay_source_clear_stats(src, TRUE);
+        added = TRUE;
+    }
+    if (index >= 0) snapshot = rc->sources[index];
+    g_mutex_unlock(&rc->lock);
+    if (added) uv_internal_emit_event(rc->viewer, UV_VIEWER_EVENT_SOURCE_ADDED,
+                                      index, &snapshot, NULL);
+    return index;
+}
+
+static void hevc_parse_annex_b_stats(UvRelaySource *src, const uint8_t *au,
+                                     size_t len, gint64 now_us) {
+    size_t i = 0;
+    while (i + 4 <= len) {
+        size_t start = SIZE_MAX;
+        for (; i + 3 <= len; i++) {
+            if (au[i] == 0 && au[i + 1] == 0 && au[i + 2] == 1) {
+                start = i + 3;
+                break;
+            }
+            if (i + 4 <= len && au[i] == 0 && au[i + 1] == 0 &&
+                au[i + 2] == 0 && au[i + 3] == 1) {
+                start = i + 4;
+                break;
+            }
+        }
+        if (start == SIZE_MAX || start >= len) break;
+        hevc_count_nal_type(src, (uint8_t)((au[start] >> 1) & 0x3f), now_us);
+        i = start + 1;
+    }
+}
+
+void relay_controller_shm_frame(RelayController *rc, int idx, const uint8_t *au,
+                                size_t len, const VencFrameMeta *meta) {
+    (void)meta;
+    gint64 now_us = g_get_monotonic_time();
+    g_mutex_lock(&rc->lock);
+    if (idx >= 0 && (guint)idx < rc->sources_count &&
+        rc->sources[idx].kind == UV_SOURCE_SHM) {
+        UvRelaySource *src = &rc->sources[idx];
+        src->rx_packets++;
+        src->rx_bytes += len;
+        src->last_seen_us = now_us;
+        source_record_marker_frame(src, now_us);
+        hevc_parse_annex_b_stats(src, au, len, now_us);
+    }
+    g_mutex_unlock(&rc->lock);
+}
+
+UvSourceKind relay_controller_source_kind(RelayController *rc, int index) {
+    UvSourceKind kind = UV_SOURCE_UDP;
+    g_mutex_lock(&rc->lock);
+    if (index >= 0 && (guint)index < rc->sources_count && rc->sources[index].in_use) {
+        kind = rc->sources[index].kind;
+    }
+    g_mutex_unlock(&rc->lock);
+    return kind;
 }
 
 /* Push a completed frame into the per-source cadence ring (oldest overwritten). */
@@ -1531,8 +1630,10 @@ void relay_controller_snapshot(RelayController *rc, UvViewerStats *stats, int cl
         s.hevc_aud_count       = src->hevc_aud_count;
         s.hevc_sei_count       = src->hevc_sei_count;
         s.hevc_other_nal_count = src->hevc_other_nal_count;
-        s.rtp_ap_packets       = src->rtp_ap_packets;
-        s.rtp_fu_packets       = src->rtp_fu_packets;
+        if (src->kind != UV_SOURCE_SHM) {
+            s.rtp_ap_packets = src->rtp_ap_packets;
+            s.rtp_fu_packets = src->rtp_fu_packets;
+        }
         if (src->last_keyframe_us > 0) {
             s.seconds_since_keyframe = (double)(now_us - src->last_keyframe_us) / 1e6;
         } else {

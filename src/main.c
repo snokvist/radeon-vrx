@@ -12,7 +12,8 @@ static void print_usage(const char *argv0) {
                " [--decoder auto|intel|nvidia|vaapi|software]"
                " [--video-sink auto|gtk4|wayland|gl|xv|autovideo|fakesink]"
                " [--idr-port N] [--sidecar] [--no-sidecar] [--sidecar-port N]"
-               " [--restream HOST:PORT] [--no-restream]\n",
+               " [--restream HOST:PORT] [--no-restream]"
+               " [--shm] [--no-shm] [--shm-name NAME]\n",
                argv0);
 }
 
@@ -210,6 +211,18 @@ static gboolean parse_args(int argc, char **argv, UvViewerConfig *cfg) {
             cfg->restream_enabled = TRUE;
         } else if (!strcmp(argv[i], "--no-restream")) {
             cfg->restream_enabled = FALSE;
+        } else if (!strcmp(argv[i], "--shm")) {
+            cfg->shm_enabled = TRUE;
+        } else if (!strcmp(argv[i], "--no-shm")) {
+            cfg->shm_enabled = FALSE;
+        } else if (!strcmp(argv[i], "--shm-name") && i + 1 < argc) {
+            const char *name = argv[++i];
+            if (!name[0] || strlen(name) >= sizeof(cfg->shm_name)) {
+                g_printerr("Invalid SHM name: %s\n", name);
+                return FALSE;
+            }
+            g_strlcpy(cfg->shm_name, name, sizeof(cfg->shm_name));
+            cfg->shm_enabled = TRUE;
         } else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
             print_usage(argv[0]);
             exit(EXIT_SUCCESS);

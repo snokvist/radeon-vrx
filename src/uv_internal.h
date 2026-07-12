@@ -2,6 +2,7 @@
 #define UV_INTERNAL_H
 
 #include "uv_viewer.h"
+#include "frame_shm_format.h"
 
 #include <gst/app/gstappsrc.h>
 #include <arpa/inet.h>
@@ -26,6 +27,8 @@ G_BEGIN_DECLS
 struct UvFrameBlockState;
 
 typedef struct {
+    UvSourceKind kind;
+    char label[UV_VIEWER_ADDR_MAX];
     struct sockaddr_in addr;
     socklen_t addrlen;
     bool in_use;
@@ -180,6 +183,37 @@ typedef struct {
     struct _UvViewer *viewer;
 } RelayController;
 
+typedef struct {
+    char name[UV_SHM_NAME_MAX];
+    gboolean enabled;
+    void *base;
+    size_t map_size;
+    uint32_t slot_count;
+    uint32_t slot_data_size;
+    size_t stride;
+    dev_t st_dev;
+    ino_t st_ino;
+    gboolean attached;
+    GThread *thread;
+    volatile gboolean stop;
+    volatile gboolean push_enabled;
+    GMutex lock;
+    GstAppSrc *appsrc;
+    RelayController *registry;
+    int source_index;
+    uint64_t frames;
+    uint64_t bytes;
+    uint64_t full_drops_seen;
+    uint64_t oversize_drops;
+    uint64_t bad_slots;
+    uint64_t reattaches;
+} ShmIngress;
+
+typedef enum {
+    UV_INGRESS_UDP = 0,
+    UV_INGRESS_SHM
+} UvIngressMode;
+
 #define UV_SIDECAR_AVG_WINDOW 64u
 
 typedef struct {
@@ -266,6 +300,7 @@ typedef struct {
 } QoSDatabase;
 
 typedef struct {
+    UvIngressMode ingress_mode;
     int payload_type;
     int clock_rate;
     gboolean sync_to_clock;
@@ -340,6 +375,7 @@ struct _UvViewer {
     DecoderStats decoder;
     QoSDatabase qos;
     SidecarController sidecar;
+    ShmIngress shm_ingress;
 
     GMutex state_lock;
     gboolean started;
@@ -371,6 +407,10 @@ void     relay_controller_snapshot(RelayController *rc, UvViewerStats *stats, in
 void     relay_controller_set_appsrc(RelayController *rc, GstAppSrc *appsrc);
 void     relay_controller_set_audio_appsrc(RelayController *rc, GstAppSrc *audio_appsrc);
 void     relay_controller_set_push_enabled(RelayController *rc, gboolean enabled);
+int      relay_controller_register_shm(RelayController *rc, const char *label);
+void     relay_controller_shm_frame(RelayController *rc, int idx, const uint8_t *au,
+                                    size_t len, const VencFrameMeta *meta);
+UvSourceKind relay_controller_source_kind(RelayController *rc, int index);
 void     relay_controller_frame_block_configure(RelayController *rc, gboolean enabled, gboolean snapshot_mode);
 void     relay_controller_frame_block_pause(RelayController *rc, gboolean paused);
 void     relay_controller_frame_block_reset(RelayController *rc);
@@ -422,6 +462,17 @@ GstAppSrc *pipeline_controller_get_audio_appsrc(PipelineController *pc);
 void     pipeline_controller_snapshot(PipelineController *pc, UvViewerStats *stats);
 gboolean pipeline_controller_update(PipelineController *pc, const UvPipelineOverrides *overrides, GError **error);
 GstElement *pipeline_controller_get_sink(PipelineController *pc);
+UvIngressMode pipeline_controller_ingress_mode(PipelineController *pc);
+void pipeline_controller_set_ingress_mode(PipelineController *pc, UvIngressMode mode);
+
+gboolean shm_ingress_init(ShmIngress *si, struct _UvViewer *viewer,
+                          RelayController *registry);
+void shm_ingress_deinit(ShmIngress *si);
+gboolean shm_ingress_start(ShmIngress *si);
+void shm_ingress_stop(ShmIngress *si);
+void shm_ingress_set_appsrc(ShmIngress *si, GstAppSrc *appsrc);
+void shm_ingress_set_push_enabled(ShmIngress *si, gboolean enabled);
+void shm_ingress_snapshot(ShmIngress *si, UvSourceStats *stats);
 
 GstElement *uv_internal_viewer_get_sink(struct _UvViewer *viewer);
 

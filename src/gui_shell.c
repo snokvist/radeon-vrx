@@ -86,6 +86,8 @@ typedef struct {
     GtkSpinButton  *restream_port_spin;
     GtkLabel       *restream_status_label;
     gboolean        restream_toggle_suppress;
+    GtkCheckButton *shm_toggle;
+    GtkEntry       *shm_name_entry;
     GtkNotebook *notebook;
     GtkDropDown *stats_range_dropdown;
     GtkDrawingArea *stats_charts[STATS_METRIC_COUNT];
@@ -1848,6 +1850,10 @@ static void sync_settings_controls(GuiContext *ctx) {
             gtk_widget_set_sensitive(GTK_WIDGET(ctx->restream_port_spin), !on);
         }
     }
+    if (ctx->shm_toggle) check_set(ctx->shm_toggle, ctx->current_cfg.shm_enabled);
+    if (ctx->shm_name_entry) {
+        gtk_editable_set_text(GTK_EDITABLE(ctx->shm_name_entry), ctx->current_cfg.shm_name);
+    }
     if (ctx->decoder_dropdown) {
         gtk_drop_down_set_selected(ctx->decoder_dropdown,
                                    decoder_pref_to_index(ctx->current_cfg.decoder_preference));
@@ -3367,11 +3373,17 @@ static void refresh_stats(GuiContext *ctx) {
             if (detail_source) {
                 char rate_buf[64];
                 format_bitrate(detail_source->inbound_bitrate_bps, rate_buf, sizeof(rate_buf));
-                char detail[320];
+                char detail[512];
+                char jitter_buf[32];
+                if (detail_source->kind == UV_SOURCE_SHM)
+                    g_strlcpy(jitter_buf, "—", sizeof(jitter_buf));
+                else
+                    g_snprintf(jitter_buf, sizeof(jitter_buf), "%.2fms",
+                               detail_source->rfc3550_jitter_ms);
                 g_snprintf(detail, sizeof(detail),
                            "%u: %s\nrx=%" G_GUINT64_FORMAT "/%" G_GUINT64_FORMAT
                            " fwd=%" G_GUINT64_FORMAT "/%" G_GUINT64_FORMAT
-                           " rate=%s input_fps=%.2f jitter=%.2fms last_seen=%.1fs",
+                           " rate=%s input_fps=%.2f jitter=%s last_seen=%.1fs",
                            detail_index,
                            detail_source->address,
                            detail_source->rx_packets,
@@ -3380,8 +3392,20 @@ static void refresh_stats(GuiContext *ctx) {
                            detail_source->forwarded_bytes,
                            rate_buf,
                            detail_source->rtp_marker_fps,
-                           detail_source->rfc3550_jitter_ms,
+                           jitter_buf,
                            detail_source->seconds_since_last_seen >= 0.0 ? detail_source->seconds_since_last_seen : 0.0);
+                if (detail_source->kind == UV_SOURCE_SHM) {
+                    char ring[192];
+                    g_snprintf(ring, sizeof(ring),
+                               "\nring=%s fill=%.1f%% full=%" G_GUINT64_FORMAT
+                               " oversize=%" G_GUINT64_FORMAT " bad=%" G_GUINT64_FORMAT
+                               " reattaches=%" G_GUINT64_FORMAT,
+                               detail_source->shm_attached ? "attached" : "stale",
+                               detail_source->shm_fill_pct, detail_source->shm_full_drops,
+                               detail_source->shm_oversize_drops, detail_source->shm_bad_slots,
+                               detail_source->shm_reattaches);
+                    g_strlcat(detail, ring, sizeof(detail));
+                }
                 if (waiting_for_switch) {
                     char switching[320];
                     g_snprintf(switching, sizeof(switching), "Switching to %s", detail);
@@ -3392,7 +3416,8 @@ static void refresh_stats(GuiContext *ctx) {
 
                 if (ctx->stream_detail_label) {
                     uint64_t kf_total = detail_source->hevc_idr_count + detail_source->hevc_cra_count;
-                    uint64_t total_pkts = detail_source->rtp_unique_packets;
+                    uint64_t total_pkts = detail_source->kind == UV_SOURCE_SHM
+                                        ? 0 : detail_source->rtp_unique_packets;
                     double frag_pct = (total_pkts > 0)
                                     ? (100.0 * (double)detail_source->rtp_fu_packets / (double)total_pkts)
                                     : 0.0;
@@ -3415,12 +3440,22 @@ static void refresh_stats(GuiContext *ctx) {
                                    detail_source->last_keyframe_interval_seconds);
                     }
                     char stream_detail[384];
+                    char ap_buf[32], fu_buf[32];
+                    if (detail_source->kind == UV_SOURCE_SHM) {
+                        g_strlcpy(ap_buf, "—", sizeof(ap_buf));
+                        g_strlcpy(fu_buf, "—", sizeof(fu_buf));
+                    } else {
+                        g_snprintf(ap_buf, sizeof(ap_buf), "%" G_GUINT64_FORMAT,
+                                   detail_source->rtp_ap_packets);
+                        g_snprintf(fu_buf, sizeof(fu_buf), "%" G_GUINT64_FORMAT,
+                                   detail_source->rtp_fu_packets);
+                    }
                     g_snprintf(stream_detail, sizeof(stream_detail),
                                "HEVC  IDR=%" G_GUINT64_FORMAT "  CRA=%" G_GUINT64_FORMAT
                                "  trail=%" G_GUINT64_FORMAT "  VPS/SPS/PPS=%" G_GUINT64_FORMAT
                                "/%" G_GUINT64_FORMAT "/%" G_GUINT64_FORMAT
                                "  SEI=%" G_GUINT64_FORMAT "  AUD=%" G_GUINT64_FORMAT
-                               "  •  AP=%" G_GUINT64_FORMAT "  FU=%" G_GUINT64_FORMAT
+                               "  •  AP=%s  FU=%s"
                                " (%.1f%% frag)"
                                "  •  KF total=%" G_GUINT64_FORMAT "  last %s ago  Δ %s",
                                detail_source->hevc_idr_count,
@@ -3431,14 +3466,28 @@ static void refresh_stats(GuiContext *ctx) {
                                detail_source->hevc_pps_count,
                                detail_source->hevc_sei_count,
                                detail_source->hevc_aud_count,
-                               detail_source->rtp_ap_packets,
-                               detail_source->rtp_fu_packets,
+                               ap_buf,
+                               fu_buf,
                                frag_pct,
                                kf_total,
                                kf_age_buf,
                                kf_gap_buf);
                     gtk_label_set_text(ctx->stream_detail_label, stream_detail);
                 }
+                gboolean udp_controls = detail_source->kind != UV_SOURCE_SHM;
+                if (ctx->restream_toggle)
+                    gtk_widget_set_sensitive(GTK_WIDGET(ctx->restream_toggle), udp_controls);
+                if (ctx->restream_host_entry)
+                    gtk_widget_set_sensitive(GTK_WIDGET(ctx->restream_host_entry),
+                                             udp_controls && !ctx->current_cfg.restream_enabled);
+                if (ctx->restream_port_spin)
+                    gtk_widget_set_sensitive(GTK_WIDGET(ctx->restream_port_spin),
+                                             udp_controls && !ctx->current_cfg.restream_enabled);
+                if (ctx->sidecar_enable_toggle)
+                    gtk_widget_set_sensitive(GTK_WIDGET(ctx->sidecar_enable_toggle), udp_controls);
+                if (ctx->sidecar_port_spin)
+                    gtk_widget_set_sensitive(GTK_WIDGET(ctx->sidecar_port_spin),
+                                             udp_controls && !ctx->current_cfg.sidecar_enabled);
             } else if (waiting_for_switch) {
                 char message[128];
                 g_snprintf(message, sizeof(message), "Switching to source %u...", detail_index);
@@ -3477,9 +3526,10 @@ static void refresh_stats(GuiContext *ctx) {
         StatsSample sample = {0};
         sample.timestamp = g_get_monotonic_time() / 1e6;
         sample.rate_bps = viewer_selected_source->inbound_bitrate_bps;
-        sample.lost_packets = (double)viewer_selected_source->rtp_lost_packets;
-        sample.dup_packets = (double)viewer_selected_source->rtp_duplicate_packets;
-        sample.reorder_packets = (double)viewer_selected_source->rtp_reordered_packets;
+        gboolean shm_source = viewer_selected_source->kind == UV_SOURCE_SHM;
+        sample.lost_packets = shm_source ? NAN : (double)viewer_selected_source->rtp_lost_packets;
+        sample.dup_packets = shm_source ? NAN : (double)viewer_selected_source->rtp_duplicate_packets;
+        sample.reorder_packets = shm_source ? NAN : (double)viewer_selected_source->rtp_reordered_packets;
         sample.rx_packets = (double)viewer_selected_source->rx_packets;
         sample.rx_bytes = (double)viewer_selected_source->rx_bytes;
         if (ctx->stats_history && ctx->stats_history->len > 0) {
@@ -3502,7 +3552,7 @@ static void refresh_stats(GuiContext *ctx) {
                                             ? dbytes_rx / dpkts : 0.0;
             }
         }
-        sample.jitter_ms = viewer_selected_source->rfc3550_jitter_ms;
+        sample.jitter_ms = shm_source ? NAN : viewer_selected_source->rfc3550_jitter_ms;
         sample.input_fps = viewer_selected_source->rtp_marker_fps;
         sample.decoder_fps_current = stats.decoder.instantaneous_fps;
         double latest_lateness = NAN;
@@ -4068,6 +4118,8 @@ static gboolean gui_restart_with_config_ex(GuiContext *ctx,
         cfg->audio_jitter_latency_ms == ctx->current_cfg.audio_jitter_latency_ms &&
         cfg->audio_use_separate_port == ctx->current_cfg.audio_use_separate_port &&
         cfg->audio_listen_port == ctx->current_cfg.audio_listen_port &&
+        cfg->shm_enabled == ctx->current_cfg.shm_enabled &&
+        g_strcmp0(cfg->shm_name, ctx->current_cfg.shm_name) == 0 &&
         cfg->jitter_drop_on_latency == ctx->current_cfg.jitter_drop_on_latency &&
         cfg->jitter_do_lost == ctx->current_cfg.jitter_do_lost &&
         cfg->jitter_post_drop_messages == ctx->current_cfg.jitter_post_drop_messages) {
@@ -4180,6 +4232,13 @@ static void on_settings_apply_clicked(GtkButton *button, gpointer user_data) {
     new_cfg.jitter_drop_on_latency = check_get(ctx->jitter_drop_toggle);
     new_cfg.jitter_do_lost = check_get(ctx->jitter_do_lost_toggle);
     new_cfg.jitter_post_drop_messages = check_get(ctx->jitter_post_drop_toggle);
+    new_cfg.shm_enabled = check_get(ctx->shm_toggle);
+    if (ctx->shm_name_entry) {
+        const char *name = gtk_editable_get_text(GTK_EDITABLE(ctx->shm_name_entry));
+        while (name && *name == '/') name++;
+        g_strlcpy(new_cfg.shm_name, name && *name ? name : "venc_frame_out",
+                  sizeof(new_cfg.shm_name));
+    }
 
     if (ctx->idr_port_spin) {
         int port = gtk_spin_button_get_value_as_int(ctx->idr_port_spin);
@@ -4766,6 +4825,24 @@ static GtkWidget *build_settings_page(GuiContext *ctx) {
     gtk_label_set_selectable(ctx->restream_status_label, TRUE);
     gtk_widget_add_css_class(GTK_WIDGET(ctx->restream_status_label), "uv-source-detail");
     gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(ctx->restream_status_label), 0, 17, 2, 1);
+
+    GtkWidget *shm_header = gtk_label_new("SHM Ingress");
+    gtk_label_set_xalign(GTK_LABEL(shm_header), 0.0);
+    gtk_widget_add_css_class(shm_header, "uv-info");
+    gtk_widget_set_margin_top(shm_header, 6);
+    gtk_grid_attach(GTK_GRID(grid), shm_header, 0, 18, 2, 1);
+
+    ctx->shm_toggle = GTK_CHECK_BUTTON(gtk_check_button_new_with_label("Enable SHM ingress"));
+    gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(ctx->shm_toggle), 0, 19, 2, 1);
+
+    GtkWidget *shm_name_label = gtk_label_new("Ring Name:");
+    gtk_label_set_xalign(GTK_LABEL(shm_name_label), 0.0);
+    gtk_grid_attach(GTK_GRID(grid), shm_name_label, 0, 20, 1, 1);
+    ctx->shm_name_entry = GTK_ENTRY(gtk_entry_new());
+    gtk_entry_set_placeholder_text(ctx->shm_name_entry, "venc_frame_out");
+    gtk_widget_set_tooltip_text(GTK_WIDGET(ctx->shm_name_entry),
+                                "POSIX object at /dev/shm/<name>; a leading slash is optional.");
+    gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(ctx->shm_name_entry), 1, 20, 1, 1);
 
     GtkWidget *apply_button = gtk_button_new_with_label("Apply Settings");
     gtk_widget_add_css_class(apply_button, "suggested-action");
@@ -6341,6 +6418,8 @@ static void on_app_shutdown(GApplication *app, gpointer user_data) {
     ctx->restream_port_spin = NULL;
     ctx->restream_status_label = NULL;
     ctx->restream_toggle_suppress = FALSE;
+    ctx->shm_toggle = NULL;
+    ctx->shm_name_entry = NULL;
 }
 
 int uv_gui_run(UvViewer **viewer, UvViewerConfig *cfg, const char *program_name) {
