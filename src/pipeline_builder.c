@@ -262,13 +262,19 @@ static void remove_audio_probe(PipelineController *pc) {
 static void on_need_data(GstAppSrc *src, guint length, gpointer user_data) {
     (void)src; (void)length;
     PipelineController *pc = (PipelineController *)user_data;
-    relay_controller_set_push_enabled(&pc->viewer->relay, TRUE);
+    if (pc->ingress_mode == UV_INGRESS_SHM)
+        shm_ingress_set_push_enabled(&pc->viewer->shm_ingress, TRUE);
+    else
+        relay_controller_set_push_enabled(&pc->viewer->relay, TRUE);
 }
 
 static void on_enough_data(GstAppSrc *src, gpointer user_data) {
     (void)src;
     PipelineController *pc = (PipelineController *)user_data;
-    relay_controller_set_push_enabled(&pc->viewer->relay, FALSE);
+    if (pc->ingress_mode == UV_INGRESS_SHM)
+        shm_ingress_set_push_enabled(&pc->viewer->shm_ingress, FALSE);
+    else
+        relay_controller_set_push_enabled(&pc->viewer->relay, FALSE);
 }
 
 static gboolean pipeline_swap_to_fakesink(PipelineController *pc) {
@@ -395,11 +401,13 @@ static gboolean build_pipeline(PipelineController *pc, GError **error) {
     UvViewer *viewer = pc->viewer;
     pc->appsrc_element   = gst_element_factory_make("appsrc", "src");
     pc->queue0           = gst_element_factory_make("queue", "queue_ingress");
-    pc->tee              = gst_element_factory_make("tee", "tee");
-    pc->queue_video_in   = gst_element_factory_make("queue", "queue_video_in");
-    pc->capsfilter_rtp_video = gst_element_factory_make("capsfilter", "cf_rtp_video");
-    pc->jitterbuffer     = gst_element_factory_make("rtpjitterbuffer", "jbuf_video");
-    pc->depay            = gst_element_factory_make("rtph265depay", "depay");
+    if (pc->ingress_mode == UV_INGRESS_UDP) {
+        pc->tee = gst_element_factory_make("tee", "tee");
+        pc->queue_video_in = gst_element_factory_make("queue", "queue_video_in");
+        pc->capsfilter_rtp_video = gst_element_factory_make("capsfilter", "cf_rtp_video");
+        pc->jitterbuffer = gst_element_factory_make("rtpjitterbuffer", "jbuf_video");
+        pc->depay = gst_element_factory_make("rtph265depay", "depay");
+    }
     pc->parser           = gst_element_factory_make("h265parse", "parser");
     pc->capsfilter       = gst_element_factory_make("capsfilter", "h265caps");
     pc->queue_postdec    = gst_element_factory_make("queue", "queue_postdec");
@@ -422,7 +430,7 @@ static gboolean build_pipeline(PipelineController *pc, GError **error) {
         pc->queue_postrate = gst_element_factory_make("queue", "queue_postrate");
     }
 
-    if (pc->audio_enabled) {
+    if (pc->audio_enabled && pc->ingress_mode == UV_INGRESS_UDP) {
         pc->queue_audio_in = gst_element_factory_make("queue", "queue_audio_in");
         pc->capsfilter_rtp_audio = gst_element_factory_make("capsfilter", "cf_rtp_audio");
         if (pc->audio_use_separate_port) {
@@ -520,8 +528,10 @@ static gboolean build_pipeline(PipelineController *pc, GError **error) {
         return FALSE;
     }
 
-    if (!pc->appsrc_element || !pc->queue0 || !pc->tee || !pc->queue_video_in ||
-        !pc->capsfilter_rtp_video || !pc->jitterbuffer || !pc->depay ||
+    if (!pc->appsrc_element || !pc->queue0 ||
+        (pc->ingress_mode == UV_INGRESS_UDP &&
+         (!pc->tee || !pc->queue_video_in || !pc->capsfilter_rtp_video ||
+          !pc->jitterbuffer || !pc->depay)) ||
         !pc->parser || !pc->capsfilter || !pc->decoder ||
         !pc->queue_postdec || !pc->video_convert ||
         (pc->use_videorate && (!pc->videorate || !pc->videorate_caps || !pc->queue_postrate))) {
@@ -561,10 +571,12 @@ static gboolean build_pipeline(PipelineController *pc, GError **error) {
         return FALSE;
     }
 
-    GstCaps *caps_appsrc = gst_caps_new_empty_simple("application/x-rtp");
+    GstCaps *caps_appsrc = pc->ingress_mode == UV_INGRESS_SHM
+                         ? gst_caps_from_string("video/x-h265,stream-format=byte-stream,alignment=au")
+                         : gst_caps_new_empty_simple("application/x-rtp");
     if (!caps_appsrc) {
         g_set_error(error, g_quark_from_static_string("uv-viewer"), 12,
-                    "Failed to build RTP caps");
+                    "Failed to build ingress caps");
         return FALSE;
     }
 
@@ -578,7 +590,8 @@ static gboolean build_pipeline(PipelineController *pc, GError **error) {
 
     g_object_set(pc->appsrc_element,
                  "is-live", TRUE,
-                 "format", GST_FORMAT_BYTES,
+                 "format", pc->ingress_mode == UV_INGRESS_SHM ? GST_FORMAT_TIME : GST_FORMAT_BYTES,
+                 "do-timestamp", pc->ingress_mode == UV_INGRESS_SHM,
                  "block", FALSE,
                  "max-bytes", (guint64)(2 * 1024 * 1024),
                  "stream-type", GST_APP_STREAM_TYPE_STREAM,
@@ -602,27 +615,29 @@ static gboolean build_pipeline(PipelineController *pc, GError **error) {
                      NULL);
     }
 
-    g_object_set(pc->jitterbuffer,
+    if (pc->jitterbuffer) g_object_set(pc->jitterbuffer,
                  "latency", (guint)MAX(viewer->config.jitter_latency_ms, 0u),
                  "drop-on-latency", viewer->config.jitter_drop_on_latency,
                  "do-lost", viewer->config.jitter_do_lost,
                  "post-drop-messages", viewer->config.jitter_post_drop_messages,
                  NULL);
 
-    GstCaps *caps_rtp_video = gst_caps_new_simple("application/x-rtp",
+    GstCaps *caps_rtp_video = pc->ingress_mode == UV_INGRESS_UDP ? gst_caps_new_simple("application/x-rtp",
                                                   "media", G_TYPE_STRING, "video",
                                                   "encoding-name", G_TYPE_STRING, "H265",
                                                   "payload", G_TYPE_INT, pc->payload_type,
                                                   "clock-rate", G_TYPE_INT, pc->clock_rate,
-                                                  NULL);
-    if (!caps_rtp_video) {
+                                                  NULL) : NULL;
+    if (pc->ingress_mode == UV_INGRESS_UDP && !caps_rtp_video) {
         gst_caps_unref(caps_h265);
         g_set_error(error, g_quark_from_static_string("uv-viewer"), 16,
                     "Failed to build video RTP caps");
         return FALSE;
     }
-    g_object_set(pc->capsfilter_rtp_video, "caps", caps_rtp_video, NULL);
-    gst_caps_unref(caps_rtp_video);
+    if (caps_rtp_video) {
+        g_object_set(pc->capsfilter_rtp_video, "caps", caps_rtp_video, NULL);
+        gst_caps_unref(caps_rtp_video);
+    }
 
     g_object_set(pc->parser, "config-interval", -1, NULL);
     g_object_set(pc->capsfilter, "caps", caps_h265, NULL);
@@ -704,10 +719,12 @@ static gboolean build_pipeline(PipelineController *pc, GError **error) {
         }
     }
 
-    gst_bin_add_many(GST_BIN(pc->pipeline),
-                     pc->appsrc_element, pc->queue0, pc->tee,
-                     pc->queue_video_in, pc->capsfilter_rtp_video, pc->jitterbuffer,
-                     pc->depay, pc->parser, pc->capsfilter,
+    gst_bin_add_many(GST_BIN(pc->pipeline), pc->appsrc_element, pc->queue0, NULL);
+    if (pc->ingress_mode == UV_INGRESS_UDP) {
+        gst_bin_add_many(GST_BIN(pc->pipeline), pc->tee, pc->queue_video_in,
+                         pc->capsfilter_rtp_video, pc->jitterbuffer, pc->depay, NULL);
+    }
+    gst_bin_add_many(GST_BIN(pc->pipeline), pc->parser, pc->capsfilter,
                      pc->decoder, pc->queue_postdec, NULL);
     if (pc->video_hw_convert) {
         gst_bin_add(GST_BIN(pc->pipeline), pc->video_hw_convert);
@@ -743,20 +760,17 @@ static gboolean build_pipeline(PipelineController *pc, GError **error) {
         return FALSE;
     }
 
-    if (!gst_element_link(pc->queue0, pc->tee)) {
-        g_set_error(error, g_quark_from_static_string("uv-viewer"), 14,
-                    "Failed to link ingress queue to tee");
-        return FALSE;
+    gboolean video_linked;
+    if (pc->ingress_mode == UV_INGRESS_SHM) {
+        video_linked = gst_element_link_many(pc->queue0, pc->parser, pc->capsfilter,
+                                             pc->decoder, pc->queue_postdec, NULL);
+    } else {
+        video_linked = gst_element_link_many(pc->queue0, pc->tee, pc->queue_video_in,
+                                             pc->capsfilter_rtp_video, pc->jitterbuffer,
+                                             pc->depay, pc->parser, pc->capsfilter,
+                                             pc->decoder, pc->queue_postdec, NULL);
     }
-
-    if (!gst_element_link(pc->tee, pc->queue_video_in)) {
-        g_set_error(error, g_quark_from_static_string("uv-viewer"), 14,
-                    "Failed to link tee to video queue");
-        return FALSE;
-    }
-
-    if (!gst_element_link_many(pc->queue_video_in, pc->capsfilter_rtp_video, pc->jitterbuffer,
-                               pc->depay, pc->parser, pc->capsfilter, pc->decoder, pc->queue_postdec, NULL)) {
+    if (!video_linked) {
         g_set_error(error, g_quark_from_static_string("uv-viewer"), 14,
                     "Failed to link video branch");
         return FALSE;
@@ -912,7 +926,6 @@ static gboolean build_pipeline(PipelineController *pc, GError **error) {
         }
     }
 
-    relay_controller_set_appsrc(&viewer->relay, GST_APP_SRC(pc->appsrc_element));
     return TRUE;
 }
 
@@ -943,6 +956,7 @@ gboolean pipeline_controller_init(PipelineController *pc, struct _UvViewer *view
     (void)error;
     g_return_val_if_fail(pc != NULL, FALSE);
     memset(pc, 0, sizeof(*pc));
+    pc->ingress_mode = UV_INGRESS_UDP;
     pc->viewer = viewer;
     pc->payload_type = viewer->config.payload_type;
     pc->clock_rate = viewer->config.clock_rate;
@@ -987,7 +1001,10 @@ void pipeline_controller_deinit(PipelineController *pc) {
     if (!pc) return;
     pipeline_controller_stop(pc);
     if (pc->bus_watch_id) {
-        g_source_remove(pc->bus_watch_id);
+        GSource *source = pc->loop_context
+                        ? g_main_context_find_source_by_id(pc->loop_context, pc->bus_watch_id)
+                        : NULL;
+        if (source) g_source_destroy(source);
         pc->bus_watch_id = 0;
     }
     remove_audio_probe(pc);
@@ -1137,6 +1154,7 @@ gboolean pipeline_controller_start(PipelineController *pc, GError **error) {
 void pipeline_controller_stop(PipelineController *pc) {
     if (!pc) return;
     relay_controller_set_push_enabled(&pc->viewer->relay, FALSE);
+    shm_ingress_set_push_enabled(&pc->viewer->shm_ingress, FALSE);
     if (pc->loop) g_main_loop_quit(pc->loop);
     if (pc->loop_thread) {
         g_thread_join(pc->loop_thread);
@@ -1282,4 +1300,12 @@ gboolean pipeline_controller_update(PipelineController *pc, const UvPipelineOver
 
 GstElement *pipeline_controller_get_sink(PipelineController *pc) {
     return pc ? pc->sink : NULL;
+}
+
+UvIngressMode pipeline_controller_ingress_mode(PipelineController *pc) {
+    return pc ? pc->ingress_mode : UV_INGRESS_UDP;
+}
+
+void pipeline_controller_set_ingress_mode(PipelineController *pc, UvIngressMode mode) {
+    if (pc) pc->ingress_mode = mode;
 }

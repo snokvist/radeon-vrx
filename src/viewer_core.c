@@ -42,6 +42,8 @@ void uv_viewer_config_init(UvViewerConfig *cfg) {
     cfg->restream_enabled = FALSE;
     cfg->restream_address[0] = '\0';
     cfg->restream_port = 5600;
+    cfg->shm_enabled = FALSE;
+    g_strlcpy(cfg->shm_name, "venc_frame_out", sizeof(cfg->shm_name));
 }
 
 UvViewer *uv_viewer_new(const UvViewerConfig *cfg) {
@@ -62,6 +64,7 @@ UvViewer *uv_viewer_new(const UvViewerConfig *cfg) {
         return NULL;
     }
     sidecar_controller_init(&viewer->sidecar, viewer);
+    shm_ingress_init(&viewer->shm_ingress, viewer, &viewer->relay);
     return viewer;
 }
 
@@ -69,6 +72,7 @@ void uv_viewer_free(UvViewer *viewer) {
     if (!viewer) return;
     uv_viewer_stop(viewer);
     sidecar_controller_deinit(&viewer->sidecar);
+    shm_ingress_deinit(&viewer->shm_ingress);
     relay_controller_deinit(&viewer->relay);
     pipeline_controller_deinit(&viewer->pipeline);
     uv_internal_qos_db_clear(&viewer->qos);
@@ -92,7 +96,14 @@ bool uv_viewer_start(UvViewer *viewer, GError **error) {
     g_mutex_unlock(&viewer->state_lock);
 
     if (!pipeline_controller_start(&viewer->pipeline, error)) return FALSE;
-    relay_controller_set_appsrc(&viewer->relay, pipeline_controller_get_appsrc(&viewer->pipeline));
+    GstAppSrc *appsrc = pipeline_controller_get_appsrc(&viewer->pipeline);
+    if (pipeline_controller_ingress_mode(&viewer->pipeline) == UV_INGRESS_SHM) {
+        relay_controller_set_appsrc(&viewer->relay, NULL);
+        shm_ingress_set_appsrc(&viewer->shm_ingress, appsrc);
+    } else {
+        relay_controller_set_appsrc(&viewer->relay, appsrc);
+        shm_ingress_set_appsrc(&viewer->shm_ingress, NULL);
+    }
     relay_controller_set_audio_appsrc(&viewer->relay,
                                       pipeline_controller_get_audio_appsrc(&viewer->pipeline));
     if (!relay_controller_start(&viewer->relay)) {
@@ -103,6 +114,9 @@ bool uv_viewer_start(UvViewer *viewer, GError **error) {
     }
 
     sidecar_controller_start(&viewer->sidecar);
+    if (!shm_ingress_start(&viewer->shm_ingress)) {
+        uv_log_warn("Failed to start SHM ingress thread");
+    }
 
     /* Honour a restream destination carried in the config (e.g. after an
      * Apply-Settings restart that rebuilt the viewer). */
@@ -129,6 +143,8 @@ void uv_viewer_stop(UvViewer *viewer) {
     g_mutex_unlock(&viewer->state_lock);
 
     sidecar_controller_stop(&viewer->sidecar);
+    shm_ingress_stop(&viewer->shm_ingress);
+    shm_ingress_set_appsrc(&viewer->shm_ingress, NULL);
     relay_controller_stop(&viewer->relay);
     pipeline_controller_stop(&viewer->pipeline);
 }
@@ -150,9 +166,11 @@ bool uv_viewer_restart_pipeline(UvViewer *viewer, GError **error) {
      * guarantees no concurrent access for the rest of the rebuild. */
     relay_controller_stop(&viewer->relay);
     relay_controller_set_appsrc(&viewer->relay, NULL);
+    shm_ingress_set_appsrc(&viewer->shm_ingress, NULL);
     relay_controller_set_audio_appsrc(&viewer->relay, NULL);
 
     /* Tear the pipeline all the way down so build_pipeline runs again. */
+    UvIngressMode ingress_mode = pipeline_controller_ingress_mode(&viewer->pipeline);
     pipeline_controller_deinit(&viewer->pipeline);
 
     /* Reset decoder + QoS stats so they reflect the new element instances,
@@ -169,6 +187,7 @@ bool uv_viewer_restart_pipeline(UvViewer *viewer, GError **error) {
         g_mutex_unlock(&viewer->state_lock);
         return FALSE;
     }
+    pipeline_controller_set_ingress_mode(&viewer->pipeline, ingress_mode);
 
     if (!pipeline_controller_start(&viewer->pipeline, error)) {
         relay_controller_start(&viewer->relay);
@@ -178,7 +197,14 @@ bool uv_viewer_restart_pipeline(UvViewer *viewer, GError **error) {
         return FALSE;
     }
 
-    relay_controller_set_appsrc(&viewer->relay, pipeline_controller_get_appsrc(&viewer->pipeline));
+    GstAppSrc *appsrc = pipeline_controller_get_appsrc(&viewer->pipeline);
+    if (ingress_mode == UV_INGRESS_SHM) {
+        relay_controller_set_appsrc(&viewer->relay, NULL);
+        shm_ingress_set_appsrc(&viewer->shm_ingress, appsrc);
+    } else {
+        relay_controller_set_appsrc(&viewer->relay, appsrc);
+        shm_ingress_set_appsrc(&viewer->shm_ingress, NULL);
+    }
     relay_controller_set_audio_appsrc(&viewer->relay,
                                       pipeline_controller_get_audio_appsrc(&viewer->pipeline));
     if (!relay_controller_start(&viewer->relay)) {
@@ -203,12 +229,41 @@ void uv_viewer_set_event_callback(UvViewer *viewer, UvViewerEventCallback cb, gp
 
 bool uv_viewer_select_source(UvViewer *viewer, int index, GError **error) {
     if (!viewer) return FALSE;
+    UvSourceKind kind = relay_controller_source_kind(&viewer->relay, index);
+    UvIngressMode want = kind == UV_SOURCE_SHM ? UV_INGRESS_SHM : UV_INGRESS_UDP;
+    if (want != pipeline_controller_ingress_mode(&viewer->pipeline)) {
+        UvIngressMode previous = pipeline_controller_ingress_mode(&viewer->pipeline);
+        pipeline_controller_set_ingress_mode(&viewer->pipeline, want);
+        if (!uv_viewer_restart_pipeline(viewer, error)) {
+            pipeline_controller_set_ingress_mode(&viewer->pipeline, previous);
+            return FALSE;
+        }
+    }
     return relay_controller_select(&viewer->relay, index, error);
 }
 
 bool uv_viewer_select_next_source(UvViewer *viewer, GError **error) {
     if (!viewer) return FALSE;
-    return relay_controller_select_next(&viewer->relay, error);
+    int next = -1;
+    g_mutex_lock(&viewer->relay.lock);
+    if (viewer->relay.sources_count > 0) {
+        int current = viewer->relay.selected_index;
+        for (guint step = 1; step <= viewer->relay.sources_count; step++) {
+            guint candidate = (guint)(current < 0 ? (int)step - 1 : current + (int)step) %
+                              viewer->relay.sources_count;
+            if (viewer->relay.sources[candidate].in_use) {
+                next = (int)candidate;
+                break;
+            }
+        }
+    }
+    g_mutex_unlock(&viewer->relay.lock);
+    if (next < 0) {
+        g_set_error(error, g_quark_from_static_string("uv-viewer"), 2,
+                    "No sources available");
+        return FALSE;
+    }
+    return uv_viewer_select_source(viewer, next, error);
 }
 
 int uv_viewer_get_selected_source(const UvViewer *viewer) {
@@ -424,6 +479,10 @@ bool uv_viewer_get_stats(UvViewer *viewer, UvViewerStats *stats) {
     g_array_set_size(stats->sources, 0);
     g_array_set_size(stats->qos_entries, 0);
     relay_controller_snapshot(&viewer->relay, stats, viewer->config.clock_rate);
+    for (guint i = 0; i < stats->sources->len; i++) {
+        UvSourceStats *source = &g_array_index(stats->sources, UvSourceStats, i);
+        if (source->kind == UV_SOURCE_SHM) shm_ingress_snapshot(&viewer->shm_ingress, source);
+    }
     pipeline_controller_snapshot(&viewer->pipeline, stats);
     uv_internal_qos_db_snapshot(&viewer->qos, stats);
 

@@ -1,5 +1,5 @@
 CC ?= gcc
-CFLAGS ?= -std=c11 -Wall -Wextra -O2 -g
+CFLAGS ?= -std=c11 -Wall -Wextra -O2 -g -pthread
 PKG_CONFIG ?= pkg-config
 GST_FLAGS := $(shell $(PKG_CONFIG) --cflags gstreamer-1.0 gstreamer-app-1.0 gstreamer-video-1.0 gobject-2.0 glib-2.0 gio-2.0)
 GST_LIBS := $(shell $(PKG_CONFIG) --libs gstreamer-1.0 gstreamer-app-1.0 gstreamer-video-1.0 gobject-2.0 glib-2.0 gio-2.0)
@@ -23,6 +23,7 @@ SRCS := \
 	src/stats.c \
 	src/logging.c \
 	src/sidecar.c \
+	src/shm_ingress.c \
 	src/gui_shell.c
 
 OBJS := $(SRCS:.c=.o)
@@ -32,7 +33,7 @@ TARGET := udp-h265-viewer
 all: $(TARGET)
 
 $(TARGET): $(OBJS)
-	$(CC) $(CFLAGS) -o $@ $^ $(GST_LIBS) $(GTK_LIBS) -lm
+	$(CC) $(CFLAGS) -o $@ $^ $(GST_LIBS) $(GTK_LIBS) -lm -lrt -pthread
 
 # -MMD -MP emits a per-object .d listing its header prerequisites, so editing a
 # shared header (e.g. uv_viewer.h / uv_internal.h) rebuilds every dependent
