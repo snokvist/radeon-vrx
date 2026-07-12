@@ -197,6 +197,7 @@ typedef struct {
     GThread *thread;
     volatile gboolean stop;
     volatile gboolean push_enabled;
+    gboolean stream_reset_pending;
     GMutex lock;
     GstAppSrc *appsrc;
     RelayController *registry;

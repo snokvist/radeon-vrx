@@ -3847,6 +3847,10 @@ static void on_next_button_clicked(GtkButton *button, gpointer user_data) {
         ctx->pending_source_index = GTK_INVALID_LIST_POSITION;
     }
 
+    /* Source selection may rebuild the pipeline when crossing ingress types.
+     * Release the old sink paintable before it can be destroyed, then bind
+     * whichever sink is active after the operation. */
+    detach_bound_sink(ctx);
     GError *error = NULL;
     if (!uv_viewer_select_next_source(ctx->viewer, &error)) {
         update_status(ctx, error ? error->message : "Failed to select next source");
@@ -3856,6 +3860,7 @@ static void on_next_button_clicked(GtkButton *button, gpointer user_data) {
         update_status(ctx, "Selected next source");
         refresh_stats(ctx);
     }
+    ensure_video_paintable(ctx);
     if (error) {
         g_error_free(error);
     }
@@ -4352,6 +4357,9 @@ static void on_source_dropdown_changed(GObject *dropdown, GParamSpec *pspec, gpo
     ctx->pending_source_index = selected;
     ctx->pending_source_valid = TRUE;
 
+    /* Switching UDP <-> SHM rebuilds the pipeline and replaces its video
+     * sink. Do not leave GtkPicture bound to the old sink's paintable. */
+    detach_bound_sink(ctx);
     GError *error = NULL;
     if (!uv_viewer_select_source(ctx->viewer, (int)selected, &error)) {
         update_status(ctx, error ? error->message : "Failed to select source");
@@ -4363,6 +4371,7 @@ static void on_source_dropdown_changed(GObject *dropdown, GParamSpec *pspec, gpo
         update_status(ctx, msg);
         refresh_stats(ctx);
     }
+    ensure_video_paintable(ctx);
     if (error) {
         g_error_free(error);
     }
