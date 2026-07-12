@@ -25,6 +25,7 @@
 #define FRAME_BLOCK_DEFAULT_FPC_YELLOW      2.0
 #define FRAME_BLOCK_DEFAULT_FPC_ORANGE      3.0
 #define FRAME_BLOCK_MISSING_SENTINEL (-1.0)
+#define SHM_RECOVERY_PORT 8092u
 
 typedef enum {
     STATS_METRIC_RATE = 0,
@@ -60,6 +61,10 @@ typedef struct {
     guint pending_source_index;
     gboolean active_source_valid;
     guint active_source_index;
+    gboolean preferred_source_valid;
+    UvSourceKind preferred_source_kind;
+    char preferred_source_address[UV_VIEWER_ADDR_MAX];
+    guint shm_recovery_timeout_id;
     guint stats_refresh_interval_ms;
     GtkSpinButton *listen_port_spin;
     GtkSpinButton *jitter_latency_spin;
@@ -228,6 +233,7 @@ typedef struct {
     UvViewerEventKind kind;
     int source_index;
     char *address;
+    UvSourceKind source_kind;
     char *error_message;
 } UiEvent;
 
@@ -1562,6 +1568,7 @@ typedef struct {
     guint port;
     char message[192];
     gboolean ok;
+    gboolean link_recovery;
 } IdrJob;
 
 static gboolean idr_apply_result(gpointer data) {
@@ -1598,12 +1605,23 @@ static gpointer idr_worker(gpointer data) {
                    err && err->message ? err->message : "connect failed");
     } else {
         char request[256];
-        g_snprintf(request, sizeof(request),
-                   "GET /request/idr HTTP/1.0\r\n"
-                   "Host: %s:%u\r\n"
-                   "User-Agent: udp-h265-viewer\r\n"
-                   "Connection: close\r\n\r\n",
-                   job->address, job->port);
+        if (job->link_recovery) {
+            g_snprintf(request, sizeof(request),
+                       "POST /api/v1/video/recover HTTP/1.0\r\n"
+                       "Host: %s:%u\r\n"
+                       "User-Agent: udp-h265-viewer\r\n"
+                       "Content-Type: application/json\r\n"
+                       "Content-Length: 2\r\n"
+                       "Connection: close\r\n\r\n{}",
+                       job->address, job->port);
+        } else {
+            g_snprintf(request, sizeof(request),
+                       "GET /request/idr HTTP/1.0\r\n"
+                       "Host: %s:%u\r\n"
+                       "User-Agent: udp-h265-viewer\r\n"
+                       "Connection: close\r\n\r\n",
+                       job->address, job->port);
+        }
         GOutputStream *ostream = g_io_stream_get_output_stream(G_IO_STREAM(conn));
         gsize written = 0;
         if (!g_output_stream_write_all(ostream, request, strlen(request),
@@ -1626,7 +1644,8 @@ static gpointer idr_worker(gpointer data) {
                 if (strncmp(buf, "HTTP/", 5) == 0 && strstr(buf, " 200") != NULL) {
                     job->ok = TRUE;
                     g_snprintf(job->message, sizeof(job->message),
-                               "IDR requested for %s:%u (HTTP 200 OK)",
+                               "%s requested via %s:%u (HTTP 200 OK)",
+                               job->link_recovery ? "SHM decoder recovery" : "IDR",
                                job->address, job->port);
                 } else {
                     g_snprintf(job->message, sizeof(job->message),
@@ -1652,6 +1671,50 @@ static void update_idr_button_sensitivity(GuiContext *ctx) {
     gtk_widget_set_sensitive(GTK_WIDGET(ctx->idr_button), has_source && !busy);
 }
 
+static gboolean start_idr_job(GuiContext *ctx, const char *address, guint port,
+                              gboolean link_recovery) {
+    if (!ctx || !address || !address[0] || ctx->idr_inflight > 0) return FALSE;
+    IdrJob *job = g_new0(IdrJob, 1);
+    job->ctx = ctx;
+    job->port = port;
+    job->link_recovery = link_recovery;
+    g_strlcpy(job->address, address, sizeof(job->address));
+
+    ctx->idr_inflight++;
+    update_idr_button_sensitivity(ctx);
+    GThread *t = g_thread_new("uv-idr", idr_worker, job);
+    if (!t) {
+        ctx->idr_inflight--;
+        update_idr_button_sensitivity(ctx);
+        g_free(job);
+        return FALSE;
+    }
+    g_thread_unref(t);
+    return TRUE;
+}
+
+static gboolean request_shm_recovery_after_select(gpointer data) {
+    GuiContext *ctx = data;
+    if (!ctx) return G_SOURCE_REMOVE;
+    ctx->shm_recovery_timeout_id = 0;
+    if (!ctx->active_source_valid ||
+        !start_idr_job(ctx, "127.0.0.1", SHM_RECOVERY_PORT, TRUE)) {
+        return G_SOURCE_REMOVE;
+    }
+    update_status(ctx, "Requesting SHM decoder recovery...");
+    return G_SOURCE_REMOVE;
+}
+
+static void schedule_shm_recovery(GuiContext *ctx) {
+    if (!ctx) return;
+    if (ctx->shm_recovery_timeout_id != 0) {
+        g_source_remove(ctx->shm_recovery_timeout_id);
+    }
+    // Let the replacement pipeline reach PLAYING and appsrc request data.
+    ctx->shm_recovery_timeout_id =
+        g_timeout_add(500, request_shm_recovery_after_select, ctx);
+}
+
 static void on_idr_button_clicked(GtkButton *button, gpointer user_data) {
     (void)button;
     GuiContext *ctx = user_data;
@@ -1671,12 +1734,14 @@ static void on_idr_button_clicked(GtkButton *button, gpointer user_data) {
     }
 
     char address[UV_VIEWER_ADDR_MAX] = {0};
+    UvSourceKind source_kind = UV_SOURCE_UDP;
     gboolean found = FALSE;
     if (stats.sources) {
         for (guint i = 0; i < stats.sources->len; i++) {
             const UvSourceStats *src = &g_array_index(stats.sources, UvSourceStats, i);
             if (src->selected) {
                 g_strlcpy(address, src->address, sizeof(address));
+                source_kind = src->kind;
                 found = TRUE;
                 break;
             }
@@ -1689,29 +1754,20 @@ static void on_idr_button_clicked(GtkButton *button, gpointer user_data) {
         return;
     }
 
-    guint port = ctx->current_cfg.idr_http_port ? ctx->current_cfg.idr_http_port : 80;
-
-    IdrJob *job = g_new0(IdrJob, 1);
-    job->ctx = ctx;
-    job->port = port;
-    g_strlcpy(job->address, address, sizeof(job->address));
+    gboolean link_recovery = source_kind == UV_SOURCE_SHM;
+    guint port = link_recovery ? SHM_RECOVERY_PORT :
+        (ctx->current_cfg.idr_http_port ? ctx->current_cfg.idr_http_port : 80);
+    const char *target = link_recovery ? "127.0.0.1" : address;
 
     char msg[160];
-    g_snprintf(msg, sizeof(msg), "Requesting IDR keyframe from %s:%u...", address, port);
+    g_snprintf(msg, sizeof(msg), "Requesting %s from %s:%u...",
+               link_recovery ? "SHM decoder recovery" : "IDR keyframe",
+               target, port);
     update_status(ctx, msg);
 
-    ctx->idr_inflight++;
-    update_idr_button_sensitivity(ctx);
-
-    GThread *t = g_thread_new("uv-idr", idr_worker, job);
-    if (!t) {
-        ctx->idr_inflight--;
-        update_idr_button_sensitivity(ctx);
+    if (!start_idr_job(ctx, target, port, link_recovery)) {
         update_status(ctx, "IDR request failed: could not spawn worker thread.");
-        g_free(job);
-        return;
     }
-    g_thread_unref(t);
 }
 
 static void install_app_css(void) {
@@ -4382,6 +4438,10 @@ static gboolean on_window_close_request(GtkWindow *window, gpointer user_data) {
     GuiContext *ctx = user_data;
     if (!ctx || !ctx->viewer) return FALSE;
     uv_viewer_set_event_callback(ctx->viewer, NULL, NULL);
+    if (ctx->shm_recovery_timeout_id) {
+        g_source_remove(ctx->shm_recovery_timeout_id);
+        ctx->shm_recovery_timeout_id = 0;
+    }
     if (ctx->stats_timeout_id) {
         GSource *source = g_main_context_find_source_by_id(NULL, ctx->stats_timeout_id);
         if (source) {
@@ -4409,6 +4469,24 @@ static gboolean dispatch_ui_event(gpointer user_data) {
             g_snprintf(msg, sizeof(msg), "Discovered source [%d] %s",
                        event->source_index, event->address ? event->address : "");
             update_status(ctx, msg);
+            if (event->source_index >= 0 && ctx->preferred_source_valid &&
+                event->source_kind == ctx->preferred_source_kind &&
+                g_strcmp0(event->address, ctx->preferred_source_address) == 0) {
+                ctx->pending_source_valid = TRUE;
+                ctx->pending_source_index = (guint)event->source_index;
+                detach_bound_sink(ctx);
+                GError *error = NULL;
+                if (!uv_viewer_select_source(ctx->viewer, event->source_index,
+                                             &error)) {
+                    update_status(ctx, error && error->message
+                                           ? error->message
+                                           : "Failed to restore source selection");
+                    ctx->pending_source_valid = FALSE;
+                    ctx->pending_source_index = GTK_INVALID_LIST_POSITION;
+                }
+                ensure_video_paintable(ctx);
+                if (error) g_error_free(error);
+            }
             refresh_stats(ctx);
             break;
         }
@@ -4418,6 +4496,14 @@ static gboolean dispatch_ui_event(gpointer user_data) {
             if (event->source_index >= 0) {
                 ctx->active_source_valid = TRUE;
                 ctx->active_source_index = (guint)event->source_index;
+                ctx->preferred_source_valid = TRUE;
+                ctx->preferred_source_kind = event->source_kind;
+                g_strlcpy(ctx->preferred_source_address,
+                          event->address ? event->address : "",
+                          sizeof(ctx->preferred_source_address));
+                if (event->source_kind == UV_SOURCE_SHM) {
+                    schedule_shm_recovery(ctx);
+                }
             } else {
                 ctx->active_source_valid = FALSE;
                 ctx->active_source_index = GTK_INVALID_LIST_POSITION;
@@ -4481,6 +4567,7 @@ static void viewer_event_callback(const UvViewerEvent *event, gpointer user_data
     copy->kind = event->kind;
     copy->source_index = event->source_index;
     copy->address = g_strdup(event->source_snapshot.address);
+    copy->source_kind = event->source_snapshot.kind;
     if (event->error) {
         copy->error_message = g_strdup(event->error->message);
     }
@@ -6489,6 +6576,9 @@ int uv_gui_run(UvViewer **viewer, UvViewerConfig *cfg, const char *program_name)
     ctx->pending_source_index = GTK_INVALID_LIST_POSITION;
     ctx->active_source_valid = FALSE;
     ctx->active_source_index = GTK_INVALID_LIST_POSITION;
+    ctx->preferred_source_valid = FALSE;
+    ctx->preferred_source_address[0] = '\0';
+    ctx->shm_recovery_timeout_id = 0;
     ctx->stats_refresh_interval_ms = 200;
     for (guint i = 0; i < FRAME_BLOCK_COLOR_COUNT; i++) {
         ctx->frame_block_colors_visible[i] = TRUE;
