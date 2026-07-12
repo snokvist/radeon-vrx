@@ -62,6 +62,7 @@ static gboolean shm_try_attach(ShmIngress *si) {
     }
 
     g_mutex_lock(&si->lock);
+    gboolean replacing_producer = si->source_index >= 0;
     shm_detach_locked(si);
     si->base = base;
     si->map_size = (size_t)st.st_size;
@@ -71,6 +72,7 @@ static gboolean shm_try_attach(ShmIngress *si) {
     si->st_dev = st.st_dev;
     si->st_ino = st.st_ino;
     si->attached = TRUE;
+    if (replacing_producer) si->stream_reset_pending = TRUE;
     g_mutex_unlock(&si->lock);
 
     if (si->source_index < 0) {
@@ -109,13 +111,31 @@ static void push_frame(ShmIngress *si, const uint8_t *data, size_t len,
     g_mutex_lock(&si->lock);
     si->frames++;
     si->bytes += au_len;
-    GstAppSrc *appsrc = si->push_enabled && si->appsrc
+    gboolean reset_stream = si->stream_reset_pending && si->appsrc;
+    GstAppSrc *appsrc = (si->push_enabled || reset_stream) && si->appsrc
                       ? GST_APP_SRC(gst_object_ref(si->appsrc)) : NULL;
+    if (reset_stream) {
+        si->stream_reset_pending = FALSE;
+        /* The flush empties appsrc, so force recovery out of a stale
+         * enough-data state. Its callbacks resume normal flow control. */
+        si->push_enabled = TRUE;
+    }
     g_mutex_unlock(&si->lock);
     if (!appsrc) return;
+
+    if (reset_stream) {
+        /* A recreated ring starts a new encoded stream. Flush stale parser and
+         * decoder state before feeding its first access unit. GstAppSrc is
+         * referenced above, so this remains safe across a concurrent pipeline
+         * rebuild, which clears si->appsrc before destroying the old pipeline. */
+        gst_element_send_event(GST_ELEMENT(appsrc), gst_event_new_flush_start());
+        gst_element_send_event(GST_ELEMENT(appsrc), gst_event_new_flush_stop(TRUE));
+        uv_log_info("SHM ingress %s reset decoder stream after producer restart", si->name);
+    }
     GstBuffer *buffer = gst_buffer_new_allocate(NULL, au_len, NULL);
     if (buffer) {
         gst_buffer_fill(buffer, 0, au, au_len);
+        if (reset_stream) GST_BUFFER_FLAG_SET(buffer, GST_BUFFER_FLAG_DISCONT);
         GstFlowReturn flow = gst_app_src_push_buffer(appsrc, buffer);
         if (flow != GST_FLOW_OK && flow != GST_FLOW_FLUSHING) {
             uv_log_warn("SHM appsrc push returned %s", gst_flow_get_name(flow));
