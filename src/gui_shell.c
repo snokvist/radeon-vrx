@@ -3865,6 +3865,10 @@ static void on_refresh_button_clicked(GtkButton *button, gpointer user_data) {
 
     /* Re-bind the paintable to the freshly built sink and update stats. */
     ensure_video_paintable(ctx);
+    if (ctx->active_source_valid &&
+        ctx->preferred_source_kind == UV_SOURCE_SHM) {
+        schedule_shm_recovery(ctx);
+    }
     refresh_stats(ctx);
 }
 
