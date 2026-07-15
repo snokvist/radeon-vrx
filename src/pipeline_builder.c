@@ -262,7 +262,7 @@ static void remove_audio_probe(PipelineController *pc) {
 static void on_need_data(GstAppSrc *src, guint length, gpointer user_data) {
     (void)src; (void)length;
     PipelineController *pc = (PipelineController *)user_data;
-    if (pc->ingress_mode == UV_INGRESS_SHM)
+    if (pipeline_controller_ingress_mode(pc) == UV_INGRESS_SHM)
         shm_ingress_set_push_enabled(&pc->viewer->shm_ingress, TRUE);
     else
         relay_controller_set_push_enabled(&pc->viewer->relay, TRUE);
@@ -271,7 +271,7 @@ static void on_need_data(GstAppSrc *src, guint length, gpointer user_data) {
 static void on_enough_data(GstAppSrc *src, gpointer user_data) {
     (void)src;
     PipelineController *pc = (PipelineController *)user_data;
-    if (pc->ingress_mode == UV_INGRESS_SHM)
+    if (pipeline_controller_ingress_mode(pc) == UV_INGRESS_SHM)
         shm_ingress_set_push_enabled(&pc->viewer->shm_ingress, FALSE);
     else
         relay_controller_set_push_enabled(&pc->viewer->relay, FALSE);
@@ -1303,9 +1303,10 @@ GstElement *pipeline_controller_get_sink(PipelineController *pc) {
 }
 
 UvIngressMode pipeline_controller_ingress_mode(PipelineController *pc) {
-    return pc ? pc->ingress_mode : UV_INGRESS_UDP;
+    return pc ? (UvIngressMode)__atomic_load_n(&pc->ingress_mode, __ATOMIC_ACQUIRE)
+              : UV_INGRESS_UDP;
 }
 
 void pipeline_controller_set_ingress_mode(PipelineController *pc, UvIngressMode mode) {
-    if (pc) pc->ingress_mode = mode;
+    if (pc) __atomic_store_n(&pc->ingress_mode, (int)mode, __ATOMIC_RELEASE);
 }

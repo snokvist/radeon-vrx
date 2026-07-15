@@ -301,7 +301,7 @@ typedef struct {
 } QoSDatabase;
 
 typedef struct {
-    UvIngressMode ingress_mode;
+    int ingress_mode; /* UvIngressMode; int for __atomic ops */
     int payload_type;
     int clock_rate;
     gboolean sync_to_clock;
