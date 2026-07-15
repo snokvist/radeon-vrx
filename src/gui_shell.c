@@ -3863,16 +3863,6 @@ static void on_refresh_button_clicked(GtkButton *button, gpointer user_data) {
      * don't keep a dangling ref or signal handler on the old element. */
     detach_bound_sink(ctx);
 
-    /* Re-evaluate the ingress mode against the currently selected source
-     * before rebuilding.  A stale mode (e.g. UDP with an SHM source
-     * selected) would otherwise be silently preserved by restart. */
-    int sel = uv_viewer_get_selected_source(ctx->viewer);
-    if (sel >= 0) {
-        UvSourceKind kind = relay_controller_source_kind(&ctx->viewer->relay, sel);
-        UvIngressMode want = kind == UV_SOURCE_SHM ? UV_INGRESS_SHM : UV_INGRESS_UDP;
-        pipeline_controller_set_ingress_mode(&ctx->viewer->pipeline, want);
-    }
-
     GError *error = NULL;
     if (!uv_viewer_restart_pipeline(ctx->viewer, &error)) {
         uv_log_error("Pipeline restart failed: %s",
@@ -3880,10 +3870,17 @@ static void on_refresh_button_clicked(GtkButton *button, gpointer user_data) {
         if (error) g_error_free(error);
     }
 
-    /* Re-select so SOURCE_SELECTED fires (triggers SHM recovery etc.). */
+    /* Re-select through the public API so ingress mode is re-evaluated
+     * and SOURCE_SELECTED fires (triggers SHM recovery etc.).
+     * uv_viewer_select_source handles rollback if a mode-change restart
+     * fails, and skips the select entirely on restart failure. */
+    int sel = uv_viewer_get_selected_source(ctx->viewer);
     if (sel >= 0) {
         GError *sel_error = NULL;
-        relay_controller_select(&ctx->viewer->relay, sel, &sel_error);
+        if (!uv_viewer_select_source(ctx->viewer, sel, &sel_error)) {
+            uv_log_warn("Source re-select after restart failed: %s",
+                        sel_error && sel_error->message ? sel_error->message : "unknown");
+        }
         if (sel_error) g_error_free(sel_error);
     }
 
