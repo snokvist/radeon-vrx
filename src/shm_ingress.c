@@ -108,7 +108,9 @@ static gboolean backing_object_current(ShmIngress *si) {
 
 static void push_frame(ShmIngress *si, const uint8_t *data, size_t len,
                        const VencFrameMeta *meta) {
-    if (len <= sizeof(*meta) || meta->codec != UV_FRAME_CODEC_H265 || meta->reserved != 0) {
+    /* No reserved-field check: bytes 6-7 now carry gdr_pos/gdr_len (venc #179),
+     * which are non-zero on every non-IDR frame when intra-refresh is on. */
+    if (len <= sizeof(*meta) || meta->codec != UV_FRAME_CODEC_H265) {
         g_mutex_lock(&si->lock);
         si->bad_slots++;
         g_mutex_unlock(&si->lock);
