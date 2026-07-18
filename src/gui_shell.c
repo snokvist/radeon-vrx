@@ -3403,13 +3403,20 @@ static void refresh_stats(GuiContext *ctx) {
             if (ctx->pending_source_valid) {
                 desired = ctx->pending_source_index;
             }
+            guint current = gtk_drop_down_get_selected(ctx->source_dropdown);
             if (desired != GTK_INVALID_LIST_POSITION) {
-                guint current = gtk_drop_down_get_selected(ctx->source_dropdown);
                 if (current != desired) {
                     ctx->suppress_source_change = TRUE;
                     gtk_drop_down_set_selected(ctx->source_dropdown, desired);
                     ctx->suppress_source_change = FALSE;
                 }
+            } else if (current != GTK_INVALID_LIST_POSITION) {
+                /* No source is selected at the viewer level; clear the
+                 * dropdown so clicking a source actually fires the change
+                 * signal instead of appearing as a no-op. */
+                ctx->suppress_source_change = TRUE;
+                gtk_drop_down_set_selected(ctx->source_dropdown, GTK_INVALID_LIST_POSITION);
+                ctx->suppress_source_change = FALSE;
             }
         }
 
@@ -3861,6 +3868,20 @@ static void on_refresh_button_clicked(GtkButton *button, gpointer user_data) {
         uv_log_error("Pipeline restart failed: %s",
                      error && error->message ? error->message : "unknown");
         if (error) g_error_free(error);
+    }
+
+    /* Re-select through the public API so ingress mode is re-evaluated
+     * and SOURCE_SELECTED fires (triggers SHM recovery etc.).
+     * uv_viewer_select_source handles rollback if a mode-change restart
+     * fails, and skips the select entirely on restart failure. */
+    int sel = uv_viewer_get_selected_source(ctx->viewer);
+    if (sel >= 0) {
+        GError *sel_error = NULL;
+        if (!uv_viewer_select_source(ctx->viewer, sel, &sel_error)) {
+            uv_log_warn("Source re-select after restart failed: %s",
+                        sel_error && sel_error->message ? sel_error->message : "unknown");
+        }
+        if (sel_error) g_error_free(sel_error);
     }
 
     /* Re-bind the paintable to the freshly built sink and update stats. */
@@ -4469,9 +4490,16 @@ static gboolean dispatch_ui_event(gpointer user_data) {
             g_snprintf(msg, sizeof(msg), "Discovered source [%d] %s",
                        event->source_index, event->address ? event->address : "");
             update_status(ctx, msg);
+            gboolean should_select = FALSE;
             if (event->source_index >= 0 && ctx->preferred_source_valid &&
                 event->source_kind == ctx->preferred_source_kind &&
                 g_strcmp0(event->address, ctx->preferred_source_address) == 0) {
+                should_select = TRUE;
+            } else if (event->source_index >= 0 && !ctx->active_source_valid &&
+                       uv_viewer_get_selected_source(ctx->viewer) < 0) {
+                should_select = TRUE;
+            }
+            if (should_select) {
                 ctx->pending_source_valid = TRUE;
                 ctx->pending_source_index = (guint)event->source_index;
                 detach_bound_sink(ctx);
@@ -4480,7 +4508,7 @@ static gboolean dispatch_ui_event(gpointer user_data) {
                                              &error)) {
                     update_status(ctx, error && error->message
                                            ? error->message
-                                           : "Failed to restore source selection");
+                                           : "Failed to select source");
                     ctx->pending_source_valid = FALSE;
                     ctx->pending_source_index = GTK_INVALID_LIST_POSITION;
                 }

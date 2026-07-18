@@ -72,13 +72,23 @@ static gboolean shm_try_attach(ShmIngress *si) {
     si->st_dev = st.st_dev;
     si->st_ino = st.st_ino;
     si->attached = TRUE;
-    if (replacing_producer) si->stream_reset_pending = TRUE;
+    if (replacing_producer) {
+        /* A recreated ring is a brand-new encoded stream. Gate ingress on the
+         * next IDR and flush stale parser/decoder state when it arrives. */
+        si->waiting_for_idr = TRUE;
+        si->stream_reset_pending = TRUE;
+    }
     g_mutex_unlock(&si->lock);
 
     if (si->source_index < 0) {
         char label[UV_VIEWER_ADDR_MAX];
         g_snprintf(label, sizeof(label), "shm:%s", si->name);
         si->source_index = relay_controller_register_shm(si->registry, label);
+    } else if (replacing_producer) {
+        /* Re-emit selection so the GUI proactively requests a decoder-bootstrap
+         * IDR for the replacement producer before the gate has to wait for a
+         * natural keyframe. */
+        relay_controller_shm_reattached(si->registry, si->source_index);
     }
     uv_log_info("SHM ingress attached to %s (%u slots, %u bytes each)",
                 si->name, slots, data_size);
@@ -111,13 +121,19 @@ static void push_frame(ShmIngress *si, const uint8_t *data, size_t len,
     g_mutex_lock(&si->lock);
     si->frames++;
     si->bytes += au_len;
-    gboolean reset_stream = si->stream_reset_pending && si->appsrc;
-    GstAppSrc *appsrc = (si->push_enabled || reset_stream) && si->appsrc
+    gboolean is_idr = (meta->flags & UV_FRAME_FLAG_IDR) != 0;
+    /* A newly bound appsrc / recreated ring must start on a random-access unit.
+     * Drop deltas until the first IDR so we never seed a decoder mid-GOP. */
+    gboolean start_stream = si->waiting_for_idr && is_idr && si->appsrc;
+    gboolean reset_stream = start_stream && si->stream_reset_pending;
+    gboolean skip_delta = si->waiting_for_idr && !is_idr;
+    GstAppSrc *appsrc = !skip_delta && (si->push_enabled || start_stream) && si->appsrc
                       ? GST_APP_SRC(gst_object_ref(si->appsrc)) : NULL;
-    if (reset_stream) {
+    if (start_stream) {
+        si->waiting_for_idr = FALSE;
         si->stream_reset_pending = FALSE;
-        /* The flush empties appsrc, so force recovery out of a stale
-         * enough-data state. Its callbacks resume normal flow control. */
+        /* Force out of a stale enough-data state left by the previous stream so
+         * the random-access unit is accepted; callbacks resume flow control. */
         si->push_enabled = TRUE;
     }
     g_mutex_unlock(&si->lock);
@@ -135,7 +151,7 @@ static void push_frame(ShmIngress *si, const uint8_t *data, size_t len,
     GstBuffer *buffer = gst_buffer_new_allocate(NULL, au_len, NULL);
     if (buffer) {
         gst_buffer_fill(buffer, 0, au, au_len);
-        if (reset_stream) GST_BUFFER_FLAG_SET(buffer, GST_BUFFER_FLAG_DISCONT);
+        if (start_stream) GST_BUFFER_FLAG_SET(buffer, GST_BUFFER_FLAG_DISCONT);
         GstFlowReturn flow = gst_app_src_push_buffer(appsrc, buffer);
         if (flow != GST_FLOW_OK && flow != GST_FLOW_FLUSHING) {
             uv_log_warn("SHM appsrc push returned %s", gst_flow_get_name(flow));
@@ -239,6 +255,11 @@ void shm_ingress_set_appsrc(ShmIngress *si, GstAppSrc *appsrc) {
     if (appsrc) gst_object_ref(appsrc);
     GstAppSrc *old = si->appsrc;
     si->appsrc = appsrc;
+    if (appsrc && appsrc != old) {
+        /* An appsrc belongs to one parser/decoder instance. Never seed a new
+         * instance with inter-predicted frames from the middle of a GOP. */
+        si->waiting_for_idr = TRUE;
+    }
     g_mutex_unlock(&si->lock);
     if (old) gst_object_unref(old);
 }

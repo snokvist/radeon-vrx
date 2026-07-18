@@ -197,6 +197,7 @@ typedef struct {
     GThread *thread;
     volatile gboolean stop;
     volatile gboolean push_enabled;
+    gboolean waiting_for_idr;
     gboolean stream_reset_pending;
     GMutex lock;
     GstAppSrc *appsrc;
@@ -301,7 +302,7 @@ typedef struct {
 } QoSDatabase;
 
 typedef struct {
-    UvIngressMode ingress_mode;
+    int ingress_mode; /* UvIngressMode; int for __atomic ops */
     int payload_type;
     int clock_rate;
     gboolean sync_to_clock;
@@ -411,6 +412,7 @@ void     relay_controller_set_push_enabled(RelayController *rc, gboolean enabled
 int      relay_controller_register_shm(RelayController *rc, const char *label);
 void     relay_controller_shm_frame(RelayController *rc, int idx, const uint8_t *au,
                                     size_t len, const VencFrameMeta *meta);
+void     relay_controller_shm_reattached(RelayController *rc, int idx);
 UvSourceKind relay_controller_source_kind(RelayController *rc, int index);
 void     relay_controller_frame_block_configure(RelayController *rc, gboolean enabled, gboolean snapshot_mode);
 void     relay_controller_frame_block_pause(RelayController *rc, gboolean paused);

@@ -608,6 +608,24 @@ void relay_controller_shm_frame(RelayController *rc, int idx, const uint8_t *au,
     g_mutex_unlock(&rc->lock);
 }
 
+void relay_controller_shm_reattached(RelayController *rc, int idx) {
+    UvRelaySource snapshot = {0};
+    gboolean selected = FALSE;
+    g_mutex_lock(&rc->lock);
+    if (idx >= 0 && (guint)idx < rc->sources_count &&
+        rc->sources[idx].kind == UV_SOURCE_SHM && rc->selected_index == idx) {
+        snapshot = rc->sources[idx];
+        selected = TRUE;
+    }
+    g_mutex_unlock(&rc->lock);
+    if (selected) {
+        /* Re-emit selection so the GUI requests a decoder-bootstrap IDR for
+         * the replacement producer before SHM ingress resumes pushing. */
+        uv_internal_emit_event(rc->viewer, UV_VIEWER_EVENT_SOURCE_SELECTED,
+                               idx, &snapshot, NULL);
+    }
+}
+
 UvSourceKind relay_controller_source_kind(RelayController *rc, int index) {
     UvSourceKind kind = UV_SOURCE_UDP;
     g_mutex_lock(&rc->lock);
