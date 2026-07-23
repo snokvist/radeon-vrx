@@ -245,6 +245,25 @@ static GstPadProbeReturn audio_src_probe(GstPad *pad, GstPadProbeInfo *info, gpo
     return GST_PAD_PROBE_OK;
 }
 
+/* autoaudiosink instantiates its real sink only when it reaches READY, so the
+ * sync/async knobs have to be applied to the child as it appears. Leaving
+ * async=TRUE on a sink that never receives data keeps the whole pipeline's
+ * state change to PLAYING pending, which stalls the video sink too. */
+static void audio_sink_deep_element_added(GstBin *bin, GstBin *sub_bin,
+                                          GstElement *element, gpointer user_data) {
+    (void)bin;
+    (void)sub_bin;
+    (void)user_data;
+    if (!element) return;
+    GObjectClass *klass = G_OBJECT_GET_CLASS(element);
+    if (g_object_class_find_property(klass, "sync")) {
+        g_object_set(element, "sync", FALSE, NULL);
+    }
+    if (g_object_class_find_property(klass, "async")) {
+        g_object_set(element, "async", FALSE, NULL);
+    }
+}
+
 static void remove_audio_probe(PipelineController *pc) {
     if (!pc || pc->audio_probe_id == 0) return;
     if (!pc->audio_resample) {
@@ -715,6 +734,18 @@ static gboolean build_pipeline(PipelineController *pc, GError **error) {
             g_object_set(pc->audio_sink, "sync", FALSE, NULL);
             if (g_object_class_find_property(G_OBJECT_GET_CLASS(pc->audio_sink), "async")) {
                 g_object_set(pc->audio_sink, "async", FALSE, NULL);
+            } else if (GST_IS_BIN(pc->audio_sink)) {
+                /* autoaudiosink is a GstBin: it proxies "sync" but has no
+                 * "async" property, so the guard above silently did nothing
+                 * and its inner sink kept async=TRUE. With no audio on the
+                 * separate UDP port that inner sink never prerolls, the
+                 * pipeline never completes its state change to PLAYING, and
+                 * every other async sink (the video sink) stalls after its
+                 * own preroll buffer -> frozen picture. The real sink only
+                 * exists once the bin reaches READY, so patch it as it is
+                 * added. */
+                g_signal_connect(pc->audio_sink, "deep-element-added",
+                                 G_CALLBACK(audio_sink_deep_element_added), NULL);
             }
         }
     }
