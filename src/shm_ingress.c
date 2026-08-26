@@ -57,6 +57,19 @@ static gboolean shm_try_attach(ShmIngress *si) {
                      expected == (uint64_t)st.st_size &&
                      load_u32(base, VFRM_OFF_TOTAL_SIZE) == (uint32_t)st.st_size;
     if (!valid) {
+        /* A version mismatch is the expected failure during a frame-SHM
+         * rollout (the ring went to v2 in waybeam_venc 0.69.0, when header
+         * offset 88 changed meaning), and without a line here it presents as
+         * a black screen with nothing in the log to chase.  Rate-limited to
+         * once per distinct version so a spinning attach loop cannot flood. */
+        static uint32_t last_bad_version = 0;
+        uint32_t saw = load_u32(base, VFRM_OFF_VERSION);
+        if (load_u32(base, VFRM_OFF_MAGIC) == VFRM_MAGIC &&
+            saw != VFRM_VERSION && saw != last_bad_version) {
+            last_bad_version = saw;
+            g_warning("shm: ring version %u, expected %u -- producer and "
+                      "viewer must be updated together", saw, VFRM_VERSION);
+        }
         munmap(base, (size_t)st.st_size);
         return FALSE;
     }
