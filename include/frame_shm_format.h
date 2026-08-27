@@ -5,7 +5,14 @@
 #include <stdint.h>
 
 #define VFRM_MAGIC 0x5646524Du
-#define VFRM_VERSION 1u
+/* v2 (waybeam_venc 0.69.0): header offset 88 changed meaning -- it carried
+ * throttle_permille (producer bitrate clamp, 1000 = unclamped) and now carries
+ * low_water_slots (ring occupancy in slots, <= 1 healthy). Same layout,
+ * OPPOSITE polarity -- exactly what an offset-addressing consumer cannot
+ * detect for itself, hence a version bump. We never defined offset 88, so
+ * nothing below changes; the constant must still move or shm_ingress.c
+ * refuses every v2 ring. */
+#define VFRM_VERSION 2u
 #define VFRM_HEADER_SIZE 192u
 #define VFRM_DEFAULT_SLOT_COUNT 16u
 #define VFRM_DEFAULT_SLOT_DATA_SIZE (512u * 1024u)
